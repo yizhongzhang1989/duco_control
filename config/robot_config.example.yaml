@@ -39,3 +39,15 @@ ft_sensor_dashboard:
   push_rate: 30.0           # initial SSE update rate (Hz)
   reliability: "best_effort"  # match the publisher's QoS
   title: ""                 # optional extra label in the page title
+
+# ============================================================================
+# duco_robot_bringup (project wrapper for the submodule ros2_control stack)
+# ============================================================================
+duco_robot_bringup:
+  robot_ip: "192.168.1.10"  # Duco robot controller IP
+  robot_port: 7003          # Duco controller TCP port (Thrift RPC)
+  use_fake_hardware: true   # true = mock_components, false = real DucoHardwareInterface
+  use_rviz: true            # launch the MoveIt RViz UI
+  db: false                 # mongo warehouse DB (off by default; can be huge)
+  debug: false              # extra ros2_control / MoveIt verbosity
+  publish_frequency: 15.0   # robot_state_publisher TF rate (Hz)
