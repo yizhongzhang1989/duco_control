@@ -1,8 +1,6 @@
 """Low-level driver for the Duco 6-DoF force/torque sensor.
 
-Wire protocol (matches the manufacturer's C# sample, NOT the 12-byte int format
-written in section 4.3 of the Chinese OCR'd manual which appears to apply to a
-different firmware variant):
+Wire protocol (verified on the physical hardware):
 
     Serial:  460800 baud, 8N1, no flow control
     Frame:   28 bytes
@@ -16,9 +14,13 @@ different firmware variant):
 Host -> sensor commands (all 4 bytes, sent as-is over the serial line):
 
     0x43 0xAA 0x0D 0x0A   stop streaming
-    0x47 0xAA 0x0D 0x0A   tare (zero) then stream @ 960 Hz
-    0x48 0xAA 0x0D 0x0A   stream @ 960 Hz (no tare)
-    0x49 0xAA 0x0D 0x0A   one shot
+    0x47 0xAA 0x0D 0x0A   tare (NOTE: no-op on the verified firmware --
+                          neither zeroes the readings nor restarts the
+                          stream; software tare is implemented in the
+                          ROS node instead)
+    0x48 0xAA 0x0D 0x0A   stream @ ~960 Hz
+    0x49 0xAA 0x0D 0x0A   one shot (NOTE: no data observed on the
+                          verified firmware)
 """
 
 from __future__ import annotations
@@ -109,10 +111,29 @@ class FTSensor:
 
     # --- commands ----------------------------------------------------------
     def start_stream(self, tare: bool = False) -> None:
-        """Start the 960 Hz stream. If ``tare`` is true, the sensor zeroes first."""
+        """Start the 960 Hz stream.
+
+        ``tare`` is accepted for API compatibility but is treated as a
+        no-op here: the verified firmware does NOT honour the 0x47 (tare)
+        command -- it neither zeroes the readings nor restarts the data
+        stream. Software tare should be done by the caller (the ROS node
+        does this in :class:`FTSensorNode`).
+
+        We always pre-stop the device to put it in a known state, because
+        re-issuing a start while the device is mid-burst from a previous
+        start can race the host's reader thread.
+        """
+        try:
+            self._ser.write(CMD_STOP)
+            self._ser.flush()
+        except serial.SerialException:
+            pass
+        time.sleep(0.05)
         self._ser.reset_input_buffer()
         self._buf.clear()
-        self._ser.write(CMD_TARE_STREAM if tare else CMD_STREAM)
+        # `tare` left intentionally unused; see docstring.
+        del tare
+        self._ser.write(CMD_STREAM)
         self._ser.flush()
 
     def stop_stream(self) -> None:
@@ -124,7 +145,8 @@ class FTSensor:
             pass
 
     def tare(self) -> None:
-        """Zero the sensor (and continue streaming)."""
+        """Hardware tare. WARNING: on the verified firmware this is a
+        no-op (the 0x47 command does nothing). Prefer software tare."""
         self.start_stream(tare=True)
 
     def close(self) -> None:

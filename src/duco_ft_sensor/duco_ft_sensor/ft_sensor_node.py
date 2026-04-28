@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Optional
+from typing import List, Optional
 
 import rclpy
 from geometry_msgs.msg import WrenchStamped
@@ -88,6 +88,17 @@ class FTSensorNode(Node):
         self._srv_start = self.create_service(Trigger, "~/start", self._srv_start_cb)
         self._srv_stop = self.create_service(Trigger, "~/stop", self._srv_stop_cb)
         self._srv_tare = self.create_service(Trigger, "~/tare", self._srv_tare_cb)
+        self._srv_reset_tare = self.create_service(
+            Trigger, "~/reset_tare", self._srv_reset_tare_cb)
+
+        # Software tare offsets (Fx, Fy, Fz, Mx, My, Mz). Subtracted from
+        # every published wrench. We use software tare because the sensor's
+        # 0x47 hardware-tare command is unreliable on the verified firmware
+        # (it neither zeroes the readings nor restarts the data stream).
+        self._offsets: List[float] = [0.0] * 6
+        # Set by tare request; cleared by the reader loop after capturing
+        # the next fresh sample as the new offset baseline.
+        self._tare_pending: bool = False
 
         # --- background reader thread ------------------------------------
         self._streaming = False
@@ -112,11 +123,13 @@ class FTSensorNode(Node):
         elif cmd == "stop":
             self._do_stop()
         elif cmd in ("tare", "zero"):
-            self._do_start(tare=True)
+            self._do_tare()
+        elif cmd in ("reset_tare", "untare", "clear_tare"):
+            self._do_reset_tare()
         else:
             self.get_logger().warn(
                 f"ignoring unknown command '{msg.data}' "
-                "(expected: start | stop | tare | zero)")
+                "(expected: start | stop | tare | zero | reset_tare)")
 
     def _srv_start_cb(self, _req, resp: Trigger.Response):
         self._do_start(tare=False)
@@ -131,32 +144,66 @@ class FTSensorNode(Node):
         return resp
 
     def _srv_tare_cb(self, _req, resp: Trigger.Response):
-        self._do_start(tare=True)
+        self._do_tare()
         resp.success = True
-        resp.message = "tared and streaming"
+        resp.message = "tare requested (offset captured from next sample)"
+        return resp
+
+    def _srv_reset_tare_cb(self, _req, resp: Trigger.Response):
+        self._do_reset_tare()
+        resp.success = True
+        resp.message = "tare cleared"
         return resp
 
     # --- helpers ----------------------------------------------------------
     def _do_start(self, tare: bool) -> None:
-        self._sensor.start_stream(tare=tare)
-        self._streaming = True
+        # Park the reader thread first so it isn't holding the buffer or
+        # mid-`serial.read` while we issue commands. The reader picks back
+        # up immediately when we re-flip the flag.
+        was_streaming = self._streaming
+        self._streaming = False
+        if was_streaming:
+            time.sleep(0.15)  # > one serial-read timeout (0.1 s)
+        try:
+            self._sensor.start_stream(tare=tare)
+        finally:
+            self._streaming = True
         self.get_logger().info("stream started" + (" (tared)" if tare else ""))
 
     def _do_stop(self) -> None:
-        self._sensor.stop_stream()
         self._streaming = False
+        time.sleep(0.05)
+        self._sensor.stop_stream()
         self.get_logger().info("stream stopped")
+
+    def _do_tare(self) -> None:
+        """Capture the next received sample as the software-tare baseline.
+
+        Use software tare because the hardware 0x47 command is a no-op on
+        the verified firmware. If the stream isn't running, start it first
+        so that a fresh sample is actually available.
+        """
+        if not self._streaming:
+            self._do_start(tare=False)
+        self._tare_pending = True
+        self.get_logger().info("tare requested (offset = next sample)")
+
+    def _do_reset_tare(self) -> None:
+        self._offsets = [0.0] * 6
+        self._tare_pending = False
+        self.get_logger().info("tare cleared (offsets = 0)")
 
     def _publish(self, w: Wrench) -> None:
         msg = WrenchStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self._frame_id
-        msg.wrench.force.x = w.fx
-        msg.wrench.force.y = w.fy
-        msg.wrench.force.z = w.fz
-        msg.wrench.torque.x = w.tx
-        msg.wrench.torque.y = w.ty
-        msg.wrench.torque.z = w.tz
+        ox, oy, oz, otx, oty, otz = self._offsets
+        msg.wrench.force.x = w.fx - ox
+        msg.wrench.force.y = w.fy - oy
+        msg.wrench.force.z = w.fz - oz
+        msg.wrench.torque.x = w.tx - otx
+        msg.wrench.torque.y = w.ty - oty
+        msg.wrench.torque.z = w.tz - otz
         self._pub.publish(msg)
 
     # --- reader loop ------------------------------------------------------
@@ -174,6 +221,15 @@ class FTSensorNode(Node):
                 break
             if wrench is None:
                 continue
+            # Capture next-sample tare baseline if requested.
+            if self._tare_pending:
+                self._offsets = [wrench.fx, wrench.fy, wrench.fz,
+                                 wrench.tx, wrench.ty, wrench.tz]
+                self._tare_pending = False
+                self.get_logger().info(
+                    f"tare baseline set: Fx={wrench.fx:+.3f} Fy={wrench.fy:+.3f} "
+                    f"Fz={wrench.fz:+.3f} N  Mx={wrench.tx:+.3f} My={wrench.ty:+.3f} "
+                    f"Mz={wrench.tz:+.3f} N*m")
             now = time.monotonic()
             if min_period > 0.0 and (now - last_pub) < min_period:
                 continue

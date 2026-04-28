@@ -24,9 +24,7 @@ Make sure no other process holds the serial port (e.g. stop the ROS node
 first), and that the user can read+write the device (group "dialout"
 membership is the usual fix on Linux).
 
-Sensor protocol (verified on the physical hardware shipped with this
-repo; this differs from section 4.3 of the manufacturer manual which
-appears to apply to a different firmware variant):
+Sensor protocol (verified on the physical hardware):
 
     Serial   : 460800 baud, 8N1, no flow control
     Frame    : 28 bytes
@@ -284,9 +282,14 @@ def check_sample_rate(port: str, baud: int, duration: float,
 
 
 def check_tare(port: str, baud: int) -> Tuple[bool, str]:
-    """TARE (0x47) followed by STREAM (0x48); verify the latest frame is
-    near zero on every axis. (On this firmware, 0x47 alone does not always
-    restart the data stream, so we follow up with 0x48.)"""
+    """Check whether the firmware HARDWARE tare actually zeroes the axes.
+
+    On the verified unit this is a NO-OP -- the firmware does not honour
+    0x47 (it neither zeroes nor restarts streaming). The check sends
+    STOP -> 0x47 -> 0x48 and verifies all six axes are within +/- 5 of
+    zero. Failure here is normal on this hardware; the ROS node works
+    around it with software tare.
+    """
     with _open(port, baud) as s:
         s.reset_input_buffer()
         s.write(CMD_STOP); s.flush(); time.sleep(0.05); s.reset_input_buffer()

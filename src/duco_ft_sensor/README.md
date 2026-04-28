@@ -7,11 +7,6 @@ The node opens the device, streams wrench samples at the sensor's native rate
 A standalone non-ROS reader and an independent self-test script are also
 provided for bench / wiring debugging.
 
-> **Why this readme exists.** The Chinese OCR'd `manual.md` in the repo root
-> describes a *different* protocol than the one actually implemented by the
-> hardware shipped with this unit. The information below has been verified
-> against the physical sensor and supersedes the manual where they disagree.
-
 ---
 
 ## Verified wire protocol
@@ -26,19 +21,17 @@ provided for bench / wiring debugging.
 | Final scaling | each `float32 × 10` → forces in **N**, torques in **N·m** |
 | Native sample rate | ~960 Hz |
 
-This matches the manufacturer's C# sample (`force[i] = ToSingle(data, i*4+2) * 10`),
-**not** the 12-byte packed-int format described in §4.3 of `manual.md` (that
-section appears to apply to a different firmware variant — probing this device
-at 230400 baud returns 0 bytes).
-
 ### Host → sensor commands (4 bytes each)
 
 | bytes | meaning |
 |---|---|
 | `0x43 0xAA 0x0D 0x0A` | stop streaming |
-| `0x47 0xAA 0x0D 0x0A` | tare (zero) then stream @ ~960 Hz |
-| `0x48 0xAA 0x0D 0x0A` | stream @ ~960 Hz (no tare) |
-| `0x49 0xAA 0x0D 0x0A` | one-shot (single frame) |
+| `0x48 0xAA 0x0D 0x0A` | stream @ ~960 Hz |
+
+The firmware on this unit also accepts `0x47` (tare) and `0x49` (one-shot)
+but neither produces useful behaviour: `0x47` does not zero the readings
+(values change by < 0.07 N) and silences the stream; `0x49` produces no
+data. Tare is therefore implemented in software in this node (see below).
 
 ### Verified hardware setup
 
@@ -84,15 +77,26 @@ Subscribed topics:
 
 | name | type | notes |
 |---|---|---|
-| `~/command` | `std_msgs/String` | accepts: `start`, `stop`, `tare`, `zero` |
+| `~/command` | `std_msgs/String` | accepts: `start`, `stop`, `tare` (alias `zero`), `reset_tare` (alias `untare`, `clear_tare`) |
 
 Services:
 
 | name | type | notes |
 |---|---|---|
-| `~/start` | `std_srvs/Trigger` | begin streaming (no tare) |
+| `~/start` | `std_srvs/Trigger` | begin streaming |
 | `~/stop` | `std_srvs/Trigger` | stop streaming |
-| `~/tare` | `std_srvs/Trigger` | zero the sensor and stream |
+| `~/tare` | `std_srvs/Trigger` | **software tare**: capture the next received sample as offset and subtract it from every subsequent published wrench |
+| `~/reset_tare` | `std_srvs/Trigger` | clear the software tare (offsets = 0) |
+
+> **Why software tare?** The firmware on the verified unit does **not**
+> implement a working hardware tare: probing 0x47 with delays from 0 ms
+> to 1 s shows the readings stay at the original (loaded) values to
+> within < 0.07 N, and 0x47 alone produces no data on the wire. The
+> node therefore implements tare in software: on `~/tare` it captures
+> the next-arrived sample as a 6-axis offset and subtracts it from every
+> outgoing wrench. Use `~/reset_tare` to clear the offsets back to zero.
+> The `tare_on_start` parameter requests the same software tare on
+> startup (the very first sample becomes the offset baseline).
 
 Parameters (with defaults):
 
