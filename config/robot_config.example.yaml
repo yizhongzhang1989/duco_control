@@ -41,6 +41,18 @@ ft_sensor_dashboard:
   title: ""                 # optional extra label in the page title
 
 # ============================================================================
+# duco_dashboard (robot state dashboard for ros2_control bringup)
+# ============================================================================
+duco_dashboard:
+  host: "0.0.0.0"
+  port: 8090
+  joint_states_topic: "/joint_states"
+  wrench_topic: "/duco_ft_sensor/wrench"
+  controller_state_topic: "/arm_1_controller/state"
+  push_rate: 20.0
+  stale_after: 1.0
+
+# ============================================================================
 # duco_robot_bringup (project wrapper for the submodule ros2_control stack)
 # ============================================================================
 duco_robot_bringup:

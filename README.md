@@ -6,6 +6,7 @@ ROS 2 workspace for Duco robot control utilities.
 
 - `duco_ft_sensor`: serial driver and ROS publisher for the verified Duco F/T sensor protocol.
 - `ft_sensor_dashboard`: web dashboard for any `geometry_msgs/WrenchStamped` topic.
+- `duco_dashboard`: web dashboard for robot joint, controller, wrench, and TCP state.
 - `common`: centralized project configuration loader.
 - `duco_robot_bringup`: project-owned launch wrappers that read the central config.
 
@@ -43,6 +44,14 @@ ros2 launch duco_robot_bringup gcr5_910_ros2_control.launch.py use_rviz:=false
 ros2 control list_controllers
 ros2 topic echo /joint_states --once
 ```
+
+Robot-state dashboard:
+
+```bash
+ros2 launch duco_dashboard dashboard.launch.py
+```
+
+Open `http://localhost:8090`.
 
 Set `duco_robot_bringup.use_fake_hardware` to `false` only when the
 robot controller IP and network are ready for real hardware.
