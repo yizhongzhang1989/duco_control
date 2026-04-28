@@ -7,7 +7,7 @@ It monitors:
 
 - `/joint_states`
 - `/arm_1_controller/state`
-- `/duco_ft_sensor/wrench`
+- `/duco_ft_sensor/wrench_raw`
 - approximate GCR5-910 TCP pose from local forward kinematics
 
 Launch:

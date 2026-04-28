@@ -23,6 +23,7 @@ version: "1.0"
 duco_ft_sensor:
   port: "/dev/ttyUSB0"      # USB-serial device
   baud: 460800
+  topic: "/duco_ft_sensor/wrench_raw"
   frame_id: "ft_sensor_link"
   publish_rate: 0.0         # 0 = publish every received frame (~960 Hz)
   autostart: true           # start streaming on launch
@@ -32,7 +33,7 @@ duco_ft_sensor:
 # ft_sensor_dashboard (web dashboard for any WrenchStamped topic)
 # ============================================================================
 ft_sensor_dashboard:
-  topic: "/duco_ft_sensor/wrench"  # which wrench topic to plot
+  topic: "/duco_ft_sensor/wrench_raw"  # which wrench topic to plot
   host: "0.0.0.0"           # 0.0.0.0 = LAN-visible, 127.0.0.1 = local-only
   port: 8080
   window_seconds: 10.0      # initial plot window
@@ -47,7 +48,7 @@ duco_dashboard:
   host: "0.0.0.0"
   port: 8090
   joint_states_topic: "/joint_states"
-  wrench_topic: "/duco_ft_sensor/wrench"
+  wrench_topic: "/duco_ft_sensor/wrench_raw"
   controller_state_topic: "/arm_1_controller/state"
   push_rate: 20.0
   stale_after: 1.0

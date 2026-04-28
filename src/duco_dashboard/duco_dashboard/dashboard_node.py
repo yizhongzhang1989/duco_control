@@ -110,7 +110,7 @@ class DucoDashboard(Node):
         self.declare_parameter('host', '0.0.0.0')
         self.declare_parameter('port', 8090)
         self.declare_parameter('joint_states_topic', '/joint_states')
-        self.declare_parameter('wrench_topic', '/duco_ft_sensor/wrench')
+        self.declare_parameter('wrench_topic', '/duco_ft_sensor/wrench_raw')
         self.declare_parameter('controller_state_topic', '/arm_1_controller/state')
         self.declare_parameter('push_rate', 20.0)
         self.declare_parameter('stale_after', 1.0)

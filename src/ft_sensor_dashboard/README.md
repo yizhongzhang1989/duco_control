@@ -79,7 +79,7 @@ ros2 launch ft_sensor_dashboard dashboard.launch.py topic:=/right/wrench port:=8
 
 | name | type | default | meaning |
 |---|---|---|---|
-| `topic` | string | `/duco_ft_sensor/wrench` | wrench topic to subscribe to (any `WrenchStamped` publisher works) |
+| `topic` | string | `/duco_ft_sensor/wrench_raw` | wrench topic to subscribe to (any `WrenchStamped` publisher works) |
 | `host` | string | `0.0.0.0` | HTTP bind address; `0.0.0.0` = LAN-visible, `127.0.0.1` = local-only |
 | `port` | int | `8080` | HTTP port |
 | `window_seconds` | double | `10.0` | initial time window shown in the plots |
@@ -121,7 +121,7 @@ Example:
 
 ```bash
 curl http://localhost:8080/api/info
-# {"topic":"/duco_ft_sensor/wrench","title":"","window_seconds":10.0,
+# {"topic":"/duco_ft_sensor/wrench_raw","title":"","window_seconds":10.0,
 #  "push_rate":30.0,"server":"fastapi","received":12345,"rate_hz":1000.4}
 
 curl -N http://localhost:8080/events?rate=10

@@ -10,7 +10,7 @@ _FALLBACKS = {
     'host': '0.0.0.0',
     'port': 8090,
     'joint_states_topic': '/joint_states',
-    'wrench_topic': '/duco_ft_sensor/wrench',
+    'wrench_topic': '/duco_ft_sensor/wrench_raw',
     'controller_state_topic': '/arm_1_controller/state',
     'push_rate': 20.0,
     'stale_after': 1.0,

@@ -5,7 +5,7 @@ Defaults are taken from ``config/robot_config.yaml`` under
 
 Examples:
   ros2 launch duco_ft_sensor ft_sensor.launch.py
-  ros2 launch duco_ft_sensor ft_sensor.launch.py port:=/dev/ttyUSB0 frame_id:=tool0
+    ros2 launch duco_ft_sensor ft_sensor.launch.py port:=/dev/ttyUSB0 topic:=/ft/raw frame_id:=tool0
   ros2 launch duco_ft_sensor ft_sensor.launch.py tare_on_start:=true
 """
 
@@ -20,6 +20,7 @@ from launch_ros.actions import Node
 _FALLBACKS = {
     "port": "/dev/ttyUSB0",
     "baud": 460800,
+    "topic": "/duco_ft_sensor/wrench_raw",
     "frame_id": "ft_sensor_link",
     "publish_rate": 0.0,
     "autostart": True,
@@ -61,6 +62,7 @@ def generate_launch_description() -> LaunchDescription:
     args = [
         DeclareLaunchArgument("port", default_value=str(d["port"])),
         DeclareLaunchArgument("baud", default_value=str(d["baud"])),
+        DeclareLaunchArgument("topic", default_value=str(d["topic"])),
         DeclareLaunchArgument("frame_id", default_value=str(d["frame_id"])),
         DeclareLaunchArgument(
             "publish_rate", default_value=str(d["publish_rate"]),
@@ -75,7 +77,7 @@ def generate_launch_description() -> LaunchDescription:
     log = LogInfo(msg=(
         f"[duco_ft_sensor] config: {source}; "
         f"defaults: port={d['port']} baud={d['baud']} "
-        f"frame_id={d['frame_id']}"))
+        f"topic={d['topic']} frame_id={d['frame_id']}"))
 
     node = Node(
         package="duco_ft_sensor",
@@ -87,6 +89,7 @@ def generate_launch_description() -> LaunchDescription:
         parameters=[{
             "port": LaunchConfiguration("port"),
             "baud": LaunchConfiguration("baud"),
+            "topic": LaunchConfiguration("topic"),
             "frame_id": LaunchConfiguration("frame_id"),
             "publish_rate": LaunchConfiguration("publish_rate"),
             "autostart": LaunchConfiguration("autostart"),

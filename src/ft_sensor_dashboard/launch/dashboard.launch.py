@@ -18,7 +18,7 @@ from launch_ros.actions import Node
 # Hard-coded fallbacks if the central config is missing or doesn't
 # contain a particular key. Match the historical defaults.
 _FALLBACKS = {
-    "topic": "/duco_ft_sensor/wrench",
+    "topic": "/duco_ft_sensor/wrench_raw",
     "host": "0.0.0.0",
     "port": 8080,
     "window_seconds": 10.0,
