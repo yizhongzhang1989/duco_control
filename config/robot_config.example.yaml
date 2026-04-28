@@ -1,0 +1,41 @@
+# duco_control project configuration template
+#
+# Copy this file to robot_config.yaml and edit with your local values.
+# robot_config.yaml is gitignored (it can hold machine-specific IPs,
+# device paths, and credentials).
+#
+#   cp config/robot_config.example.yaml config/robot_config.yaml
+#   ${EDITOR:-nano} config/robot_config.yaml
+#
+# Convention: top-level keys are PACKAGE NAMES; second-level keys are
+# the names the package's launch file exposes (i.e. they map 1-to-1 to
+# `ros2 launch <pkg> <launch_file> <key>:=<value>`). New packages just
+# add a new top-level section with their own keys.
+#
+# Strings may use ${ENV_VAR} expansion (e.g. ${HOME}). Values not set
+# here fall back to whatever the consuming launch file defaults to.
+
+version: "1.0"
+
+# ============================================================================
+# duco_ft_sensor (driver node for the 6-DoF F/T sensor)
+# ============================================================================
+duco_ft_sensor:
+  port: "/dev/ttyUSB0"      # USB-serial device
+  baud: 460800
+  frame_id: "ft_sensor_link"
+  publish_rate: 0.0         # 0 = publish every received frame (~960 Hz)
+  autostart: true           # start streaming on launch
+  tare_on_start: false      # software-tare against the first sample on startup
+
+# ============================================================================
+# ft_sensor_dashboard (web dashboard for any WrenchStamped topic)
+# ============================================================================
+ft_sensor_dashboard:
+  topic: "/duco_ft_sensor/wrench"  # which wrench topic to plot
+  host: "0.0.0.0"           # 0.0.0.0 = LAN-visible, 127.0.0.1 = local-only
+  port: 8080
+  window_seconds: 10.0      # initial plot window
+  push_rate: 30.0           # initial SSE update rate (Hz)
+  reliability: "best_effort"  # match the publisher's QoS
+  title: ""                 # optional extra label in the page title
