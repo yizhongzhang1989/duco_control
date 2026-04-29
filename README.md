@@ -6,6 +6,9 @@ ROS 2 workspace for Duco robot control utilities.
 
 - `duco_ft_sensor`: serial driver and ROS publisher for the verified Duco F/T sensor protocol.
 - `ft_sensor_dashboard`: web dashboard for any `geometry_msgs/WrenchStamped` topic.
+- `ft_sensor_gravity_compensation`: subscribes to the raw F/T wrench and `/tf`,
+  publishes a gravity-compensated wrench, and serves a calibration dashboard
+  with multi-end-effector profiles.
 - `duco_dashboard`: web dashboard for robot joint, controller, wrench, and TCP state.
 - `common`: centralized project configuration loader.
 - `duco_robot_bringup`: project-owned launch wrappers that read the central config.

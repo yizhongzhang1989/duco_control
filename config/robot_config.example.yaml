@@ -42,6 +42,24 @@ ft_sensor_dashboard:
   title: ""                 # optional extra label in the page title
 
 # ============================================================================
+# ft_sensor_gravity_compensation (compensated wrench publisher + dashboard)
+# ============================================================================
+ft_sensor_gravity_compensation:
+  input_topic: "/duco_ft_sensor/wrench_raw"
+  output_topic: "/duco_ft_sensor/wrench_compensated"
+  world_frame: "base_link"        # gravity-fixed frame in /tf
+  sensor_frame: "link_6"          # frame whose orientation is used for gravity
+  reliability: "best_effort"      # match the publisher's QoS
+  publish_when_no_tf: false       # if true, fall back to bias-only when TF stale
+  storage_path: "~/.ros/ft_sensor_gravity_compensation/end_effectors.yaml"
+  enable_dashboard: false         # set true to launch the calibration web UI
+  host: "0.0.0.0"
+  port: 8100
+  gravity: 9.80665                # m/s^2
+  tf_timeout: 0.05                # seconds, per lookup_transform call
+  tf_max_age: 1.0                 # seconds; older TF -> stop publishing
+
+# ============================================================================
 # duco_dashboard (robot state dashboard for ros2_control bringup)
 # ============================================================================
 duco_dashboard:
