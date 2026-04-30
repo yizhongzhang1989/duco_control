@@ -60,6 +60,51 @@ ft_sensor_gravity_compensation:
   tf_max_age: 1.0                 # seconds; older TF -> stop publishing
 
 # ============================================================================
+# duco_cartesian_control (FZI orchestrator: engage UX + safety supervisor
+# wrapping FZI's cartesian_force_controller; the C++ controller does the
+# actual Cartesian admittance work in controller_manager).  System works
+# end-to-end without any dashboard; cartesian_controller_dashboard below
+# is a separate, optional UI.
+# ============================================================================
+duco_cartesian_control:
+  # ---- connectivity ----
+  wrench_topic: "/duco_ft_sensor/wrench_compensated"
+  joint_states_topic: "/joint_states"
+  controller_manager_ns: "/controller_manager"
+  engaged_default: false          # do not auto-engage on launch
+  # ---- FZI controller wiring ----
+  fzi_controller_name:     "cartesian_force_controller"
+  fzi_jtc_controller_name: "arm_1_controller"
+  fzi_ft_topic:            "/cartesian_force_controller/ft_sensor_wrench"
+  fzi_target_topic:        "/cartesian_force_controller/target_wrench"
+  fzi_target_frame:        "link_6"
+  fzi_target_rate_hz:      10.0
+  fzi_service_timeout_sec: 2.0
+  # ---- supervisor + state publish ----
+  loop_rate_hz: 50.0              # safety-supervisor tick (not the FZI hot path)
+  state_publish_rate_hz: 5.0      # rate the JSON state topic is heartbeated
+  # ---- safety ----
+  max_wrench_force: 80.0
+  max_wrench_torque: 10.0
+  engage_max_joint_velocity: 0.05 # rad/s; refuse engage above this
+  ft_stale_after: 0.25
+  joint_states_stale_after: 0.25
+
+# ============================================================================
+# cartesian_controller_dashboard (web UI for monitoring + parameter tuning).
+# Pure UI: subscribes to duco_cartesian_control's state, calls its
+# Trigger services, and reads/writes parameters on the FZI controller.
+# ============================================================================
+cartesian_controller_dashboard:
+  orchestrator_ns:     "/duco_cartesian_control"
+  controller_name:     "cartesian_force_controller"
+  wrench_topic:        "/duco_ft_sensor/wrench_compensated"
+  joint_states_topic:  "/joint_states"
+  service_timeout_sec: 2.0
+  host: "0.0.0.0"
+  port: 8120
+
+# ============================================================================
 # duco_dashboard (robot state dashboard for ros2_control bringup)
 # ============================================================================
 duco_dashboard:

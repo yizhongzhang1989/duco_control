@@ -1,0 +1,40 @@
+# FZI cartesian_force_controller -- "zero-gravity" / free-drive
+# preset.  The controller minimises (ft_sensor_wrench - target_wrench);
+# we publish target_wrench = 0 from the orchestrator, so any real
+# external force on the FT sensor will move the arm to cancel it --
+# i.e. the user can hand-guide the robot.
+#
+# The gains below are deliberately conservative for first contact:
+# small `error_scale` keeps each integration step short, modest
+# `pd_gains.p` keeps the inner-loop response gentle.
+#
+# These values are loaded into the controller_manager when the
+# spawner brings the controller up.  They can also be live-tuned via
+# `ros2 param set /cartesian_force_controller pd_gains.trans_x.p ...`
+# or through the cartesian_controller_dashboard parameter UI.
+
+cartesian_force_controller:
+  ros__parameters:
+    end_effector_link: "link_6"
+    robot_base_link: "base_link"
+    ft_sensor_ref_link: "link_6"
+    joints:
+      - arm_1_joint_1
+      - arm_1_joint_2
+      - arm_1_joint_3
+      - arm_1_joint_4
+      - arm_1_joint_5
+      - arm_1_joint_6
+    command_interfaces:
+      - position
+    solver:
+      error_scale: 0.05      # integration step (s); FZI default 1.0
+      iterations: 5
+      publish_state_feedback: true
+    pd_gains:
+      trans_x: {p: 0.05}
+      trans_y: {p: 0.05}
+      trans_z: {p: 0.05}
+      rot_x:   {p: 0.5}
+      rot_y:   {p: 0.5}
+      rot_z:   {p: 0.5}

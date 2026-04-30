@@ -1,0 +1,44 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>duco_cartesian_control</name>
+  <version>0.1.0</version>
+  <description>
+    Cartesian-controller setup + operator orchestration for the Duco
+    GCR5_910 arm. Spawns FZI's cartesian_force_controller into the live
+    controller_manager, relays the gravity-compensated wrench onto the
+    controller's RELIABLE input, publishes a zero target_wrench
+    heartbeat, exposes engage/disengage Trigger services that atomically
+    swap arm_1_controller and the FZI controller, and runs a safety
+    supervisor that auto-disengages on stale topics or excessive
+    force/torque. The actual Cartesian compliance hot path is the C++
+    plugin from
+    https://github.com/yizhongzhang1989/cartesian_controllers (a fork
+    of fzi-forschungszentrum-informatik/cartesian_controllers).
+    The system runs without any dashboard; cartesian_controller_dashboard
+    is a separate, optional package.
+  </description>
+
+  <maintainer email="yizhongzhang1989@gmail.com">yizhongzhang</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>controller_manager_msgs</exec_depend>
+  <exec_depend>cartesian_force_controller</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
+  <exec_depend>common</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
