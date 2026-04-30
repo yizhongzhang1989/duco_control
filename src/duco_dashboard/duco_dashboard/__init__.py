@@ -1,0 +1,1 @@
+"""Duco robot monitoring dashboard."""

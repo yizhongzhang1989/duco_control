@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Duco Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { width: 100%; height: 100%; overflow: hidden; }
+        body { background: #1a1a2e; color: #e0e6ef; font-family: "Segoe UI", system-ui, -apple-system, sans-serif; }
+        #viewer { display: block; width: 100vw; height: 100vh; }
+        #loading {
+            position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            color: #4fc3f7; font-size: 18px; text-align: center; z-index: 20;
+        }
+        .spinner {
+            border: 3px solid rgba(79,195,247,0.15); border-top: 3px solid #4fc3f7;
+            border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 0 auto 15px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        #panel {
+            display: none; position: fixed; top: 12px; right: 12px;
+            width: min(380px, calc(100vw - 24px)); max-height: calc(100vh - 24px); overflow: auto;
+            background: rgba(22, 33, 62, 0.92); border: 1px solid rgba(79, 195, 247, 0.30);
+            border-radius: 10px; padding: 14px 18px 16px; backdrop-filter: blur(8px); z-index: 10;
+            box-shadow: 0 18px 48px rgba(0, 0, 0, 0.30);
+        }
+        #panel h1 { font-size: 16px; color: #4fc3f7; margin-bottom: 8px; font-weight: 650; }
+        .status-row { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; color: #90a4ae; font-size: 11px; }
+        .status-row .push { margin-left: auto; }
+        .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; background: #ef5350; }
+        .status-dot.connected { background: #66bb6a; box-shadow: 0 0 8px rgba(102, 187, 106, 0.55); }
+        .section { margin-top: 11px; }
+        .section-title { font-size: 10px; color: #78909c; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 5px; }
+        .metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+        .metric { background: rgba(15, 25, 35, 0.82); border: 1px solid rgba(55, 71, 79, 0.82); border-radius: 6px; padding: 7px 8px; min-width: 0; }
+        .metric-label { color: #78909c; font-size: 9px; text-transform: uppercase; letter-spacing: 0.7px; margin-bottom: 3px; }
+        .metric-value { color: #66bb6a; font-family: Consolas, "SFMono-Regular", ui-monospace, monospace; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .metric-value.warn { color: #ffa726; }
+        .metric-value.bad { color: #ef5350; }
+        .joint-row { display: grid; grid-template-columns: 25px minmax(90px, 1fr) 62px 56px; align-items: center; gap: 5px; height: 21px; margin-bottom: 3px; }
+        .joint-label { font-size: 11px; font-weight: 650; text-align: center; }
+        .joint-bar-bg { height: 16px; background: #0f1923; border-radius: 3px; position: relative; overflow: hidden; box-shadow: inset 0 0 0 1px rgba(55, 71, 79, 0.6); }
+        .joint-center { position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: #37474f; z-index: 2; }
+        .joint-bar { height: 100%; border-radius: 3px; transition: width 0.06s ease-out; position: absolute; top: 0; }
+        .joint-bar.positive { left: 50%; }
+        .joint-bar.negative { right: 50%; }
+        .joint-val { text-align: right; font-size: 10px; font-family: Consolas, "SFMono-Regular", ui-monospace, monospace; color: #4fc3f7; white-space: nowrap; }
+        .joint-vel { color: #78909c; }
+        .info-row { display: flex; justify-content: space-between; gap: 12px; padding: 2px 0; font-size: 12px; }
+        .info-label { color: #78909c; }
+        .info-value { color: #66bb6a; font-family: Consolas, "SFMono-Regular", ui-monospace, monospace; text-align: right; }
+        .info-value.force { color: #ffa726; }
+        #tcpDisplay, #topicDisplay {
+            font-family: Consolas, "SFMono-Regular", ui-monospace, monospace; font-size: 10px; color: #4fc3f7;
+            white-space: pre; background: rgba(15, 25, 35, 0.68); border: 1px solid rgba(55, 71, 79, 0.65);
+            border-radius: 6px; padding: 8px; overflow: auto;
+        }
+        #sceneLabel {
+            position: fixed; left: 14px; bottom: 12px; z-index: 5; color: #78909c; font-size: 11px;
+            font-family: Consolas, "SFMono-Regular", ui-monospace, monospace; background: rgba(15, 25, 35, 0.52);
+            border: 1px solid rgba(55, 71, 79, 0.45); border-radius: 6px; padding: 6px 8px;
+        }
+        @media (max-width: 520px) {
+            #panel { left: 10px; right: 10px; width: auto; }
+            .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        }
+    </style>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "./vendor/three.module.js",
+            "three/addons/": "./vendor/addons/",
+            "three/examples/jsm/": "./vendor/addons/"
+        }
+    }
+    </script>
+</head>
+<body>
+    <canvas id="viewer"></canvas>
+    <div id="loading"><div class="spinner"></div>Loading Duco model...</div>
+    <div id="sceneLabel">base_link / link_6</div>
+    <div id="panel">
+        <h1>Duco GCR5-910</h1>
+        <div class="status-row">
+            <div><span class="status-dot" id="connDot"></span><span id="connText">Disconnected</span></div>
+            <div class="push"><span id="rateVal">-- Hz</span></div>
+        </div>
+        <div class="metrics">
+            <div class="metric"><div class="metric-label">Joint Age</div><div class="metric-value" id="jointAge">--</div></div>
+            <div class="metric"><div class="metric-label">Controller</div><div class="metric-value" id="controllerState">--</div></div>
+            <div class="metric"><div class="metric-label">Wrench</div><div class="metric-value" id="wrenchState">--</div></div>
+        </div>
+        <div class="section"><div class="section-title">Joints</div><div id="joints"></div></div>
+        <div class="section">
+            <div class="section-title">Force / Torque</div>
+            <div class="info-row"><span class="info-label">F</span><span class="info-value force" id="forceVal">--</span></div>
+            <div class="info-row"><span class="info-label">T</span><span class="info-value force" id="torqueVal">--</span></div>
+            <div class="info-row"><span class="info-label">|F|</span><span class="info-value force" id="forceMag">--</span></div>
+        </div>
+        <div class="section"><div class="section-title">TCP Pose</div><div id="tcpDisplay">--</div></div>
+        <div class="section"><div class="section-title">Topics</div><div id="topicDisplay">--</div></div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import URDFLoader from './vendor/URDFLoader.js';
+
+        const URDF_PATH = '/duco_support/urdf/duco_gcr5_910.urdf';
+        const COLORS = ['#42a5f5', '#66bb6a', '#ffa726', '#ef5350', '#ab47bc', '#26c6da'];
+        const JOINT_RANGE_DEG = [360, 360, 360, 360, 360, 360];
+
+        const jointHost = document.getElementById('joints');
+        for (let i = 0; i < 6; i++) {
+            jointHost.insertAdjacentHTML('beforeend', `<div class="joint-row">
+                <div class="joint-label" style="color:${COLORS[i]}">J${i + 1}</div>
+                <div class="joint-bar-bg"><div class="joint-center"></div><div class="joint-bar" id="jbar${i}" style="width:0%"></div></div>
+                <div class="joint-val" id="jval${i}">0.0 deg</div>
+                <div class="joint-val joint-vel" id="jvel${i}">0.000</div>
+            </div>`);
+        }
+
+        const canvas = document.getElementById('viewer');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x1a1a2e);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.01, 100);
+        camera.up.set(0, 0, 1);
+        camera.position.set(1.2, -1.25, 0.95);
+
+        const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.setScissorTest(true);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.15;
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.1;
+        controls.target.set(0.25, 0.0, 0.38);
+        controls.update();
+
+        scene.add(new THREE.AmbientLight(0xffffff, 0.58));
+        scene.add(new THREE.HemisphereLight(0xb0d4f1, 0x404040, 0.75));
+        const keyLight = new THREE.DirectionalLight(0xffffff, 1.45);
+        keyLight.position.set(3, 5, 3);
+        keyLight.castShadow = true;
+        keyLight.shadow.mapSize.set(2048, 2048);
+        scene.add(keyLight);
+        const fillLight = new THREE.DirectionalLight(0xffffff, 0.45);
+        fillLight.position.set(-2, 3, -1);
+        scene.add(fillLight);
+        const rimLight = new THREE.DirectionalLight(0xffffff, 0.3);
+        rimLight.position.set(0, -1, 3);
+        scene.add(rimLight);
+
+        const grid = new THREE.GridHelper(2.2, 22, 0x444466, 0x333355);
+        grid.rotation.x = Math.PI / 2;
+        scene.add(grid);
+        scene.add(new THREE.AxesHelper(0.2));
+
+        const tcpAxes = new THREE.AxesHelper(0.12);
+        tcpAxes.visible = false;
+        scene.add(tcpAxes);
+
+        const forceArrow = new THREE.ArrowHelper(
+            new THREE.Vector3(0, 0, -1), new THREE.Vector3(0, 0, 0),
+            0.1, 0xff4444, 0.03, 0.02
+        );
+        forceArrow.visible = false;
+        scene.add(forceArrow);
+
+        const ground = new THREE.Mesh(
+            new THREE.PlaneGeometry(2.2, 2.2),
+            new THREE.ShadowMaterial({ opacity: 0.28 })
+        );
+        ground.receiveShadow = true;
+        scene.add(ground);
+
+        let robot = null;
+        let latest = null;
+        let initialFrameDone = false;
+        const loader = new URDFLoader();
+        loader.packages = { duco_support: '/duco_support' };
+        loader.load(URDF_PATH, (result) => {
+            robot = result;
+            scene.add(robot);
+            robot.traverse((child) => {
+                if (child.isMesh) {
+                    child.castShadow = true;
+                    child.receiveShadow = true;
+                    if (child.material) {
+                        child.material.side = THREE.DoubleSide;
+                    }
+                }
+            });
+            document.getElementById('loading').style.display = 'none';
+            document.getElementById('panel').style.display = 'block';
+            if (latest) applyRobotState(latest);
+            frameRobotOnce();
+        }, undefined, (error) => {
+            document.getElementById('loading').innerHTML = '<div style="color:#ff5252;">Failed to load Duco model<br>' + error + '</div>';
+        });
+
+        function fmt(value, digits = 3) {
+            return value === null || value === undefined || Number.isNaN(Number(value)) ? '--' : Number(value).toFixed(digits);
+        }
+        function freshnessClass(fresh, count) { if (!count) return 'bad'; return fresh ? '' : 'warn'; }
+        function setMetric(id, value, klass = '') {
+            const element = document.getElementById(id);
+            element.textContent = value;
+            element.className = `metric-value ${klass}`;
+        }
+        function updateBar(index, deg) {
+            const bar = document.getElementById(`jbar${index}`);
+            const halfRange = JOINT_RANGE_DEG[index] / 2;
+            const pct = Math.min(Math.abs(deg) / halfRange * 50, 50);
+            bar.style.width = `${pct}%`;
+            bar.className = 'joint-bar ' + (deg >= 0 ? 'positive' : 'negative');
+            bar.style.background = `linear-gradient(${deg >= 0 ? '90deg' : '270deg'}, ${COLORS[index]}88, ${COLORS[index]})`;
+            document.getElementById(`jval${index}`).textContent = `${fmt(deg, 1)} deg`;
+        }
+        function updateTcpFrame(matrix) {
+            tcpAxes.matrix.set(
+                matrix[0][0], matrix[0][1], matrix[0][2], matrix[0][3],
+                matrix[1][0], matrix[1][1], matrix[1][2], matrix[1][3],
+                matrix[2][0], matrix[2][1], matrix[2][2], matrix[2][3],
+                matrix[3][0], matrix[3][1], matrix[3][2], matrix[3][3]
+            );
+            tcpAxes.matrixAutoUpdate = false;
+            tcpAxes.matrixWorldNeedsUpdate = true;
+            tcpAxes.visible = true;
+        }
+        function updateForceArrow(state) {
+            const force = state.wrench.force;
+            const matrix = state.tcp.matrix;
+            if (!matrix || !state.wrench.force_mag || state.wrench.force_mag <= 0.5) {
+                forceArrow.visible = false;
+                return;
+            }
+            const origin = new THREE.Vector3(matrix[0][3], matrix[1][3], matrix[2][3]);
+            const x = matrix[0][0] * force.x + matrix[0][1] * force.y + matrix[0][2] * force.z;
+            const y = matrix[1][0] * force.x + matrix[1][1] * force.y + matrix[1][2] * force.z;
+            const z = matrix[2][0] * force.x + matrix[2][1] * force.y + matrix[2][2] * force.z;
+            const direction = new THREE.Vector3(x, y, z);
+            const magnitude = direction.length();
+            if (magnitude <= 0.01) {
+                forceArrow.visible = false;
+                return;
+            }
+            direction.normalize();
+            const length = Math.min(Math.max(magnitude * 0.02, 0.02), 0.5);
+            forceArrow.position.copy(origin);
+            forceArrow.setDirection(direction);
+            forceArrow.setLength(length, length * 0.3, length * 0.15);
+            forceArrow.visible = true;
+        }
+        function applyRobotState(state) {
+            if (robot && state.joint_names && state.joints_rad) {
+                for (let i = 0; i < state.joint_names.length; i++) {
+                    robot.setJointValue(state.joint_names[i], state.joints_rad[i]);
+                }
+                frameRobotOnce();
+            }
+            if (state.tcp && state.tcp.matrix) {
+                updateTcpFrame(state.tcp.matrix);
+                updateForceArrow(state);
+            }
+        }
+        function frameRobotOnce() {
+            if (!robot || initialFrameDone) return;
+            robot.updateMatrixWorld(true);
+            const box = new THREE.Box3().setFromObject(robot);
+            if (box.isEmpty()) return;
+            const viewport = sceneViewport();
+            camera.aspect = viewport.width / viewport.height;
+            const center = box.getCenter(new THREE.Vector3());
+            const size = box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z, 0.6);
+            const distance = maxDim / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2)) * 1.55;
+            controls.target.copy(center);
+            controls.target.z += Math.min(0.08, maxDim * 0.08);
+            camera.position.set(
+                controls.target.x + distance * 0.72,
+                controls.target.y - distance * 0.86,
+                controls.target.z + distance * 0.46
+            );
+            camera.near = Math.max(distance / 100, 0.01);
+            camera.far = distance * 100;
+            camera.updateProjectionMatrix();
+            controls.update();
+            initialFrameDone = true;
+        }
+        function sceneViewport() {
+            const panel = document.getElementById('panel');
+            const panelRect = panel && getComputedStyle(panel).display !== 'none'
+                ? panel.getBoundingClientRect()
+                : null;
+            const reservedRight = panelRect ? Math.max(0, window.innerWidth - panelRect.left + 12) : 0;
+            const width = Math.max(260, window.innerWidth - reservedRight);
+            return { x: 0, y: 0, width: Math.min(width, window.innerWidth), height: window.innerHeight };
+        }
+        function applyViewport() {
+            const viewport = sceneViewport();
+            camera.aspect = viewport.width / viewport.height;
+            camera.updateProjectionMatrix();
+            renderer.setViewport(viewport.x, viewport.y, viewport.width, viewport.height);
+            renderer.setScissor(viewport.x, viewport.y, viewport.width, viewport.height);
+        }
+        function update(state) {
+            latest = state;
+            const dot = document.getElementById('connDot');
+            dot.className = 'status-dot' + (state.connected ? ' connected' : '');
+            document.getElementById('connText').textContent = state.connected ? 'Connected' : 'Disconnected';
+            document.getElementById('rateVal').textContent = `${fmt(state.joint_state.rate, 1)} Hz`;
+            setMetric('jointAge', `${fmt(state.joint_state.age, 3)} s`, freshnessClass(state.joint_state.fresh, state.joint_state.count));
+            setMetric('controllerState', state.controller.available ? 'active' : 'missing', freshnessClass(state.controller.fresh, state.controller.available));
+            setMetric('wrenchState', `${fmt(state.wrench.age, 3)} s`, freshnessClass(state.wrench.fresh, state.wrench.count));
+            for (let i = 0; i < 6; i++) {
+                updateBar(i, state.joints_deg[i] || 0);
+                document.getElementById(`jvel${i}`).textContent = fmt(state.velocity[i], 3);
+            }
+            const force = state.wrench.force;
+            const torque = state.wrench.torque;
+            document.getElementById('forceVal').textContent = `(${fmt(force.x, 2)}, ${fmt(force.y, 2)}, ${fmt(force.z, 2)}) N`;
+            document.getElementById('torqueVal').textContent = `(${fmt(torque.x, 3)}, ${fmt(torque.y, 3)}, ${fmt(torque.z, 3)}) Nm`;
+            document.getElementById('forceMag').textContent = `${fmt(state.wrench.force_mag, 2)} N`;
+            document.getElementById('tcpDisplay').textContent =
+                `Pos:  (${state.tcp.position.map(v => fmt(v, 4)).join(', ')}) m\n` +
+                `RPY:  (${state.tcp.rpy_deg.map(v => fmt(v, 2)).join(', ')}) deg\n` +
+                state.tcp.matrix.map(row => row.map(v => fmt(v, 4).padStart(8)).join(' ')).join('\n');
+            document.getElementById('topicDisplay').textContent =
+                `${state.joint_state.topic}   ${state.joint_state.count} msgs\n` +
+                `${state.wrench.topic}   ${state.wrench.count} msgs\n` +
+                `${state.controller.topic}   age ${fmt(state.controller.age, 3)} s`;
+            applyRobotState(state);
+        }
+        function connectSSE() {
+            const source = new EventSource('/api/events');
+            source.onopen = () => {
+                const dot = document.getElementById('connDot');
+                dot.className = 'status-dot connected';
+                document.getElementById('connText').textContent = 'Server';
+            };
+            source.onmessage = event => { try { update(JSON.parse(event.data)); } catch (_) {} };
+            source.onerror = () => {
+                const dot = document.getElementById('connDot');
+                dot.className = 'status-dot';
+                document.getElementById('connText').textContent = 'Disconnected';
+                source.close();
+                setTimeout(connectSSE, 1500);
+            };
+        }
+        window.addEventListener('resize', () => {
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            applyViewport();
+        });
+        fetch('/api/state').then(response => response.json()).then(update).catch(() => {});
+        connectSSE();
+        (function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            applyViewport();
+            renderer.render(scene, camera);
+        })();
+    </script>
+</body>
+</html>

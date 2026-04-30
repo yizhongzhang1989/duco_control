@@ -3,7 +3,8 @@
 ROS 2 driver for the Duco 6-DoF force/torque sensor (RS-422 over USB serial).
 
 The node opens the device, streams wrench samples at the sensor's native rate
-(~1 kHz), and publishes them on `~/wrench` as `geometry_msgs/WrenchStamped`.
+(~1 kHz), and publishes them on the configurable raw wrench topic
+`~/wrench_raw` as `geometry_msgs/WrenchStamped`.
 A standalone non-ROS reader and an independent self-test script are also
 provided for bench / wiring debugging.
 
@@ -64,13 +65,13 @@ The node publishes to:
 
 | name | type | notes |
 |---|---|---|
-| `~/wrench` | `geometry_msgs/WrenchStamped` | sensor data, ~1 kHz, **BEST_EFFORT** QoS, KEEP_LAST(200) |
+| `~/wrench_raw` | `geometry_msgs/WrenchStamped` | raw sensor data, ~1 kHz, **BEST_EFFORT** QoS, KEEP_LAST(200) |
 
-> **QoS note.** `~/wrench` uses `BEST_EFFORT` so that slow subscribers cannot
+> **QoS note.** `~/wrench_raw` uses `BEST_EFFORT` so that slow subscribers cannot
 > apply back-pressure to the publisher. The default `ros2 topic hz` and
 > `ros2 topic echo` use `RELIABLE`, which **will not subscribe** to a
 > BEST_EFFORT publisher and will appear silent. To inspect from the CLI, run
-> `ros2 topic echo --qos-reliability best_effort /duco_ft_sensor/wrench`, or
+> `ros2 topic echo --qos-reliability best_effort /duco_ft_sensor/wrench_raw`, or
 > use the dashboard (see [`ft_sensor_dashboard`](../ft_sensor_dashboard)).
 
 Subscribed topics:
@@ -104,7 +105,8 @@ Parameters (with defaults):
 |---|---|---|---|
 | `port` | string | `/dev/ttyUSB0` | serial device |
 | `baud` | int | `460800` | baud rate |
-| `frame_id` | string | `ft_sensor_link` | header.frame_id on `~/wrench` |
+| `topic` | string | `~/wrench_raw` | output wrench topic; central config defaults to `/duco_ft_sensor/wrench_raw` |
+| `frame_id` | string | `ft_sensor_link` | header.frame_id on the output wrench |
 | `publish_rate` | double | `0.0` | 0 = publish every frame (~960 Hz) |
 | `autostart` | bool | `true` | start streaming on launch |
 | `tare_on_start` | bool | `false` | tare immediately on launch |
@@ -126,7 +128,7 @@ Runtime dependency: `python3-serial` (apt-installed).
 ```bash
 ros2 launch duco_ft_sensor ft_sensor.launch.py
 # or with overrides:
-ros2 launch duco_ft_sensor ft_sensor.launch.py port:=/dev/ttyUSB0 frame_id:=tool0
+ros2 launch duco_ft_sensor ft_sensor.launch.py port:=/dev/ttyUSB0 topic:=/my_ft/wrench_raw frame_id:=tool0
 ros2 launch duco_ft_sensor ft_sensor.launch.py tare_on_start:=true
 ```
 
@@ -216,7 +218,7 @@ duco_ft_sensor/                  ← this package
 ├── launch/ft_sensor.launch.py
 └── duco_ft_sensor/
     ├── driver.py                ← pure-Python serial driver (no ROS)
-    ├── ft_sensor_node.py        ← rclpy node: publishes ~/wrench
+    ├── ft_sensor_node.py        ← rclpy node: publishes configurable ~/wrench_raw
     └── cli.py                   ← `read_ft_sensor` console reader
 
 ../../tools/test_ft_sensor.py    ← standalone self-test (no ROS, no package import)

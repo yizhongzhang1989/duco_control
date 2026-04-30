@@ -2,6 +2,7 @@
 build/
 install/
 log/
+tmp/
 
 # Python
 __pycache__/
@@ -9,3 +10,7 @@ __pycache__/
 *.pyo
 *.egg-info/
 .eggs/
+
+# Local (machine-specific) configuration; copy from
+# config/robot_config.example.yaml and edit. The template *is* committed.
+config/robot_config.yaml

@@ -12,7 +12,7 @@ Multiple browsers can connect at the same time.
 
 Parameters
 ----------
-  topic            string  default "/duco_ft_sensor/wrench"
+  topic            string  default "/duco_ft_sensor/wrench_raw"
   host             string  default "0.0.0.0"
   port             int     default 8080
   window_seconds   double  default 10.0
@@ -667,7 +667,7 @@ def main() -> None:
     rclpy.init()
 
     bootstrap = rclpy.create_node("ft_sensor_dashboard_bootstrap")
-    bootstrap.declare_parameter("topic", "/duco_ft_sensor/wrench")
+    bootstrap.declare_parameter("topic", "/duco_ft_sensor/wrench_raw")
     bootstrap.declare_parameter("host", "0.0.0.0")
     bootstrap.declare_parameter("port", 8080)
     bootstrap.declare_parameter("window_seconds", 10.0)

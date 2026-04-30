@@ -1,19 +1,19 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>ft_sensor_dashboard</name>
+  <name>duco_robot_bringup</name>
   <version>0.1.0</version>
-  <description>Web-based live dashboard for force/torque sensor wrench topics. Streams data over Server-Sent Events to a browser.</description>
+  <description>Project-owned launch wrappers for Duco robot bringup.</description>
 
   <maintainer email="yizhongzhang1989@gmail.com">yizhongzhang</maintainer>
   <license>MIT</license>
 
-  <exec_depend>rclpy</exec_depend>
-  <exec_depend>geometry_msgs</exec_depend>
-  <exec_depend>python3-fastapi</exec_depend>
-  <exec_depend>python3-uvicorn</exec_depend>
-  <exec_depend>ros2launch</exec_depend>
+  <buildtool_depend>ament_python</buildtool_depend>
+
   <exec_depend>common</exec_depend>
+  <exec_depend>duco_gcr5_910_moveit_config</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

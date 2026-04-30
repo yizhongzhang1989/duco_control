@@ -3,7 +3,7 @@
 Topics
 ------
 publishes:
-  ~/wrench  geometry_msgs/WrenchStamped       6-axis wrench, frame_id=<frame_id>
+    ~/wrench_raw  geometry_msgs/WrenchStamped   raw 6-axis wrench, frame_id=<frame_id>
   ~/diagnostics  diagnostic_msgs/...           (not used; kept simple)
 
 subscribes:
@@ -19,6 +19,7 @@ Parameters
 ----------
   port           string  default "/dev/ttyUSB0"
   baud           int     default 460800
+    topic          string  default "~/wrench_raw"
   frame_id       string  default "ft_sensor_link"
   publish_rate   double  default 0.0  (0 = publish every frame, ~960 Hz)
   autostart      bool    default true (start streaming on launch)
@@ -51,6 +52,7 @@ class FTSensorNode(Node):
         # --- parameters ---------------------------------------------------
         self.declare_parameter("port", "/dev/ttyUSB0")
         self.declare_parameter("baud", 460800)
+        self.declare_parameter("topic", "~/wrench_raw")
         self.declare_parameter("frame_id", "ft_sensor_link")
         self.declare_parameter("publish_rate", 0.0)
         self.declare_parameter("autostart", True)
@@ -58,6 +60,7 @@ class FTSensorNode(Node):
 
         port = self.get_parameter("port").get_parameter_value().string_value
         baud = self.get_parameter("baud").get_parameter_value().integer_value
+        topic = self.get_parameter("topic").get_parameter_value().string_value
         self._frame_id = self.get_parameter("frame_id").get_parameter_value().string_value
         self._publish_rate = self.get_parameter("publish_rate").get_parameter_value().double_value
         autostart = self.get_parameter("autostart").get_parameter_value().bool_value
@@ -82,7 +85,7 @@ class FTSensorNode(Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=200,
         )
-        self._pub = self.create_publisher(WrenchStamped, "~/wrench", wrench_qos)
+        self._pub = self.create_publisher(WrenchStamped, topic, wrench_qos)
         self._cmd_sub = self.create_subscription(
             String, "~/command", self._on_command, 10)
         self._srv_start = self.create_service(Trigger, "~/start", self._srv_start_cb)
@@ -108,12 +111,14 @@ class FTSensorNode(Node):
 
         if autostart:
             self.get_logger().info(
-                f"starting stream on {port} @ {baud} (tare={tare_on_start})")
+                f"starting stream on {port} @ {baud} -> {topic} "
+                f"(tare={tare_on_start})")
             self._sensor.start_stream(tare=tare_on_start)
             self._streaming = True
         else:
             self.get_logger().info(
-                f"opened {port} @ {baud}; waiting for start command")
+                f"opened {port} @ {baud}; publishing to {topic}; "
+                "waiting for start command")
 
     # --- ROS callbacks ----------------------------------------------------
     def _on_command(self, msg: String) -> None:
