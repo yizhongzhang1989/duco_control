@@ -52,12 +52,18 @@ from std_srvs.srv import Trigger
 
 
 # ---------------------------------------------------------------------------
-# tunable parameter list (curated -- the dashboard exposes these as the
-# editable controls for ``cartesian_force_controller``).  Each entry is
-# ``(name, kind)`` where ``kind`` is "double" or "integer" so we can
-# build a correctly-typed ``ParameterValue``.
+# tunable parameter catalogue (curated, keyed by controller "kind").
+#
+# Each entry is ``(name, kind)`` where ``kind`` is "double" or "integer"
+# so we can build a correctly-typed ``ParameterValue``.  The dashboard
+# discovers which controller is currently *active* from the orchestrator's
+# state topic and exposes the matching list as the editable controls.
+#
+# All FZI controllers share the base ``pd_gains.*`` and ``solver.*``
+# inner-loop knobs; the compliance controller adds an apparent-stiffness
+# matrix, which is the main parameter operators want to play with.
 # ---------------------------------------------------------------------------
-_TUNABLE_PARAMS: List[Tuple[str, str]] = [
+_BASE_TUNABLES: List[Tuple[str, str]] = [
     ("pd_gains.trans_x.p", "double"),
     ("pd_gains.trans_y.p", "double"),
     ("pd_gains.trans_z.p", "double"),
@@ -67,6 +73,19 @@ _TUNABLE_PARAMS: List[Tuple[str, str]] = [
     ("solver.error_scale", "double"),
     ("solver.iterations",  "integer"),
 ]
+_COMPLIANCE_EXTRAS: List[Tuple[str, str]] = [
+    ("stiffness.trans_x", "double"),
+    ("stiffness.trans_y", "double"),
+    ("stiffness.trans_z", "double"),
+    ("stiffness.rot_x",   "double"),
+    ("stiffness.rot_y",   "double"),
+    ("stiffness.rot_z",   "double"),
+]
+_TUNABLES_BY_KIND: Dict[str, List[Tuple[str, str]]] = {
+    "force":      list(_BASE_TUNABLES),
+    "motion":     list(_BASE_TUNABLES),
+    "compliance": list(_BASE_TUNABLES) + list(_COMPLIANCE_EXTRAS),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +127,10 @@ _HTML_PAGE = r"""<!doctype html>
            border: 1px solid #2b3140; border-radius: 4px; padding: 3px 6px;
            font: inherit; font-size: 0.82rem; width: 7em;
            font-variant-numeric: tabular-nums; }
+  select { background: #0f1218; color: #e6e6e6;
+           border: 1px solid #2b3140; border-radius: 4px; padding: 3px 6px;
+           font: inherit; font-size: 0.82rem; }
+  select:disabled { opacity: 0.5; cursor: not-allowed; }
   .status { display: inline-block; padding: 2px 7px; border-radius: 999px;
             background: #1f2937; color: #cfd3dc; font-variant-numeric: tabular-nums; }
   .status.ok  { background: #14532d; color: #c6f7d6; }
@@ -132,7 +155,7 @@ _HTML_PAGE = r"""<!doctype html>
 <body>
   <h1>Cartesian controller dashboard</h1>
   <div class="sub">
-    controller <code id="controller-name">--</code>
+    active controller <code id="controller-name">--</code>
     &nbsp; orchestrator state <span id="orch-status" class="status">--</span>
     &nbsp; <span id="conn" class="status">connecting...</span>
   </div>
@@ -140,11 +163,19 @@ _HTML_PAGE = r"""<!doctype html>
   <div class="panel">
     <div class="engage-bar">
       <span id="engaged" class="status">--</span>
-      <span class="pill active">backend: FZI</span>
+      <span class="small">controller:</span>
+      <select id="sel-controller" title="select which FZI controller engage will activate"></select>
+      <span class="pill" id="kind-pill">kind: --</span>
       <span class="small">trip:</span>
       <span id="trip" class="status">--</span>
       <button id="btn-engage"    type="button" class="big success">Engage</button>
       <button id="btn-disengage" type="button" class="big danger">Disengage</button>
+    </div>
+    <div class="small" style="margin-top:6px;">
+      Use the dropdown to select a controller; click Engage to activate
+      it (only allowed while idle).  Force = pure free-drive
+      (target_wrench=0); Motion = pose-hold (snapshots current pose);
+      Compliance = pose-hold + yields to wrench.
     </div>
   </div>
 
@@ -251,6 +282,40 @@ _HTML_PAGE = r"""<!doctype html>
     $("trip").classList.toggle("bad", !!s.trip_reason);
   }
 
+  // Cache of last (active_controller, available_controllers) we rendered
+  // into the <select> so we don't blow away an in-progress selection on
+  // every 200 ms tick.
+  let renderedSelectSig = null;
+
+  function setControllerSelect(ctl) {
+    const sel = $("sel-controller");
+    const avail = ctl.available_controllers || [];
+    const sig = JSON.stringify(avail);
+    if (sig !== renderedSelectSig) {
+      sel.innerHTML = "";
+      for (const c of avail) {
+        const opt = document.createElement("option");
+        opt.value = c.name;
+        opt.textContent = c.name + " (" + c.kind + ")";
+        sel.appendChild(opt);
+      }
+      renderedSelectSig = sig;
+    }
+    // Sync select to current active unless the user is editing the
+    // dropdown right now (handled by document.activeElement guard).
+    if (document.activeElement !== sel) {
+      sel.value = ctl.active_controller || "";
+    }
+    // Lock the dropdown while engaged -- the orchestrator refuses the
+    // param change anyway, but disabling makes intent obvious.
+    sel.disabled = !!ctl.engaged;
+    // Show kind pill for whatever is currently *selected* in the
+    // dropdown, or the active one if no selection.
+    const chosen = sel.value || ctl.active_controller || "";
+    const entry = avail.find((c) => c.name === chosen);
+    $("kind-pill").textContent = "kind: " + (entry ? entry.kind : "--");
+  }
+
   function setStaleness(elId, ok, age) {
     const el = $(elId);
     el.classList.remove("ok", "bad", "warn");
@@ -284,6 +349,7 @@ _HTML_PAGE = r"""<!doctype html>
     if (!s) return;
     const ctl = s.control || {};
     setEngagedPill(ctl);
+    setControllerSelect(ctl);
     setOrchPill(s);
 
     const w = s.wrench;
@@ -459,6 +525,27 @@ _HTML_PAGE = r"""<!doctype html>
 
   $("btn-refresh-params").addEventListener("click", refreshParams);
 
+  // Switch the orchestrator's ``active_controller_name`` parameter on
+  // dropdown change.  The orchestrator refuses if currently engaged --
+  // surface that as a toast and snap the dropdown back.
+  $("sel-controller").addEventListener("change", async (ev) => {
+    const name = ev.target.value;
+    if (!name) return;
+    try {
+      await api("/api/active_controller", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name })
+      });
+      toast("active controller -> " + name, "ok");
+      await refresh();
+    } catch (e) {
+      toast("switch failed: " + e.message, "bad");
+      // Re-sync to whatever the orchestrator actually thinks is active.
+      await refresh();
+    }
+  });
+
   refresh().then(() => setInterval(tick, 200));
   setInterval(refresh, 3000);
 })();
@@ -544,6 +631,11 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 body = self._read_json_body() or {}
                 self._send_json(200, self._dashboard.api_set_param(body))
                 return
+            if path == "/api/active_controller":
+                body = self._read_json_body() or {}
+                self._send_json(
+                    200, self._dashboard.api_set_active_controller(body))
+                return
             self.send_response(404)
             self.end_headers()
         except RuntimeError as exc:
@@ -563,7 +655,16 @@ class DashboardNode(Node):
     _PARAM_DECLARATIONS: List[Tuple[str, object]] = [
         # connectivity ---------------------------------------------------
         ("orchestrator_ns",  "/duco_cartesian_control"),
-        ("controller_name",  "cartesian_force_controller"),
+        # Catalogue of FZI controller node names this dashboard knows
+        # how to talk to.  Must match the orchestrator's
+        # ``available_controllers`` list (this is the *fallback* for
+        # bootstrap before the orchestrator's state topic arrives).
+        ("available_controllers", [
+            "cartesian_force_controller",
+            "cartesian_motion_controller",
+            "cartesian_compliance_controller",
+        ]),
+        ("default_controller_name",  "cartesian_force_controller"),
         ("wrench_topic",     "/duco_ft_sensor/wrench_compensated"),
         ("joint_states_topic", "/joint_states"),
         ("service_timeout_sec", 2.0),
@@ -579,7 +680,19 @@ class DashboardNode(Node):
 
         gp = lambda n: self.get_parameter(n).value  # noqa: E731
         self._orchestrator_ns = str(gp("orchestrator_ns")).rstrip("/")
-        self._controller_name = str(gp("controller_name")).strip("/")
+        # Catalogue of controller names we'll create per-controller param
+        # clients for.  Order is not significant.
+        avail = list(gp("available_controllers") or [])
+        self._available_controllers: List[str] = [
+            str(n).strip("/") for n in avail if str(n).strip("/")]
+        if not self._available_controllers:
+            self._available_controllers = ["cartesian_force_controller"]
+        # Bootstrap default until orchestrator state arrives.  The cached
+        # state's ``active_controller`` field overrides this at runtime.
+        self._default_controller_name = str(
+            gp("default_controller_name")).strip("/")
+        if self._default_controller_name not in self._available_controllers:
+            self._default_controller_name = self._available_controllers[0]
         self._wrench_topic = str(gp("wrench_topic"))
         self._joint_states_topic = str(gp("joint_states_topic"))
         self._service_timeout = float(gp("service_timeout_sec"))
@@ -622,16 +735,28 @@ class DashboardNode(Node):
             Trigger, f"{self._orchestrator_ns}/disengage",
             callback_group=self._cbgroup)
 
-        # Parameter clients on the FZI controller node.
-        ctrl = self._controller_name
-        self._cli_list_params = self.create_client(
-            ListParameters, f"/{ctrl}/list_parameters",
-            callback_group=self._cbgroup)
-        self._cli_get_params = self.create_client(
-            GetParameters, f"/{ctrl}/get_parameters",
-            callback_group=self._cbgroup)
-        self._cli_set_params = self.create_client(
-            SetParameters, f"/{ctrl}/set_parameters",
+        # Parameter clients on every FZI controller node we know about.
+        # We pre-create them so switching the *active* controller does
+        # not require any client churn.  Each entry maps controller_name
+        # -> {"list": ..., "get": ..., "set": ...}.
+        self._param_clients: Dict[str, Dict[str, Any]] = {}
+        for ctrl in self._available_controllers:
+            self._param_clients[ctrl] = {
+                "list": self.create_client(
+                    ListParameters, f"/{ctrl}/list_parameters",
+                    callback_group=self._cbgroup),
+                "get": self.create_client(
+                    GetParameters, f"/{ctrl}/get_parameters",
+                    callback_group=self._cbgroup),
+                "set": self.create_client(
+                    SetParameters, f"/{ctrl}/set_parameters",
+                    callback_group=self._cbgroup),
+            }
+        # Service client for the orchestrator's *own* parameters --
+        # used to flip ``active_controller_name`` at runtime.
+        self._cli_orchestrator_set_params = self.create_client(
+            SetParameters,
+            f"{self._orchestrator_ns}/set_parameters",
             callback_group=self._cbgroup)
 
         # ---- HTTP server ----------------------------------------------
@@ -682,8 +807,8 @@ class DashboardNode(Node):
                      else self._host)
             self.get_logger().info(
                 f"web dashboard: http://{shown}:{self._port}/  "
-                f"(controller={self._controller_name!r}, "
-                f"orchestrator={self._orchestrator_ns!r})")
+                f"(orchestrator={self._orchestrator_ns!r}, "
+                f"controllers={self._available_controllers})")
         except OSError as exc:
             self.get_logger().error(
                 f"web dashboard: failed to bind {self._host}:{self._port}: "
@@ -735,9 +860,9 @@ class DashboardNode(Node):
             raise RuntimeError(resp.message or f"{kind} failed")
         return {"ok": True, "message": resp.message or kind}
 
-    def _get_param_values(self, names: List[str]
+    def _get_param_values(self, controller: str, names: List[str]
                           ) -> Dict[str, Optional[Any]]:
-        """Read parameter values from the controller node.
+        """Read parameter values from a specific controller node.
 
         Returns a dict ``{name: value_or_None}``.  ``None`` means the
         parameter does not exist (or the controller is not running).
@@ -745,23 +870,31 @@ class DashboardNode(Node):
         result: Dict[str, Optional[Any]] = {n: None for n in names}
         if not names:
             return result
-        if not self._cli_get_params.wait_for_service(timeout_sec=0.2):
+        clients = self._param_clients.get(controller)
+        if clients is None:
+            return result
+        get_cli = clients["get"]
+        if not get_cli.wait_for_service(timeout_sec=0.2):
             return result
         req = GetParameters.Request()
         req.names = list(names)
         resp = self._service_call_sync(
-            self._cli_get_params, req, self._service_timeout)
+            get_cli, req, self._service_timeout)
         if resp is None:
             return result
         for name, pv in zip(names, resp.values):
             result[name] = _decode_param_value(pv)
         return result
 
-    def _set_param(self, name: str, kind: str, raw_value: Any
-                   ) -> Tuple[bool, str]:
-        if not self._cli_set_params.wait_for_service(timeout_sec=0.2):
+    def _set_param(self, controller: str, name: str, kind: str,
+                   raw_value: Any) -> Tuple[bool, str]:
+        clients = self._param_clients.get(controller)
+        if clients is None:
+            return False, f"unknown controller {controller!r}"
+        set_cli = clients["set"]
+        if not set_cli.wait_for_service(timeout_sec=0.2):
             return False, (f"set_parameters service unavailable -- is the "
-                           f"{self._controller_name!r} controller running?")
+                           f"{controller!r} controller running?")
         param = Parameter()
         param.name = name
         pv = ParameterValue()
@@ -780,7 +913,7 @@ class DashboardNode(Node):
         req = SetParameters.Request()
         req.parameters = [param]
         resp = self._service_call_sync(
-            self._cli_set_params, req, self._service_timeout)
+            set_cli, req, self._service_timeout)
         if resp is None:
             return False, "set_parameters: no response"
         if not resp.results or not resp.results[0].successful:
@@ -789,19 +922,87 @@ class DashboardNode(Node):
             return False, why or "set_parameters failed"
         return True, "ok"
 
+    def _set_orchestrator_active_controller(self, name: str
+                                            ) -> Tuple[bool, str]:
+        """Flip the orchestrator's ``active_controller_name`` parameter.
+
+        The orchestrator validates the value against its own catalogue
+        and refuses the change while engaged -- both surface here as
+        ``(False, reason)`` from the SetParameters response.
+        """
+        if not self._cli_orchestrator_set_params.wait_for_service(
+                timeout_sec=0.2):
+            return False, (f"orchestrator set_parameters service "
+                           f"unavailable at {self._orchestrator_ns!r}")
+        param = Parameter()
+        param.name = "active_controller_name"
+        pv = ParameterValue()
+        pv.type = ParameterType.PARAMETER_STRING
+        pv.string_value = str(name)
+        param.value = pv
+        req = SetParameters.Request()
+        req.parameters = [param]
+        resp = self._service_call_sync(
+            self._cli_orchestrator_set_params, req, self._service_timeout)
+        if resp is None:
+            return False, "orchestrator set_parameters: no response"
+        if not resp.results or not resp.results[0].successful:
+            why = (resp.results[0].reason
+                   if resp.results else "unknown error")
+            return False, why or "set_parameters failed"
+        return True, "ok"
+
+    # ------------------------------------------------------------------
+    # active-controller helpers (cached from orchestrator state topic)
+    # ------------------------------------------------------------------
+    def _active_controller(self) -> str:
+        """Return whichever controller the orchestrator currently
+        considers *active* (settable param).  Falls back to the
+        bootstrap default until the first state message arrives.
+        """
+        with self._lock:
+            ctl = self._control_state
+        if ctl:
+            v = ctl.get("active_controller")
+            if isinstance(v, str) and v:
+                return v
+        return self._default_controller_name
+
+    def _active_kind(self) -> str:
+        """Return the kind ("force"/"motion"/"compliance") of the
+        active controller, looked up from the orchestrator's published
+        catalogue.  Defaults to "force" if unknown.
+        """
+        active = self._active_controller()
+        with self._lock:
+            ctl = self._control_state or {}
+        for entry in ctl.get("available_controllers", []) or []:
+            if (isinstance(entry, dict)
+                    and entry.get("name") == active
+                    and isinstance(entry.get("kind"), str)):
+                return entry["kind"]
+        return "force"
+
+    def _tunables_for_active(self) -> List[Tuple[str, str]]:
+        return list(_TUNABLES_BY_KIND.get(self._active_kind(),
+                                          _BASE_TUNABLES))
+
     # ------------------------------------------------------------------
     # snapshots used by the HTTP handler
     # ------------------------------------------------------------------
     def api_state_full(self) -> Dict[str, Any]:
-        names = [n for (n, _) in _TUNABLE_PARAMS]
-        values = self._get_param_values(names)
+        active = self._active_controller()
+        tunables = self._tunables_for_active()
+        names = [n for (n, _) in tunables]
+        values = self._get_param_values(active, names)
         params = [
             {"name": n, "kind": k, "value": values.get(n)}
-            for (n, k) in _TUNABLE_PARAMS
+            for (n, k) in tunables
         ]
         live = self._snapshot_live_locked()
         live["params"] = params
-        live["controller_name"] = self._controller_name
+        live["controller_name"] = active
+        live["controller_kind"] = self._active_kind()
         live["orchestrator_ns"] = self._orchestrator_ns
         return live
 
@@ -809,13 +1010,16 @@ class DashboardNode(Node):
         return self._snapshot_live_locked()
 
     def api_params(self) -> Dict[str, Any]:
-        names = [n for (n, _) in _TUNABLE_PARAMS]
-        values = self._get_param_values(names)
+        active = self._active_controller()
+        tunables = self._tunables_for_active()
+        names = [n for (n, _) in tunables]
+        values = self._get_param_values(active, names)
         return {
-            "controller_name": self._controller_name,
+            "controller_name": active,
+            "controller_kind": self._active_kind(),
             "params": [
                 {"name": n, "kind": k, "value": values.get(n)}
-                for (n, k) in _TUNABLE_PARAMS
+                for (n, k) in tunables
             ],
         }
 
@@ -834,15 +1038,39 @@ class DashboardNode(Node):
         if kind not in ("double", "integer"):
             raise RuntimeError(
                 f"unsupported 'kind' {kind!r}; expected 'double' or 'integer'")
-        # Whitelist for safety: only allow names from _TUNABLE_PARAMS.
-        allowed = {n for (n, _) in _TUNABLE_PARAMS}
+        # Whitelist for safety: only allow names the dashboard advertises
+        # for the *currently active* controller's kind.
+        allowed = {n for (n, _) in self._tunables_for_active()}
         if name not in allowed:
             raise RuntimeError(
-                f"parameter {name!r} is not in the dashboard's tunable list")
-        ok, why = self._set_param(name, kind, value)
+                f"parameter {name!r} is not in the dashboard's tunable "
+                f"list for kind {self._active_kind()!r}")
+        active = self._active_controller()
+        ok, why = self._set_param(active, name, kind, value)
         if not ok:
             raise RuntimeError(why)
-        return {"ok": True, "name": name, "value": value, "message": why}
+        return {"ok": True, "name": name, "value": value, "message": why,
+                "controller_name": active}
+
+    def api_set_active_controller(self, body: Dict[str, Any]
+                                  ) -> Dict[str, Any]:
+        """Switch which FZI controller engage will activate.
+
+        Forwarded to the orchestrator's ``active_controller_name``
+        parameter via SetParameters; the orchestrator validates and
+        refuses the change while engaged.
+        """
+        name = body.get("name")
+        if not isinstance(name, str) or not name:
+            raise RuntimeError("missing 'name'")
+        if name not in self._available_controllers:
+            raise RuntimeError(
+                f"{name!r} is not in available_controllers "
+                f"({self._available_controllers})")
+        ok, why = self._set_orchestrator_active_controller(name)
+        if not ok:
+            raise RuntimeError(why)
+        return {"ok": True, "name": name, "message": why}
 
     # ------------------------------------------------------------------
     def _snapshot_live_locked(self) -> Dict[str, Any]:

@@ -1,17 +1,29 @@
-"""Launch the Cartesian-control orchestrator + spawn FZI's controller (inactive).
+"""Launch the Cartesian-control orchestrator + spawn FZI's controllers (inactive).
 
 Defaults are loaded from ``config/robot_config.yaml`` under
 ``duco_cartesian_control:`` (via the ``common`` package) when present,
 with hard-coded fallbacks so the launch still works on a fresh checkout.
 
-The launch also spawns FZI's ``cartesian_force_controller`` into the
-live ``controller_manager`` in the **inactive** state.  Our orchestrator
-node will activate / deactivate it on engage / disengage via
-``switch_controller``.
+The launch spawns each FZI Cartesian controller plugin into the live
+``controller_manager`` in the **inactive** state.  The orchestrator
+node will then activate / deactivate the **selected** one on engage /
+disengage via ``switch_controller``.  By default three controllers are
+loaded:
+
+* ``cartesian_force_controller``
+* ``cartesian_motion_controller``
+* ``cartesian_compliance_controller``
+
+The default selection is ``cartesian_force_controller``; switch live
+via ``ros2 param set /duco_cartesian_control active_controller_name
+<name>`` (must be disengaged first), or use the
+``cartesian_controller_dashboard`` UI.
 
 Examples::
 
     ros2 launch duco_cartesian_control cartesian_control.launch.py
+    ros2 launch duco_cartesian_control cartesian_control.launch.py \\
+        active_controller_name:=cartesian_compliance_controller
 """
 
 import os
@@ -23,6 +35,21 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
+# Catalogue of FZI Cartesian-controller plugins this launch file knows
+# how to spawn.  Each entry is ``(name, kind, plugin_type)`` where
+# ``kind`` is consumed by the orchestrator (drives which heartbeat
+# topics it publishes) and ``plugin_type`` is the pluginlib class the
+# spawner needs to register the controller with controller_manager.
+_FZI_CONTROLLERS = [
+    ("cartesian_force_controller",       "force",
+     "cartesian_force_controller/CartesianForceController"),
+    ("cartesian_motion_controller",      "motion",
+     "cartesian_motion_controller/CartesianMotionController"),
+    ("cartesian_compliance_controller",  "compliance",
+     "cartesian_compliance_controller/CartesianComplianceController"),
+]
+
+
 _FALLBACKS = {
     # connectivity ---------------------------------------------------------
     "wrench_topic":          "/duco_ft_sensor/wrench_compensated",
@@ -30,10 +57,8 @@ _FALLBACKS = {
     "controller_manager_ns": "/controller_manager",
     "engaged_default":       False,
     # FZI controller wiring ------------------------------------------------
-    "fzi_controller_name":     "cartesian_force_controller",
+    "active_controller_name":  "cartesian_force_controller",
     "fzi_jtc_controller_name": "arm_1_controller",
-    "fzi_ft_topic":            "/cartesian_force_controller/ft_sensor_wrench",
-    "fzi_target_topic":        "/cartesian_force_controller/target_wrench",
     "fzi_target_frame":        "link_6",
     "fzi_target_rate_hz":      10.0,
     "fzi_service_timeout_sec": 2.0,
@@ -86,9 +111,15 @@ def generate_launch_description() -> LaunchDescription:
             args.append(DeclareLaunchArgument(key, default_value=str(d[key])))
 
     log = LogInfo(msg=(
-        f"[duco_cartesian_control] config: {source}"))
+        f"[duco_cartesian_control] config: {source}; "
+        f"controllers={[n for n,_,_ in _FZI_CONTROLLERS]}"))
 
     parameters = {key: LaunchConfiguration(key) for key in _FALLBACKS.keys()}
+    # The orchestrator's catalogue (parallel string lists) is fixed at
+    # launch time -- we always preload the three FZI controllers below,
+    # so we hardcode the matching catalogue here too.
+    parameters["available_controllers"] = [n for n, _, _ in _FZI_CONTROLLERS]
+    parameters["controller_kinds"] = [k for _, k, _ in _FZI_CONTROLLERS]
 
     node = Node(
         package="duco_cartesian_control",
@@ -99,22 +130,27 @@ def generate_launch_description() -> LaunchDescription:
         parameters=[parameters],
     )
 
-    # Pre-load FZI's controller into the live controller_manager
-    # (inactive).  Our orchestrator will activate it on engage via the
-    # SwitchController service.
+    # Pre-load each FZI controller into the live controller_manager
+    # (inactive).  Our orchestrator activates the *selected* one on
+    # engage via the SwitchController service.  All three share the
+    # same YAML config (controller_manager picks the section keyed by
+    # the controller's own name).
     pkg_share = get_package_share_directory("duco_cartesian_control")
     fzi_yaml = os.path.join(pkg_share, "config", "fzi_zero_gravity.yaml")
-    fzi_spawner = Node(
-        package="controller_manager",
-        executable="spawner",
-        arguments=[
-            "cartesian_force_controller",
-            "-c", LaunchConfiguration("controller_manager_ns"),
-            "-p", fzi_yaml,
-            "-t", "cartesian_force_controller/CartesianForceController",
-            "--inactive",
-        ],
-        output="screen",
-    )
+    fzi_spawners = [
+        Node(
+            package="controller_manager",
+            executable="spawner",
+            arguments=[
+                name,
+                "-c", LaunchConfiguration("controller_manager_ns"),
+                "-p", fzi_yaml,
+                "-t", plugin_type,
+                "--inactive",
+            ],
+            output="screen",
+        )
+        for name, _kind, plugin_type in _FZI_CONTROLLERS
+    ]
 
-    return LaunchDescription([log, *args, fzi_spawner, node])
+    return LaunchDescription([log, *args, *fzi_spawners, node])

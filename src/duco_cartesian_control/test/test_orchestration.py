@@ -81,7 +81,12 @@ class DummyClient:
 def _make_stub() -> SimpleNamespace:
     """Build a minimal stub that exposes the methods under test."""
     stub = SimpleNamespace()
-    stub._fzi_controller_name = "cartesian_force_controller"
+    # The orchestrator now selects which FZI controller engage will
+    # activate via a runtime-settable parameter; ``_engaged_controller_name``
+    # is the bookkeeping for which one is currently engaged (cleared on
+    # disengage / trip).
+    stub._active_controller_name = "cartesian_force_controller"
+    stub._engaged_controller_name = ""
     stub._fzi_jtc_controller_name = "arm_1_controller"
     stub._fzi_service_timeout = 0.5
     stub._fzi_switch_cli = DummyClient()
@@ -201,10 +206,45 @@ def test_switch_to_jtc_sync_targets_correct_controllers():
         future_factory=lambda req: (captured.append(req)
                                     or DummyFuture(
                                         result=SimpleNamespace(ok=True))))
+    # Simulate that we are mid-engage on the force controller.
+    stub._engaged_controller_name = "cartesian_force_controller"
     ok, _ = stub._switch_to_jtc_sync()
     assert ok is True
     assert captured[0].activate_controllers == ["arm_1_controller"]
     assert captured[0].deactivate_controllers == ["cartesian_force_controller"]
+
+
+def test_switch_to_fzi_sync_uses_active_controller_name():
+    """Engaging respects the runtime-settable ``active_controller_name``."""
+    stub = _make_stub()
+    stub._active_controller_name = "cartesian_compliance_controller"
+    captured: List[Any] = []
+    stub._fzi_switch_cli = DummyClient(
+        future_factory=lambda req: (captured.append(req)
+                                    or DummyFuture(
+                                        result=SimpleNamespace(ok=True))))
+    ok, _ = stub._switch_to_fzi_sync()
+    assert ok is True
+    assert captured[0].activate_controllers == [
+        "cartesian_compliance_controller"]
+    assert captured[0].deactivate_controllers == ["arm_1_controller"]
+
+
+def test_switch_to_jtc_sync_falls_back_to_active_when_idle():
+    """With no engaged controller recorded, ``_switch_to_jtc_sync`` uses
+    the active selection -- e.g. on shutdown when we never engaged."""
+    stub = _make_stub()
+    stub._engaged_controller_name = ""
+    stub._active_controller_name = "cartesian_motion_controller"
+    captured: List[Any] = []
+    stub._fzi_switch_cli = DummyClient(
+        future_factory=lambda req: (captured.append(req)
+                                    or DummyFuture(
+                                        result=SimpleNamespace(ok=True))))
+    ok, _ = stub._switch_to_jtc_sync()
+    assert ok is True
+    assert captured[0].deactivate_controllers == [
+        "cartesian_motion_controller"]
 
 
 # --- concurrent resolution path -------------------------------------------

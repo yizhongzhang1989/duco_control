@@ -1,18 +1,25 @@
-# FZI cartesian_force_controller -- "zero-gravity" / free-drive
-# preset.  The controller minimises (ft_sensor_wrench - target_wrench);
-# we publish target_wrench = 0 from the orchestrator, so any real
-# external force on the FT sensor will move the arm to cancel it --
-# i.e. the user can hand-guide the robot.
+# FZI Cartesian controllers -- shared "zero-gravity" / hold-pose preset.
 #
-# The gains below are deliberately conservative for first contact:
-# small `error_scale` keeps each integration step short, modest
-# `pd_gains.p` keeps the inner-loop response gentle.
+# The orchestrator pre-loads three FZI controller plugins (all inactive)
+# and switches whichever is currently selected with the JTC on engage.
+# This file is loaded into controller_manager once for each spawner;
+# controller_manager picks the section keyed by the controller's own
+# node name.
 #
-# These values are loaded into the controller_manager when the
-# spawner brings the controller up.  They can also be live-tuned via
-# `ros2 param set /cartesian_force_controller pd_gains.trans_x.p ...`
-# or through the cartesian_controller_dashboard parameter UI.
+# Conventions:
+#   * end_effector_link / robot_base_link / ft_sensor_ref_link / joints
+#     are identical across the three controllers and should match the
+#     URDF that controller_manager sees.
+#   * pd_gains are deliberately conservative for first contact; tune
+#     them at runtime via the dashboard or
+#     ``ros2 param set /<controller_name> pd_gains.trans_x.p ...``.
+#   * The compliance controller adds ``stiffness.*`` -- this is the
+#     impedance the arm projects on its environment when an external
+#     wrench is applied (units: N/m for trans_*, Nm/rad for rot_*).
 
+# --- Force controller ----------------------------------------------------
+# Minimises (target_wrench - ft_sensor_wrench).  With our orchestrator
+# publishing target_wrench=0, this is pure free-drive (hand guidance).
 cartesian_force_controller:
   ros__parameters:
     end_effector_link: "link_6"
@@ -32,9 +39,78 @@ cartesian_force_controller:
       iterations: 5
       publish_state_feedback: true
     pd_gains:
-      trans_x: {p: 0.05}
-      trans_y: {p: 0.05}
-      trans_z: {p: 0.05}
+      trans_x: {p: 0.2}
+      trans_y: {p: 0.2}
+      trans_z: {p: 0.2}
+      rot_x:   {p: 0.5}
+      rot_y:   {p: 0.5}
+      rot_z:   {p: 0.5}
+
+# --- Motion controller ---------------------------------------------------
+# Drives the end-effector toward target_frame (PoseStamped on
+# /<controller>/target_frame).  On activate it snapshots the current
+# pose, so without an external publisher it simply holds pose.
+cartesian_motion_controller:
+  ros__parameters:
+    end_effector_link: "link_6"
+    robot_base_link: "base_link"
+    joints:
+      - arm_1_joint_1
+      - arm_1_joint_2
+      - arm_1_joint_3
+      - arm_1_joint_4
+      - arm_1_joint_5
+      - arm_1_joint_6
+    command_interfaces:
+      - position
+    solver:
+      error_scale: 0.1       # gentler than FZI's 1.0 default
+      iterations: 5
+      publish_state_feedback: true
+    pd_gains:
+      trans_x: {p: 0.5}
+      trans_y: {p: 0.5}
+      trans_z: {p: 0.5}
+      rot_x:   {p: 0.5}
+      rot_y:   {p: 0.5}
+      rot_z:   {p: 0.5}
+
+# --- Compliance controller ----------------------------------------------
+# Combination of motion + force: drives toward target_frame while
+# yielding to target_wrench.  ``stiffness`` is the apparent impedance of
+# the end-effector in the compliance_ref_link frame (here = end-effector
+# link, so a downward push in tool-Z yields in tool-Z).  Conservative
+# stiffness numbers; raise for stiffer "stay on the path" behaviour.
+cartesian_compliance_controller:
+  ros__parameters:
+    end_effector_link: "link_6"
+    robot_base_link: "base_link"
+    ft_sensor_ref_link: "link_6"
+    compliance_ref_link: "link_6"
+    joints:
+      - arm_1_joint_1
+      - arm_1_joint_2
+      - arm_1_joint_3
+      - arm_1_joint_4
+      - arm_1_joint_5
+      - arm_1_joint_6
+    command_interfaces:
+      - position
+    stiffness:               # w.r.t. compliance_ref_link
+      trans_x: 200.0         # N/m
+      trans_y: 200.0
+      trans_z: 200.0
+      rot_x:   10.0          # Nm/rad
+      rot_y:   10.0
+      rot_z:   10.0
+    solver:
+      error_scale: 0.1
+      iterations: 5
+      publish_state_feedback: true
+    pd_gains:
+      trans_x: {p: 0.05, d: 0.005}
+      trans_y: {p: 0.05, d: 0.005}
+      trans_z: {p: 0.05, d: 0.005}
       rot_x:   {p: 0.5}
       rot_y:   {p: 0.5}
       rot_z:   {p: 0.5}

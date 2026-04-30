@@ -1,38 +1,54 @@
-"""Orchestrator for FZI's ``cartesian_force_controller``.
+"""Orchestrator for FZI's Cartesian controllers.
 
-The Cartesian admittance hot path is owned by FZI's
-``cartesian_force_controller`` ros2_control plugin -- a C++ controller
-that runs inside ``controller_manager`` and writes joint position
-commands directly to the hardware interface (~250 Hz).  This node
-provides the operational glue around it:
+The Cartesian hot path is owned by one of FZI's ros2_control plugins
+running inside ``controller_manager`` (~250 Hz).  Three plugins are
+pre-loaded as **inactive** at launch time and selectable at runtime:
+
+* ``cartesian_force_controller``       -- minimises (target_wrench - ft);
+  with target_wrench = 0 this gives pure free-drive (hand-guidance).
+* ``cartesian_motion_controller``      -- drives the end-effector toward
+  a ``target_frame``; on activate it snapshots the current pose, so it
+  also works as a pure pose-hold controller for testing.
+* ``cartesian_compliance_controller``  -- combination of the above:
+  drives toward ``target_frame`` while yielding to ``target_wrench``.
+
+This node provides the operational glue:
 
 * an **engage / disengage** UX (``Trigger`` services) that atomically
-  switches ``arm_1_controller`` (the ``JointTrajectoryController``) and
-  ``cartesian_force_controller`` via the ``controller_manager``'s
+  switches ``arm_1_controller`` (the ``JointTrajectoryController``) with
+  whichever FZI controller is currently selected via the parameter
+  ``active_controller_name``, using ``controller_manager``'s
   ``switch_controller`` service;
 * a **wrench relay** that republishes the gravity-compensated
-  ``WrenchStamped`` from the FT sensor pipeline (BEST_EFFORT) onto
-  FZI's RELIABLE ``ft_sensor_wrench`` topic so FZI's solver sees it;
-* a **zero ``target_wrench`` heartbeat** at a configurable rate, which
-  drives FZI's controller into pure free-drive (minimise the operator
-  wrench);
+  ``WrenchStamped`` from the FT sensor pipeline (BEST_EFFORT) onto every
+  FZI controller's RELIABLE ``ft_sensor_wrench`` input;
+* a **zero ``target_wrench`` heartbeat** at a configurable rate to every
+  controller that consumes it (force + compliance), so any of them is
+  ready to engage in free-drive mode without an external publisher;
 * a **safety supervisor** that monitors FT staleness, joint-state
   staleness, and force / torque limits, auto-disengaging on any trip;
 * a **status topic** (``~/state``, ``std_msgs/String`` with a JSON
   payload) so external tooling such as
   :package:`cartesian_controller_dashboard` can render the current
-  engaged / tripped / idle state without an in-process API.
+  engaged / tripped / idle state and let the operator pick which
+  controller is active.
 
 This node is self-contained: the system runs end-to-end without any
-dashboard or external UI.  Use it with the companion launch file
-:file:`cartesian_control.launch.py`, which also pre-loads FZI's plugin
-into the controller_manager (inactive).
+dashboard.  Use it with the companion launch file
+:file:`cartesian_control.launch.py`, which also pre-loads each FZI
+plugin (inactive) into the controller_manager.
 
 Operator interfaces::
 
     /duco_cartesian_control/engage      (std_srvs/srv/Trigger)
     /duco_cartesian_control/disengage   (std_srvs/srv/Trigger)
     /duco_cartesian_control/state       (std_msgs/String, JSON)
+
+Live parameters::
+
+    active_controller_name              (string) which controller engage
+                                        will activate; refused while
+                                        already engaged.
 """
 
 from __future__ import annotations
@@ -41,7 +57,7 @@ import json
 import sys
 import threading
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -61,6 +77,31 @@ from std_srvs.srv import Trigger
 
 
 # ---------------------------------------------------------------------------
+# FZI controller catalogue
+# ---------------------------------------------------------------------------
+# Each entry is ``(name, kind)``.  ``kind`` decides which heartbeat
+# topics we publish on this controller's behalf:
+#   * "force"      -- consumes target_wrench + ft_sensor_wrench
+#   * "motion"     -- consumes target_frame; ignores wrench (we still
+#                      relay the FT topic harmlessly so the listener
+#                      QoS is matched if/when activated)
+#   * "compliance" -- consumes target_wrench + target_frame +
+#                      ft_sensor_wrench (the union)
+# A controller's kind also drives the dashboard's tunable-parameter
+# whitelist via :data:`cartesian_controller_dashboard._TUNABLES_BY_KIND`.
+_DEFAULT_AVAILABLE_CONTROLLERS: List[str] = [
+    "cartesian_force_controller",
+    "cartesian_motion_controller",
+    "cartesian_compliance_controller",
+]
+_DEFAULT_CONTROLLER_KINDS: List[str] = [
+    "force",
+    "motion",
+    "compliance",
+]
+
+
+# ---------------------------------------------------------------------------
 # parameters
 # ---------------------------------------------------------------------------
 _PARAM_DECLARATIONS: List[Tuple[str, object]] = [
@@ -70,10 +111,10 @@ _PARAM_DECLARATIONS: List[Tuple[str, object]] = [
     ("controller_manager_ns", "/controller_manager"),
     ("engaged_default",       False),
     # FZI controller wiring ------------------------------------------------
-    ("fzi_controller_name",     "cartesian_force_controller"),
+    ("available_controllers",  _DEFAULT_AVAILABLE_CONTROLLERS),
+    ("controller_kinds",       _DEFAULT_CONTROLLER_KINDS),
+    ("active_controller_name", "cartesian_force_controller"),
     ("fzi_jtc_controller_name", "arm_1_controller"),
-    ("fzi_ft_topic",            "/cartesian_force_controller/ft_sensor_wrench"),
-    ("fzi_target_topic",        "/cartesian_force_controller/target_wrench"),
     ("fzi_target_frame",        "link_6"),
     ("fzi_target_rate_hz",      10.0),
     ("fzi_service_timeout_sec", 2.0),
@@ -107,26 +148,33 @@ class CartesianControlNode(Node):
             self.declare_parameter(name, default)
         self._read_params()
 
-        # ---- state ------------------------------------------------------
+        # ---- runtime state ---------------------------------------------
         self._lock = threading.RLock()
         self._engaged: bool = False
+        # Name of the controller that is currently activated by the
+        # ``switch_controller`` call (==active at engage time).  We need
+        # to remember it so the disengage path deactivates the right
+        # controller even if the operator changed ``active_controller_name``
+        # mid-session (we now refuse such a change while engaged, but
+        # this is still belt-and-suspenders).
+        self._engaged_controller_name: str = ""
         self._trip_reason: str = ""
         self._last_wrench: Optional[np.ndarray] = None
         self._last_wrench_mono: Optional[float] = None
         self._last_q_mono: Optional[float] = None
         self._last_qdot_max: Optional[float] = None  # max |qdot| over all joints
 
-        # Live parameter callbacks for safety knobs.
+        # Live parameter callbacks (safety knobs + active controller).
         self.add_on_set_parameters_callback(self._on_param_change)
 
-        # ---- callback group ---------------------------------------------
+        # ---- callback group --------------------------------------------
         # Engage/disengage handlers issue synchronous switch_controller
         # calls; they need to be on a Reentrant group + a
         # MultiThreadedExecutor so the response can be dispatched while
         # the handler is still on the stack.  See ``main()``.
         self._cbgroup = ReentrantCallbackGroup()
 
-        # ---- pubs / subs ------------------------------------------------
+        # ---- subscriptions ---------------------------------------------
         wrench_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
@@ -138,16 +186,26 @@ class CartesianControlNode(Node):
         self._sub_js = self.create_subscription(
             JointState, self._joint_states_topic, self._on_joint_states, 50)
 
+        # ---- per-controller publishers ---------------------------------
+        # We publish the relayed wrench on every controller's
+        # ``ft_sensor_wrench`` topic and a constant zero target_wrench on
+        # every controller that consumes it (force + compliance).  Doing
+        # this irrespective of which one is active means engage is just
+        # a switch_controller call -- no reconnection needed.
         reliable_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
         )
-        self._pub_fzi_ft = self.create_publisher(
-            WrenchStamped, self._fzi_ft_topic, reliable_qos)
-        self._pub_fzi_target = self.create_publisher(
-            WrenchStamped, self._fzi_target_topic, reliable_qos)
+        self._pubs_ft: Dict[str, rclpy.publisher.Publisher] = {}
+        self._pubs_target_wrench: Dict[str, rclpy.publisher.Publisher] = {}
+        for name, kind in self._controllers:
+            self._pubs_ft[name] = self.create_publisher(
+                WrenchStamped, f"/{name}/ft_sensor_wrench", reliable_qos)
+            if kind in ("force", "compliance"):
+                self._pubs_target_wrench[name] = self.create_publisher(
+                    WrenchStamped, f"/{name}/target_wrench", reliable_qos)
 
         # State topic: TRANSIENT_LOCAL so late subscribers (e.g. a
         # dashboard launched after the orchestrator) see the most
@@ -161,13 +219,13 @@ class CartesianControlNode(Node):
         self._pub_state = self.create_publisher(
             String, "~/state", state_qos)
 
-        # ---- service clients (controller_manager) -----------------------
+        # ---- service clients (controller_manager) ----------------------
         self._fzi_switch_cli = self.create_client(
             SwitchController,
             f"{self._controller_manager_ns}/switch_controller",
             callback_group=self._cbgroup)
 
-        # ---- services (engage / disengage) ------------------------------
+        # ---- services (engage / disengage) -----------------------------
         self._srv_engage = self.create_service(
             Trigger, "~/engage", self._cb_engage,
             callback_group=self._cbgroup)
@@ -175,7 +233,7 @@ class CartesianControlNode(Node):
             Trigger, "~/disengage", self._cb_disengage,
             callback_group=self._cbgroup)
 
-        # ---- timers -----------------------------------------------------
+        # ---- timers ----------------------------------------------------
         rate = max(self._fzi_target_rate_hz, 0.1)
         self._fzi_target_timer = self.create_timer(
             1.0 / rate, self._publish_fzi_target_zero,
@@ -187,15 +245,21 @@ class CartesianControlNode(Node):
             1.0 / max(self._state_publish_rate_hz, 0.1),
             self._publish_state, callback_group=self._cbgroup)
 
+        ctl_list = ", ".join(f"{n}({k})" for n, k in self._controllers)
         self.get_logger().info(
-            f"orchestrating FZI: engage will switch "
+            f"orchestrating FZI: available controllers=[{ctl_list}]; "
+            f"engage will switch "
             f"{self._fzi_jtc_controller_name!r} -> "
-            f"{self._fzi_controller_name!r}; relaying wrench "
-            f"{self._wrench_topic!r} -> {self._fzi_ft_topic!r}; "
-            f"target_wrench=0 on {self._fzi_target_topic!r} @ {rate:.0f} Hz")
+            f"{self._active_controller_name!r}; relaying wrench "
+            f"{self._wrench_topic!r} -> /<each controller>/ft_sensor_wrench; "
+            f"target_wrench=0 to force/compliance @ {rate:.0f} Hz")
         self.get_logger().info(
             f"engage via `ros2 service call /duco_cartesian_control/engage "
             f"std_srvs/srv/Trigger`")
+        self.get_logger().info(
+            f"switch active controller via "
+            f"`ros2 param set /duco_cartesian_control "
+            f"active_controller_name <name>` (must be disengaged first)")
 
     # ------------------------------------------------------------------
     # parameter loading + live updates
@@ -207,10 +271,31 @@ class CartesianControlNode(Node):
         self._controller_manager_ns = str(gp("controller_manager_ns")).rstrip("/")
         self._engaged_default = bool(gp("engaged_default"))
 
-        self._fzi_controller_name = str(gp("fzi_controller_name"))
+        names = list(gp("available_controllers"))
+        kinds = list(gp("controller_kinds"))
+        if not names:
+            raise ValueError(
+                "available_controllers must contain at least one entry")
+        if len(kinds) != len(names):
+            raise ValueError(
+                f"controller_kinds (len={len(kinds)}) must have the same "
+                f"length as available_controllers (len={len(names)})")
+        bad_kinds = [k for k in kinds
+                     if k not in ("force", "motion", "compliance")]
+        if bad_kinds:
+            raise ValueError(
+                f"controller_kinds: unknown kind(s) {bad_kinds}; "
+                f"expected 'force' | 'motion' | 'compliance'")
+        self._controllers: List[Tuple[str, str]] = list(zip(names, kinds))
+        self._kind_by_name: Dict[str, str] = dict(self._controllers)
+
+        self._active_controller_name = str(gp("active_controller_name"))
+        if self._active_controller_name not in self._kind_by_name:
+            raise ValueError(
+                f"active_controller_name {self._active_controller_name!r} "
+                f"is not in available_controllers {names}")
+
         self._fzi_jtc_controller_name = str(gp("fzi_jtc_controller_name"))
-        self._fzi_ft_topic = str(gp("fzi_ft_topic"))
-        self._fzi_target_topic = str(gp("fzi_target_topic"))
         self._fzi_target_frame = str(gp("fzi_target_frame"))
         self._fzi_target_rate_hz = float(gp("fzi_target_rate_hz"))
         self._fzi_service_timeout = float(gp("fzi_service_timeout_sec"))
@@ -231,6 +316,20 @@ class CartesianControlNode(Node):
                 return SetParametersResult(
                     successful=False,
                     reason=f"{p.name!r} must be >= 0")
+            if p.name == "active_controller_name":
+                # Must be one of the known controllers, and we refuse to
+                # change it while engaged (otherwise the engaged-controller
+                # bookkeeping would silently drift).
+                if str(p.value) not in self._kind_by_name:
+                    return SetParametersResult(
+                        successful=False,
+                        reason=(f"{p.value!r} is not in available_controllers "
+                                f"{list(self._kind_by_name)}"))
+                if self._engaged:
+                    return SetParametersResult(
+                        successful=False,
+                        reason=("refuse to change active_controller_name "
+                                "while engaged; disengage first"))
         # Apply.
         for p in params:
             if p.name == "max_wrench_force":
@@ -243,15 +342,23 @@ class CartesianControlNode(Node):
                 self._ft_stale_after = float(p.value)
             elif p.name == "joint_states_stale_after":
                 self._joint_states_stale_after = float(p.value)
+            elif p.name == "active_controller_name":
+                self._active_controller_name = str(p.value)
+                self.get_logger().info(
+                    f"active_controller_name -> {self._active_controller_name!r} "
+                    f"(kind={self._kind_by_name[self._active_controller_name]})")
         return SetParametersResult(successful=True)
 
     # ------------------------------------------------------------------
     # subscriptions
     # ------------------------------------------------------------------
     def _on_wrench(self, msg: WrenchStamped) -> None:
-        # Forward to FZI's RELIABLE input verbatim -- FZI does its own
-        # conditioning (no LP / deadband on our side).
-        self._pub_fzi_ft.publish(msg)
+        # Forward verbatim to every FZI controller's RELIABLE input --
+        # FZI does its own conditioning so we don't filter on this side.
+        # The relays stay live regardless of which controller is engaged
+        # so engage is a single switch_controller call (no rewiring).
+        for pub in self._pubs_ft.values():
+            pub.publish(msg)
         # Cache for the safety supervisor.
         with self._lock:
             self._last_wrench = np.array([
@@ -324,12 +431,14 @@ class CartesianControlNode(Node):
         if not ok:
             return False, f"controller switch failed: {switch_why}"
         self._engaged = True
+        self._engaged_controller_name = self._active_controller_name
         self._trip_reason = ""
         self.get_logger().info(
             f"engaged {why}; {self._fzi_jtc_controller_name!r} deactivated, "
-            f"{self._fzi_controller_name!r} active. FZI is now writing "
-            "position commands directly to the hardware interface; this "
-            "node is the safety supervisor.")
+            f"{self._engaged_controller_name!r} (kind="
+            f"{self._kind_by_name[self._engaged_controller_name]}) active. "
+            "FZI is now writing position commands directly to the hardware "
+            "interface; this node is the safety supervisor.")
         # Publish the new state immediately so dashboards reflect the
         # transition without waiting for the next periodic publish.
         self._publish_state()
@@ -348,6 +457,7 @@ class CartesianControlNode(Node):
                 return False, why
         with self._lock:
             self._engaged = False
+            self._engaged_controller_name = ""
             self._trip_reason = ""
         self.get_logger().info("disengaged (operator request)")
         self._publish_state()
@@ -357,13 +467,23 @@ class CartesianControlNode(Node):
     # FZI orchestration helpers (also used by tests)
     # ------------------------------------------------------------------
     def _publish_fzi_target_zero(self) -> None:
-        """Send an all-zero ``WrenchStamped`` to FZI's setpoint topic.
+        """Send an all-zero ``WrenchStamped`` to every consumer's setpoint.
 
         FZI minimises (target - measured), so an identically zero
         target means FZI tries to drive the operator-applied wrench to
         zero -- pure free-drive.  Always running so the topic stays
-        warm; harmless when FZI is inactive.
+        warm for every controller that consumes it (force, compliance);
+        harmless when the corresponding controller is inactive.
+
+        Motion / compliance controllers also accept a ``target_frame``
+        but their ``on_activate`` snapshots the current end-effector
+        pose, so they hold their pose without any external publisher.
+        Tools that want to drive them around (teleop, scripts, RViz
+        markers) should publish ``target_frame`` themselves; the
+        orchestrator does not own the trajectory.
         """
+        if not self._pubs_target_wrench:
+            return
         msg = WrenchStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self._fzi_target_frame
@@ -374,7 +494,8 @@ class CartesianControlNode(Node):
         msg.wrench.torque.x = 0.0
         msg.wrench.torque.y = 0.0
         msg.wrench.torque.z = 0.0
-        self._pub_fzi_target.publish(msg)
+        for pub in self._pubs_target_wrench.values():
+            pub.publish(msg)
 
     def _service_call_sync(self, client, request, timeout_s: float):
         """Issue ``call_async`` and block until done or timeout.
@@ -399,16 +520,29 @@ class CartesianControlNode(Node):
             return None
 
     def _switch_to_fzi_sync(self) -> Tuple[bool, str]:
-        """Atomically deactivate the JTC and activate FZI's controller."""
+        """Atomically deactivate the JTC and activate the active FZI controller.
+
+        Uses ``self._active_controller_name`` (settable at runtime via the
+        ``active_controller_name`` parameter, refused while engaged).
+        """
         return self._switch_controllers_sync(
-            activate=[self._fzi_controller_name],
+            activate=[self._active_controller_name],
             deactivate=[self._fzi_jtc_controller_name])
 
     def _switch_to_jtc_sync(self) -> Tuple[bool, str]:
-        """Atomically deactivate FZI and activate the JTC."""
+        """Atomically deactivate whichever FZI controller is engaged and
+        activate the JTC.
+
+        Falls back to ``self._active_controller_name`` if no engaged
+        controller is recorded (i.e. someone called us while idle --
+        harmless because controller_manager will refuse to deactivate a
+        non-running controller and the JTC will reactivate).
+        """
+        deactivate = [self._engaged_controller_name
+                      or self._active_controller_name]
         return self._switch_controllers_sync(
             activate=[self._fzi_jtc_controller_name],
-            deactivate=[self._fzi_controller_name])
+            deactivate=deactivate)
 
     def _switch_controllers_sync(self, activate: List[str],
                                  deactivate: List[str]) -> Tuple[bool, str]:
@@ -488,6 +622,10 @@ class CartesianControlNode(Node):
                     f"{self._fzi_jtc_controller_name!r} FAILED ({why}); "
                     "FZI is still active -- arm may continue compliant "
                     "motion! Operator must intervene manually.")
+        # Clear bookkeeping for the engaged controller after the switch
+        # call so ``_switch_to_jtc_sync`` could deactivate the right one.
+        with self._lock:
+            self._engaged_controller_name = ""
         self._publish_state()
 
     # ------------------------------------------------------------------
@@ -511,10 +649,15 @@ class CartesianControlNode(Node):
                 "trip_reason":          self._trip_reason,
                 "wrench_topic":         self._wrench_topic,
                 "joint_states_topic":   self._joint_states_topic,
-                "fzi_controller":       self._fzi_controller_name,
+                # Currently-selected (settable via param) and currently-
+                # engaged FZI controller (== selected at the time of the
+                # last engage; empty when idle).
+                "active_controller":    self._active_controller_name,
+                "engaged_controller":   self._engaged_controller_name,
+                "available_controllers": [
+                    {"name": n, "kind": k} for n, k in self._controllers
+                ],
                 "fzi_jtc":              self._fzi_jtc_controller_name,
-                "fzi_ft_topic":         self._fzi_ft_topic,
-                "fzi_target_topic":     self._fzi_target_topic,
                 "controller_manager_ns": self._controller_manager_ns,
                 "loop_rate_hz":         self._loop_rate_hz,
                 "ft_age":               ft_age,

@@ -1,14 +1,16 @@
 # duco_control
 
 ROS 2 (Humble) workspace for hand-guided / Cartesian-compliance control of
-the Duco GCR5_910 6-DoF arm.  The hot-path Cartesian controller is the C++
-`cartesian_force_controller` plugin from a fork of FZI's
+the Duco GCR5_910 6-DoF arm.  The hot-path Cartesian controllers are the
+C++ `cartesian_force_controller` / `cartesian_motion_controller` /
+`cartesian_compliance_controller` plugins from a fork of FZI's
 [cartesian_controllers](https://github.com/fzi-forschungszentrum-informatik/cartesian_controllers)
 (tracked as a submodule under
 [`external/cartesian_controllers`](external/cartesian_controllers)).
-Everything in `src/` is the project-owned glue around it: the FT sensor
+Everything in `src/` is the project-owned glue around them: the FT sensor
 driver, gravity compensation, the orchestrator that spawns / engages /
-supervises the FZI controller, and a set of optional web dashboards.
+supervises the active Cartesian controller, and a set of optional web
+dashboards.
 
 ---
 
@@ -20,8 +22,8 @@ supervises the FZI controller, and a set of optional web dashboards.
 | [`duco_ft_sensor`](src/duco_ft_sensor) | serial driver + ROS publisher for the Duco F/T sensor | -- |
 | [`ft_sensor_dashboard`](src/ft_sensor_dashboard) | optional web UI for any `WrenchStamped` topic | `8080` |
 | [`ft_sensor_gravity_compensation`](src/ft_sensor_gravity_compensation) | subscribes to the raw wrench + `/tf`, publishes a gravity-compensated wrench, has its own calibration UI | `8100` |
-| [`duco_cartesian_control`](src/duco_cartesian_control) | spawns FZI's `cartesian_force_controller`, relays the wrench, publishes a zero target_wrench heartbeat, runs the engage / disengage Trigger services and a safety supervisor | -- |
-| [`cartesian_controller_dashboard`](src/cartesian_controller_dashboard) | optional web UI for engage / disengage and live-tuning of the FZI controller's gains | `8120` |
+| [`duco_cartesian_control`](src/duco_cartesian_control) | spawns FZI's `cartesian_force_controller` / `cartesian_motion_controller` / `cartesian_compliance_controller` (all inactive), relays the wrench, publishes a zero target_wrench heartbeat, runs the engage / disengage Trigger services and a safety supervisor | -- |
+| [`cartesian_controller_dashboard`](src/cartesian_controller_dashboard) | optional web UI for engage / disengage, controller selection (force / motion / compliance), and live-tuning of the active controller's gains | `8120` |
 | [`duco_dashboard`](src/duco_dashboard) | optional web UI for joint / controller / TCP state | `8090` |
 | [`common`](src/common) | centralised config loader (reads `config/robot_config.yaml`) |
 
@@ -135,19 +137,28 @@ ros2 launch duco_cartesian_control cartesian_control_real.launch.py
 
 This:
 
-* loads FZI's `cartesian_force_controller` into `controller_manager` in
-  the **inactive** state (operator must engage to activate it),
-* relays `/duco_ft_sensor/wrench_compensated` (BEST_EFFORT) onto FZI's
-  RELIABLE input `/cartesian_force_controller/ft_sensor_wrench`,
+* loads three FZI Cartesian controllers into `controller_manager` in
+  the **inactive** state (operator picks one and engages):
+  * `cartesian_force_controller` -- pure free-drive (target_wrench = 0),
+  * `cartesian_motion_controller` -- pose-hold (snapshots current pose
+    on activate),
+  * `cartesian_compliance_controller` -- pose-hold + yields to wrench;
+* relays `/duco_ft_sensor/wrench_compensated` (BEST_EFFORT) onto each
+  controller's RELIABLE input `/<controller>/ft_sensor_wrench`,
 * publishes a constant zero `WrenchStamped` at 10 Hz on
-  `/cartesian_force_controller/target_wrench` (FZI minimises
-  `target - measured`, so identically zero target = pure free-drive),
+  `/<controller>/target_wrench` for the force + compliance controllers
+  (FZI minimises `target - measured`, so identically zero target =
+  pure free-drive / compliance against zero),
 * exposes `~/engage` and `~/disengage` `Trigger` services that
-  atomically swap `arm_1_controller` <-> `cartesian_force_controller`,
+  atomically swap `arm_1_controller` <-> the **active** Cartesian
+  controller (selected via the `active_controller_name` parameter or
+  the dashboard's dropdown -- locked while engaged),
 * runs a 50 Hz safety supervisor that auto-disengages on stale topics
   or wrench / torque limit violation,
 * publishes a JSON status snapshot on `/duco_cartesian_control/state`
-  (`std_msgs/String`, RELIABLE + TRANSIENT_LOCAL).
+  (`std_msgs/String`, RELIABLE + TRANSIENT_LOCAL) including the
+  catalogue, the current `active_controller`, and the
+  `engaged_controller`.
 
 Use `cartesian_control.launch.py` instead of `_real` when running
 against fake hardware (no conservative-limit overlay).
@@ -156,12 +167,17 @@ Verify:
 
 ```bash
 ros2 control list_controllers
-# joint_state_broadcaster      active
-# arm_1_controller             active
-# cartesian_force_controller   inactive   <-- correct: standby
+# joint_state_broadcaster           active
+# arm_1_controller                  active
+# cartesian_force_controller        inactive   <-- selectable, standby
+# cartesian_motion_controller       inactive
+# cartesian_compliance_controller   inactive
 ros2 topic hz /cartesian_force_controller/ft_sensor_wrench
 ros2 topic hz /cartesian_force_controller/target_wrench   # ~10 Hz
 ros2 service list | grep duco_cartesian_control
+# Switch which controller engage will activate (only while idle):
+ros2 param set /duco_cartesian_control active_controller_name \\
+    cartesian_compliance_controller
 ```
 
 ### 5. Cartesian dashboard (optional but recommended)
