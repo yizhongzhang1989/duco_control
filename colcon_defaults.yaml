@@ -1,0 +1,38 @@
+# Workspace-local colcon defaults.
+#
+# Auto-discovered by the `colcon-defaults` plugin (already shipped with
+# ros-humble-ros-core / colcon-common-extensions on this machine) when
+# colcon is invoked from this directory.  Equivalent to passing the
+# matching `--packages-ignore` flag to every verb.
+#
+# We exclude two packages from the upstream FZI cartesian_controllers
+# submodule that we don't build:
+#
+#   * cartesian_controller_simulation -- pulls in Gazebo-classic deps that
+#     are not relevant to the Duco real-hardware setup.
+#   * cartesian_controller_tests      -- the upstream gtest suite, depends
+#     on the simulation package above.
+#
+# Keeping the ignore list here (instead of in COLCON_IGNORE marker files
+# inside the submodule's working tree) means `git status` in the submodule
+# stays clean and the submodule is never modified.
+build:
+  packages-ignore:
+    - cartesian_controller_simulation
+    - cartesian_controller_tests
+test:
+  packages-ignore:
+    - cartesian_controller_simulation
+    - cartesian_controller_tests
+list:
+  packages-ignore:
+    - cartesian_controller_simulation
+    - cartesian_controller_tests
+graph:
+  packages-ignore:
+    - cartesian_controller_simulation
+    - cartesian_controller_tests
+info:
+  packages-ignore:
+    - cartesian_controller_simulation
+    - cartesian_controller_tests

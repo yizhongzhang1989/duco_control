@@ -67,6 +67,14 @@ Repeat `colcon build --symlink-install` after pulling.  Because all the
 project-owned packages use `--symlink-install`, edits to Python sources
 take effect on the next launch without rebuilding.
 
+> Two packages from the upstream FZI submodule
+> (`cartesian_controller_simulation`, `cartesian_controller_tests`) pull in
+> Gazebo-classic dependencies we don't need; they are excluded via
+> [`colcon_defaults.yaml`](colcon_defaults.yaml) at the workspace root.
+> The `colcon-defaults` plugin auto-discovers that file when `colcon` is
+> invoked from this directory, so no extra flags or env vars are required.
+> The submodule's working tree stays clean (`git status` shows nothing).
+
 ---
 
 ## Bringup sequence (real hardware)
