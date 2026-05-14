@@ -95,6 +95,16 @@ def get_config_dir() -> str:
     return str(Path(root) / "config")
 
 
+def get_config_path(filename: str) -> str:
+    """Return the absolute path of ``config/<filename>`` in the project.
+
+    Raises ``RuntimeError`` if the workspace root can't be located.
+    Does NOT check whether the file actually exists -- callers that need
+    that guarantee should ``os.path.isfile(...)`` the result themselves.
+    """
+    return str(Path(get_config_dir()) / filename)
+
+
 def get_temp_dir(create: bool = True) -> str:
     """Return the absolute path of the project's ``temp/`` directory.
 

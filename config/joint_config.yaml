@@ -1,0 +1,68 @@
+# Alicia-D Leader joint calibration -- DUCO GCR5_910 follower
+# ============================================================
+#
+# This file is loaded by the alicia_duo_leader_driver and tells it how
+# to map raw leader-arm encoder readings into joint angles that match
+# the Duco's joint frame and zero pose. The driver applies, per joint:
+#
+#     out = direction * raw  +  zero_offset      (continuous=false)
+#     out = unwrap(direction * raw + zero_offset) (continuous=true)
+#
+# Pass this file to the driver via:
+#
+#   ros2 launch alicia_duo_leader_driver serial_server.launch.py \
+#       joint_config:=$(pwd)/config/joint_config.yaml
+#
+# NOTE: This config is intentionally DIFFERENT from the UR15 version
+# (e.g. in ../ur15_crisp/config/joint_config.yaml). The two robots have
+# different zero poses and joint-rotation conventions, so the
+# zero_offset values are not portable. The direction / continuous flags
+# are leader-mechanical properties and stay the same.
+#
+# Field reference:
+#   direction:    1.0 or -1.0 -- flip the joint if the leader rotates
+#                 opposite to the Duco follower.
+#   zero_offset:  radians -- added AFTER direction flip; aligns the
+#                 leader's rest pose with the Duco's joint-zero pose.
+#                 CALIBRATE: hold the leader in the Duco's home pose
+#                 and read /arm_joint_state_raw, then negate the values.
+#   continuous:   true to unwrap (wrist roll etc.), false to clamp at +/-pi.
+#
+# Duco GCR5_910 joint limits are +/-pi on every joint (see
+# external/duco_ros2_driver/src/duco_support/urdf/duco_gcr5_910.urdf), so
+# the unwrapping policy below is the same as for UR15.
+
+joint_config:
+  joint1:                       # -> arm_1_joint_1 (base)
+    direction: 1.0
+    zero_offset: -3.14            # CALIBRATE for Duco home pose
+    continuous: false
+
+  joint2:                       # -> arm_1_joint_2 (shoulder)
+    direction: -1.0
+    zero_offset: 0.0            # CALIBRATE for Duco home pose
+    continuous: false
+
+  joint3:                       # -> arm_1_joint_3 (elbow)
+    direction: 1.0
+    zero_offset: -2.1            # CALIBRATE for Duco home pose
+    continuous: false
+
+  joint4:                       # -> arm_1_joint_4 (wrist 1)
+    direction: -1.0
+    zero_offset: 0.0            # CALIBRATE for Duco home pose
+    continuous: true
+
+  joint5:                       # -> arm_1_joint_5 (wrist 2)
+    direction: -1.0
+    zero_offset: 0.0            # CALIBRATE for Duco home pose
+    continuous: true
+
+  joint6:                       # -> arm_1_joint_6 (wrist 3)
+    direction: -1.0
+    zero_offset: -3.14            # CALIBRATE for Duco home pose
+    continuous: true
+
+  gripper:                      # leader gripper -- Duco has no end-effector
+    direction: 1.0              # claw by default; ignored downstream.
+    zero_offset: 0.0
