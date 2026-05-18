@@ -12,6 +12,7 @@
   <depend>sensor_msgs</depend>
   <depend>trajectory_msgs</depend>
   <depend>control_msgs</depend>
+  <depend>controller_manager_msgs</depend>
   <depend>alicia_duo_leader_driver</depend>
   <depend>alicia_duo_leader_dashboard</depend>
   <depend>common</depend>

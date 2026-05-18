@@ -147,6 +147,15 @@ alicia_teleop:
   trajectory_time: 0.1                  # seconds, time_from_start per point
   leader_topic: "/arm_joint_state"      # ArmJointState from alicia driver
   trajectory_topic: "/arm_1_controller/joint_trajectory"
+  forward_position_topic: "/forward_position_controller/commands"
+  # 'forward_position' (DEFAULT): FZI-style direct position streaming via
+  #   forward_command_controller. The teleop node auto-switches the active
+  #   ros2_control controller at startup, no manual setup required.
+  # 'trajectory': publish JointTrajectory to the joint_trajectory_controller.
+  command_mode: "forward_position"
+  # Set to false to skip the auto-switch and use whatever controller is
+  # already active.
+  auto_switch_controller: true
   joint_names:                          # Duco GCR5_910 joint names, in order
     - arm_1_joint_1
     - arm_1_joint_2

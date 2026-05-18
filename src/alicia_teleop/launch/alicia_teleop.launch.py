@@ -43,6 +43,16 @@ _FALLBACKS = {
     "max_velocity": 3.0,
     "leader_topic": "/arm_joint_state",
     "trajectory_topic": "/arm_1_controller/joint_trajectory",
+    "forward_position_topic": "/forward_position_controller/commands",
+    # 'forward_position' (DEFAULT, FZI-style direct position streaming
+    # via forward_command_controller) or 'trajectory' (publish
+    # JointTrajectory to JTC). The teleop bridge auto-switches the
+    # underlying ros2_control controller to match this mode at startup.
+    "command_mode": "forward_position",
+    # Auto-activate the controller required for `command_mode` and
+    # deactivate its sibling on startup; restore on shutdown. Disable
+    # if you are managing controller activation externally.
+    "auto_switch_controller": True,
     "joint_names": [
         "arm_1_joint_1",
         "arm_1_joint_2",
@@ -114,6 +124,26 @@ def generate_launch_description() -> LaunchDescription:
                               description="Clamp on the velocity feedforward, rad/s per joint"),
         DeclareLaunchArgument("leader_topic", default_value=str(d["leader_topic"])),
         DeclareLaunchArgument("trajectory_topic", default_value=str(d["trajectory_topic"])),
+        DeclareLaunchArgument(
+            "forward_position_topic",
+            default_value=str(d["forward_position_topic"]),
+            description="Topic for std_msgs/Float64MultiArray when "
+                        "command_mode == 'forward_position'"),
+        DeclareLaunchArgument(
+            "command_mode",
+            default_value=str(d["command_mode"]),
+            choices=["trajectory", "forward_position"],
+            description="forward_position (default) = publish "
+                        "Float64MultiArray to forward_command_controller "
+                        "(FZI-style direct position streaming, no JTC "
+                        "spline); trajectory = publish JointTrajectory to "
+                        "JTC"),
+        DeclareLaunchArgument(
+            "auto_switch_controller",
+            default_value=str(d["auto_switch_controller"]).lower(),
+            choices=["true", "false", "True", "False"],
+            description="Auto-activate the controller required for "
+                        "command_mode on startup and restore on shutdown"),
         DeclareLaunchArgument("namespace", default_value=""),
         # composition switches
         DeclareLaunchArgument(
@@ -195,6 +225,9 @@ def generate_launch_description() -> LaunchDescription:
             "max_velocity": LaunchConfiguration("max_velocity"),
             "leader_topic": LaunchConfiguration("leader_topic"),
             "trajectory_topic": LaunchConfiguration("trajectory_topic"),
+            "forward_position_topic": LaunchConfiguration("forward_position_topic"),
+            "command_mode": LaunchConfiguration("command_mode"),
+            "auto_switch_controller": LaunchConfiguration("auto_switch_controller"),
             "joint_names": d["joint_names"],
             "joint_scale": [float(x) for x in d["joint_scale"]],
             "joint_offset": [float(x) for x in d["joint_offset"]],
