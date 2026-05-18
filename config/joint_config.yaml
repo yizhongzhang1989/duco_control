@@ -39,7 +39,7 @@ joint_config:
     continuous: false
 
   joint2:                       # -> arm_1_joint_2 (shoulder)
-    direction: -1.0
+    direction: 1.0
     zero_offset: 0.0            # CALIBRATE for Duco home pose
     continuous: false
 

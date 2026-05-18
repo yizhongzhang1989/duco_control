@@ -37,8 +37,10 @@ from launch_ros.actions import Node
 # contain a particular key. These match the historical defaults so the
 # launcher still works on a clean checkout.
 _FALLBACKS = {
-    "rate": 50.0,
-    "trajectory_time": 0.1,
+    "rate": 100.0,
+    "trajectory_time": 0.05,
+    "velocity_feedforward": True,
+    "max_velocity": 3.0,
     "leader_topic": "/arm_joint_state",
     "trajectory_topic": "/arm_1_controller/joint_trajectory",
     "joint_names": [
@@ -105,6 +107,11 @@ def generate_launch_description() -> LaunchDescription:
         # teleop bridge
         DeclareLaunchArgument("rate", default_value=str(d["rate"])),
         DeclareLaunchArgument("trajectory_time", default_value=str(d["trajectory_time"])),
+        DeclareLaunchArgument("velocity_feedforward",
+                              default_value=str(d["velocity_feedforward"]).lower(),
+                              description="Send leader-velocity estimates with each trajectory point"),
+        DeclareLaunchArgument("max_velocity", default_value=str(d["max_velocity"]),
+                              description="Clamp on the velocity feedforward, rad/s per joint"),
         DeclareLaunchArgument("leader_topic", default_value=str(d["leader_topic"])),
         DeclareLaunchArgument("trajectory_topic", default_value=str(d["trajectory_topic"])),
         DeclareLaunchArgument("namespace", default_value=""),
@@ -184,6 +191,8 @@ def generate_launch_description() -> LaunchDescription:
         parameters=[{
             "rate": LaunchConfiguration("rate"),
             "trajectory_time": LaunchConfiguration("trajectory_time"),
+            "velocity_feedforward": LaunchConfiguration("velocity_feedforward"),
+            "max_velocity": LaunchConfiguration("max_velocity"),
             "leader_topic": LaunchConfiguration("leader_topic"),
             "trajectory_topic": LaunchConfiguration("trajectory_topic"),
             "joint_names": d["joint_names"],
