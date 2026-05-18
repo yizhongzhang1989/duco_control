@@ -41,6 +41,7 @@ _FALLBACKS = {
     "trajectory_time": 0.05,
     "velocity_feedforward": True,
     "max_velocity": 3.0,
+    "max_acceleration": 10.0,
     "leader_topic": "/arm_joint_state",
     "trajectory_topic": "/arm_1_controller/joint_trajectory",
     "forward_position_topic": "/forward_position_controller/commands",
@@ -121,7 +122,18 @@ def generate_launch_description() -> LaunchDescription:
                               default_value=str(d["velocity_feedforward"]).lower(),
                               description="Send leader-velocity estimates with each trajectory point"),
         DeclareLaunchArgument("max_velocity", default_value=str(d["max_velocity"]),
-                              description="Clamp on the velocity feedforward, rad/s per joint"),
+                              description="Per-joint velocity cap for the "
+                                          "rate-limited command interpolator "
+                                          "(also used as velocity feedforward "
+                                          "value), rad/s"),
+        DeclareLaunchArgument("max_acceleration",
+                              default_value=str(d["max_acceleration"]),
+                              description="Per-joint acceleration cap for the "
+                                          "rate-limited command interpolator, "
+                                          "rad/s^2. Together with max_velocity "
+                                          "this controls how quickly the "
+                                          "follower closes a leader/follower "
+                                          "gap on SYNC engage."),
         DeclareLaunchArgument("leader_topic", default_value=str(d["leader_topic"])),
         DeclareLaunchArgument("trajectory_topic", default_value=str(d["trajectory_topic"])),
         DeclareLaunchArgument(
@@ -223,6 +235,7 @@ def generate_launch_description() -> LaunchDescription:
             "trajectory_time": LaunchConfiguration("trajectory_time"),
             "velocity_feedforward": LaunchConfiguration("velocity_feedforward"),
             "max_velocity": LaunchConfiguration("max_velocity"),
+            "max_acceleration": LaunchConfiguration("max_acceleration"),
             "leader_topic": LaunchConfiguration("leader_topic"),
             "trajectory_topic": LaunchConfiguration("trajectory_topic"),
             "forward_position_topic": LaunchConfiguration("forward_position_topic"),

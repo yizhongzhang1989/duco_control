@@ -7,6 +7,14 @@ publishes them either as a JointTrajectory on the JTC's command topic
 the forward_command_controller's command topic (``command_mode ==
 'forward_position'``, the default).
 
+Per-joint velocity and acceleration limits are enforced by a rate-limited
+command interpolator. On every engagement, ``q_cmd`` is seeded from the
+robot's actual pose (read from ``/joint_states``) and then ramped toward
+the leader target with bounded velocity (``max_velocity``) and bounded
+acceleration (``max_acceleration``). This prevents the "current pose
+differs too much from target" safety stop that the robot driver raises
+when SYNC engages with the leader far from the follower.
+
 By default this node also activates the controller required for the
 configured mode and deactivates its sibling at startup, and restores the
 original controller states on shutdown -- so a fresh bringup followed by
@@ -45,6 +53,7 @@ import numpy as np
 import rclpy
 import signal
 from rclpy.node import Node
+from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectoryPoint, JointTrajectory
 from std_msgs.msg import Float64MultiArray
 from builtin_interfaces.msg import Duration as DurationMsg
@@ -96,14 +105,20 @@ class AliciaTeleop(Node):
         self.declare_parameter("joint_scale", [1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
         self.declare_parameter("joint_offset", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         self.declare_parameter("trajectory_time", 0.05)  # seconds — time_from_start per point (trajectory mode only)
-        # Velocity feedforward: estimate leader joint velocity from
-        # successive samples and send it with each trajectory point so
-        # JTC interpolates a smooth velocity profile instead of
-        # stop-and-go ramps. Cap protects against finite-difference
-        # noise / large timestamp gaps.
+        # Velocity feedforward: send the rate-limited command velocity
+        # (v_cmd, see _timer_cb) with each trajectory point so JTC's
+        # spline matches the commanded velocity profile instead of
+        # stop-and-go ramping between successive position points.
         # Only used in trajectory mode; ignored in forward_position mode.
         self.declare_parameter("velocity_feedforward", True)
-        self.declare_parameter("max_velocity", 3.0)  # rad/s, per joint
+        # Per-joint hard caps on the rate-limited command interpolator.
+        # Together they bound how aggressively the follower closes the
+        # gap between the robot's current pose and the (possibly far)
+        # leader target -- so engaging SYNC when the leader is far from
+        # the follower ramps in smoothly instead of tripping the robot's
+        # "position deviation too large" safety stop. Both must be > 0.
+        self.declare_parameter("max_velocity", 3.0)       # rad/s, per joint
+        self.declare_parameter("max_acceleration", 10.0)  # rad/s^2, per joint
 
         rate = self.get_parameter("rate").value
         self._joint_names = list(self.get_parameter("joint_names").value)
@@ -122,6 +137,14 @@ class AliciaTeleop(Node):
         self._traj_time = self.get_parameter("trajectory_time").value
         self._vff_enabled = bool(self.get_parameter("velocity_feedforward").value)
         self._vmax = float(self.get_parameter("max_velocity").value)
+        self._amax = float(self.get_parameter("max_acceleration").value)
+        self._rate = float(rate)
+        self._dt = 1.0 / self._rate
+
+        if self._vmax <= 0.0 or self._amax <= 0.0:
+            raise ValueError(
+                f"alicia_teleop: max_velocity and max_acceleration must be "
+                f"positive, got vmax={self._vmax}, amax={self._amax}")
 
         if len(self._joint_names) != 6:
             raise ValueError(
@@ -132,10 +155,11 @@ class AliciaTeleop(Node):
                 "joint_scale and joint_offset must each have 6 elements")
 
         # State
-        self._leader_joints = None  # latest leader arm joint angles (6,)
-        self._leader_velocity = np.zeros(6, dtype=np.float64)  # rad/s, estimated
-        self._prev_leader_joints = None
-        self._prev_leader_stamp = None  # rclpy time when last sample arrived
+        self._leader_joints = None      # latest leader arm joint angles (6,)
+        self._follower_joints = None    # latest follower joint positions (6,)
+                                        # from /joint_states (matched by name).
+        self._q_cmd = None              # rate-limited commanded position (6,)
+        self._v_cmd = None              # rate-limited commanded velocity (6,)
         self._active = False
         self._last_lock = None   # last seen but1, for transition logging
         self._last_sync = None   # last seen but2, for transition logging
@@ -145,6 +169,19 @@ class AliciaTeleop(Node):
             ArmJointState,
             leader_topic,
             self._leader_cb,
+            10,
+        )
+
+        # Subscribe to follower /joint_states so the rate limiter can
+        # seed its starting position from the actual robot pose on each
+        # SYNC engagement -- this is what prevents the "current pose
+        # differs too much from target" safety stop. Match by name:
+        # joint_state_broadcaster does NOT guarantee the canonical
+        # [j1..j6] ordering (we've observed [j1, j3, j2, j4, j5, j6]).
+        self.create_subscription(
+            JointState,
+            "/joint_states",
+            self._joint_state_cb,
             10,
         )
 
@@ -173,6 +210,7 @@ class AliciaTeleop(Node):
             f"traj_time={self._traj_time:.3f}s, "
             f"vff={'on' if self._vff_enabled else 'off'} "
             f"vmax={self._vmax:.2f} rad/s, "
+            f"amax={self._amax:.2f} rad/s^2, "
             f"leader_topic={leader_topic}, "
             f"command_topic={self._command_topic}, "
             f"joint_names={self._joint_names}"
@@ -190,28 +228,10 @@ class AliciaTeleop(Node):
 
     def _leader_cb(self, msg: ArmJointState):
         """Store latest leader arm joints and update active state."""
-        leader_joints = np.array([
+        self._leader_joints = np.array([
             msg.joint1, msg.joint2, msg.joint3,
             msg.joint4, msg.joint5, msg.joint6,
         ], dtype=np.float64)
-
-        # Estimate leader velocity from the timestamp delta. Guards
-        # against zero/huge dt (timer skew, first sample, etc.).
-        now = self.get_clock().now()
-        if (self._vff_enabled and self._prev_leader_joints is not None
-                and self._prev_leader_stamp is not None):
-            dt = (now - self._prev_leader_stamp).nanoseconds * 1e-9
-            if 1e-4 < dt < 0.1:
-                vel = (leader_joints - self._prev_leader_joints) / dt
-                # Clamp to vmax to suppress finite-difference spikes.
-                vel = np.clip(vel, -self._vmax, self._vmax)
-                # Light low-pass (alpha=0.5) for further noise rejection.
-                self._leader_velocity = 0.5 * self._leader_velocity + 0.5 * vel
-            else:
-                self._leader_velocity[:] = 0.0
-        self._prev_leader_joints = leader_joints
-        self._prev_leader_stamp = now
-        self._leader_joints = leader_joints
 
         lock = bool(msg.but1)
         sync = bool(msg.but2)
@@ -235,45 +255,125 @@ class AliciaTeleop(Node):
         if sync:
             if not self._active:
                 self._active = True
+                # _q_cmd / _v_cmd are deliberately left as None until
+                # the next timer tick seeds them from /joint_states.
+                # That keeps the rate limiter starting from the robot's
+                # actual pose every time SYNC is pressed.
                 self.get_logger().info("Teleop ENGAGED (leader SYNC)")
         else:
             if self._active:
                 self._active = False
+                self._q_cmd = None
+                self._v_cmd = None
                 self.get_logger().info(
                     "Teleop DISENGAGED (leader SYNC released)"
                 )
 
+    def _joint_state_cb(self, msg: JointState):
+        """Capture follower joint positions for rate-limiter seeding.
+
+        Matches by joint name -- joint_state_broadcaster does not
+        guarantee the canonical [j1..j6] order. Silently ignores
+        messages that don't carry all of our joints (e.g. partial
+        publishers).
+        """
+        pos_by_name = dict(zip(msg.name, msg.position))
+        try:
+            self._follower_joints = np.array(
+                [pos_by_name[n] for n in self._joint_names],
+                dtype=np.float64,
+            )
+        except KeyError:
+            return
+
     def _timer_cb(self):
-        """Send joint command from leader arm data."""
+        """Send joint command from leader arm data, rate-limited.
+
+        Per-joint velocity and acceleration caps are enforced on a
+        commanded position (``_q_cmd``) that is seeded from the robot's
+        actual pose at engagement time and then ramped toward the
+        leader target. The published value is ``_q_cmd``, NOT the raw
+        leader target -- so a large leader-vs-follower gap becomes a
+        smooth bounded approach instead of an instantaneous jump.
+        """
         if self._leader_joints is None or not self._active:
             return
 
-        # Map leader joints to follower joints. Velocity is mapped by
-        # the same scale (sign flips track) and offset is irrelevant
-        # since it's a constant.
+        # Map leader joints to follower joints. ``joint_offset`` is a
+        # constant bias, ``joint_scale`` includes any sign flips for
+        # mirrored axes.
         target = self._leader_joints * self._joint_scale + self._joint_offset
 
-        if self._command_mode == "trajectory":
-            target_vel = self._leader_velocity * self._joint_scale
+        # Seed the rate limiter on the first tick after engagement so
+        # we start from the robot's actual pose (no jump). If
+        # /joint_states hasn't been heard yet we throttle-warn and hold
+        # off publishing until it arrives -- otherwise we'd have to
+        # fall back to the leader target and lose the safety guarantee.
+        if self._q_cmd is None:
+            if self._follower_joints is None:
+                self.get_logger().warn(
+                    "Engaged but /joint_states not received yet; "
+                    "holding off commands until the robot's joint "
+                    "states arrive. Is joint_state_broadcaster active?",
+                    throttle_duration_sec=2.0,
+                )
+                return
+            self._q_cmd = self._follower_joints.copy()
+            self._v_cmd = np.zeros(6, dtype=np.float64)
+            gap = float(np.max(np.abs(target - self._q_cmd)))
+            self.get_logger().info(
+                f"Rate limiter seeded from /joint_states; "
+                f"max initial gap = {gap:.3f} rad "
+                f"(vmax={self._vmax:.2f} rad/s, "
+                f"amax={self._amax:.2f} rad/s^2 will close it smoothly)"
+            )
 
+        # Per-joint velocity- and acceleration-limited tracking using
+        # a trapezoidal profile. The "stopping velocity" cap
+        # sqrt(2*amax*|err|) is what makes this overshoot-free: it is
+        # the maximum speed from which we can still decelerate to zero
+        # at the target given amax, so v_cmd starts braking BEFORE we
+        # reach the target instead of trying (and failing) to brake on
+        # the last tick.
+        #   err   = target - q_cmd
+        #   v_des = sign(err) * min(|err|/dt, sqrt(2*amax*|err|), vmax)
+        #   dv    = clip(v_des - v_cmd, -amax*dt, amax*dt)
+        #   v_cmd = clip(v_cmd + dv, -vmax, vmax)
+        #   q_cmd = q_cmd + v_cmd * dt
+        dt = self._dt
+        err = target - self._q_cmd
+        abs_err = np.abs(err)
+        v_stop = np.sqrt(2.0 * self._amax * abs_err)
+        v_des = np.sign(err) * np.minimum(
+            np.minimum(abs_err / dt, v_stop), self._vmax)
+        dv = np.clip(
+            v_des - self._v_cmd, -self._amax * dt, self._amax * dt)
+        self._v_cmd = np.clip(self._v_cmd + dv, -self._vmax, self._vmax)
+        self._q_cmd = self._q_cmd + self._v_cmd * dt
+
+        if self._command_mode == "trajectory":
             traj = JointTrajectory()
             traj.joint_names = self._joint_names
 
             point = JointTrajectoryPoint()
-            point.positions = target.tolist()
+            point.positions = self._q_cmd.tolist()
             if self._vff_enabled:
-                point.velocities = target_vel.tolist()
+                # vff = the rate-limited command velocity (matches the
+                # position derivative we are actually publishing) so
+                # JTC's spline tracks our profile without overshoot.
+                point.velocities = self._v_cmd.tolist()
             sec = int(self._traj_time)
             nanosec = int((self._traj_time - sec) * 1e9)
             point.time_from_start = DurationMsg(sec=sec, nanosec=nanosec)
             traj.points = [point]
             self._traj_pub.publish(traj)
         else:  # forward_position
-            # FZI-style: just hand the latest position to the controller.
-            # forward_command_controller writes whatever we send straight
-            # to the position command interface on every controller tick.
+            # FZI-style: just hand the latest rate-limited position to
+            # the controller. forward_command_controller writes whatever
+            # we send straight to the position command interface on
+            # every controller tick.
             msg = Float64MultiArray()
-            msg.data = target.tolist()
+            msg.data = self._q_cmd.tolist()
             self._fwd_pub.publish(msg)
 
 

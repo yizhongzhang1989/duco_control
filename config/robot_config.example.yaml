@@ -145,6 +145,13 @@ alicia_teleop:
   # ---- bridge node ----
   rate: 50.0                            # Hz, JointTrajectory publish rate
   trajectory_time: 0.1                  # seconds, time_from_start per point
+  velocity_feedforward: true            # send v_cmd with each trajectory point
+  # Per-joint hard caps on the rate-limited command interpolator. They
+  # bound how quickly the follower closes the leader/follower gap on
+  # SYNC engage, so a large initial offset no longer trips the robot's
+  # "position deviation too large" safety stop. Tune for your task.
+  max_velocity: 3.0                     # rad/s
+  max_acceleration: 10.0                # rad/s^2
   leader_topic: "/arm_joint_state"      # ArmJointState from alicia driver
   trajectory_topic: "/arm_1_controller/joint_trajectory"
   forward_position_topic: "/forward_position_controller/commands"
