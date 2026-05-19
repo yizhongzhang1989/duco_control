@@ -29,6 +29,7 @@ not deadlock with the ROS spin thread.
 from __future__ import annotations
 
 import json
+import math
 import sys
 import threading
 import time
@@ -38,7 +39,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import rclpy
-from geometry_msgs.msg import WrenchStamped
+from geometry_msgs.msg import (PoseStamped, WrenchStamped)
 from rcl_interfaces.msg import (Parameter, ParameterType, ParameterValue)
 from rcl_interfaces.srv import GetParameters, ListParameters, SetParameters
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -49,15 +50,22 @@ from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
+from tf2_ros import Buffer, TransformException, TransformListener
 
 
 # ---------------------------------------------------------------------------
-# tunable parameter list (curated -- the dashboard exposes these as the
-# editable controls for ``cartesian_force_controller``).  Each entry is
-# ``(name, kind)`` where ``kind`` is "double" or "integer" so we can
-# build a correctly-typed ``ParameterValue``.
+# tunable parameter catalogue (curated, keyed by controller "kind").
+#
+# Each entry is ``(name, kind)`` where ``kind`` is "double" or "integer"
+# so we can build a correctly-typed ``ParameterValue``.  The dashboard
+# discovers which controller is currently *active* from the orchestrator's
+# state topic and exposes the matching list as the editable controls.
+#
+# All FZI controllers share the base ``pd_gains.*`` and ``solver.*``
+# inner-loop knobs; the compliance controller adds an apparent-stiffness
+# matrix, which is the main parameter operators want to play with.
 # ---------------------------------------------------------------------------
-_TUNABLE_PARAMS: List[Tuple[str, str]] = [
+_BASE_TUNABLES: List[Tuple[str, str]] = [
     ("pd_gains.trans_x.p", "double"),
     ("pd_gains.trans_y.p", "double"),
     ("pd_gains.trans_z.p", "double"),
@@ -67,6 +75,19 @@ _TUNABLE_PARAMS: List[Tuple[str, str]] = [
     ("solver.error_scale", "double"),
     ("solver.iterations",  "integer"),
 ]
+_COMPLIANCE_EXTRAS: List[Tuple[str, str]] = [
+    ("stiffness.trans_x", "double"),
+    ("stiffness.trans_y", "double"),
+    ("stiffness.trans_z", "double"),
+    ("stiffness.rot_x",   "double"),
+    ("stiffness.rot_y",   "double"),
+    ("stiffness.rot_z",   "double"),
+]
+_TUNABLES_BY_KIND: Dict[str, List[Tuple[str, str]]] = {
+    "force":      list(_BASE_TUNABLES),
+    "motion":     list(_BASE_TUNABLES),
+    "compliance": list(_BASE_TUNABLES) + list(_COMPLIANCE_EXTRAS),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +129,10 @@ _HTML_PAGE = r"""<!doctype html>
            border: 1px solid #2b3140; border-radius: 4px; padding: 3px 6px;
            font: inherit; font-size: 0.82rem; width: 7em;
            font-variant-numeric: tabular-nums; }
+  select { background: #0f1218; color: #e6e6e6;
+           border: 1px solid #2b3140; border-radius: 4px; padding: 3px 6px;
+           font: inherit; font-size: 0.82rem; }
+  select:disabled { opacity: 0.5; cursor: not-allowed; }
   .status { display: inline-block; padding: 2px 7px; border-radius: 999px;
             background: #1f2937; color: #cfd3dc; font-variant-numeric: tabular-nums; }
   .status.ok  { background: #14532d; color: #c6f7d6; }
@@ -120,6 +145,18 @@ _HTML_PAGE = r"""<!doctype html>
   .small { font-size: 0.78rem; color: #8a93a6; }
   .num { font-variant-numeric: tabular-nums; }
   .engage-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .cmd-grid { display: flex; gap: 24px; flex-wrap: wrap; margin-top: 8px; }
+  .cmd-col  { display: flex; flex-direction: column; gap: 6px; min-width: 180px; }
+  .cmd-row  { display: flex; gap: 8px; align-items: center; }
+  .cmd-row label { color: #8a93a6; font-size: 0.78rem; min-width: 5em; }
+  .jog-grid { display: grid; grid-template-columns: repeat(2, 60px);
+              grid-auto-rows: 32px; gap: 6px; }
+  button.jog { background: #2a3142; color: #e6e6e6; border: 1px solid #3a4258;
+               border-radius: 4px; cursor: pointer; font: inherit;
+               font-size: 0.85rem; padding: 4px 0; }
+  button.jog:hover:not(:disabled) { background: #3a4258; }
+  button.jog:disabled { opacity: 0.4; cursor: not-allowed; }
+  .cmd-section[hidden] { display: none; }
   .toast { position: fixed; right: 14px; bottom: 14px; max-width: 400px;
            background: #181b22; border: 1px solid #262a33; border-radius: 8px;
            padding: 8px 12px; font-size: 0.82rem; color: #cfd3dc;
@@ -132,7 +169,7 @@ _HTML_PAGE = r"""<!doctype html>
 <body>
   <h1>Cartesian controller dashboard</h1>
   <div class="sub">
-    controller <code id="controller-name">--</code>
+    active controller <code id="controller-name">--</code>
     &nbsp; orchestrator state <span id="orch-status" class="status">--</span>
     &nbsp; <span id="conn" class="status">connecting...</span>
   </div>
@@ -140,11 +177,85 @@ _HTML_PAGE = r"""<!doctype html>
   <div class="panel">
     <div class="engage-bar">
       <span id="engaged" class="status">--</span>
-      <span class="pill active">backend: FZI</span>
+      <span class="small">controller:</span>
+      <select id="sel-controller" title="select which FZI controller engage will activate"></select>
+      <span class="pill" id="kind-pill">kind: --</span>
       <span class="small">trip:</span>
       <span id="trip" class="status">--</span>
       <button id="btn-engage"    type="button" class="big success">Engage</button>
       <button id="btn-disengage" type="button" class="big danger">Disengage</button>
+    </div>
+    <div class="small" style="margin-top:6px;">
+      Use the dropdown to select a controller; click Engage to activate
+      it (only allowed while idle).  Force = pure free-drive
+      (target_wrench=0); Motion = pose-hold (snapshots current pose);
+      Compliance = pose-hold + yields to wrench.
+    </div>
+  </div>
+
+  <div class="panel" id="control-panel">
+    <h2>Controller commands <span class="pill" id="cmd-kind-pill">kind: --</span></h2>
+
+    <div id="cmd-force" class="cmd-section" hidden>
+      <div class="small">
+        The <b>force controller</b> consumes <code>target_wrench</code> and
+        minimises <code>(target - measured)</code>.  The orchestrator
+        publishes <code>target_wrench=0</code> at 10 Hz on
+        <code>/cartesian_force_controller/target_wrench</code>, so engage
+        gives you <b>pure free-drive</b> (hand-guidance) -- push the arm
+        and it yields.  No per-press commands are needed; just engage and
+        guide.
+      </div>
+    </div>
+
+    <div id="cmd-motion-compliance" class="cmd-section" hidden>
+      <div class="small" id="cmd-help">
+        Each press computes <code>new_target = current_EE_pose + delta</code>
+        in <b>base_link</b> and publishes it on
+        <code>/&lt;controller&gt;/target_frame</code>.  Active only while
+        engaged.  <b>Snap</b> resets target to the current pose.
+      </div>
+      <div class="cmd-grid">
+        <div class="cmd-col">
+          <div class="cmd-row">
+            <label>trans step</label>
+            <input id="jog-trans-step" type="number" min="0.001"
+                   max="0.10" step="0.005" value="0.010"> m
+          </div>
+          <div class="jog-grid">
+            <button data-axis="x" data-sign="-1" class="jog">-X</button>
+            <button data-axis="x" data-sign="+1" class="jog">+X</button>
+            <button data-axis="y" data-sign="-1" class="jog">-Y</button>
+            <button data-axis="y" data-sign="+1" class="jog">+Y</button>
+            <button data-axis="z" data-sign="-1" class="jog">-Z</button>
+            <button data-axis="z" data-sign="+1" class="jog">+Z</button>
+          </div>
+        </div>
+        <div class="cmd-col">
+          <div class="cmd-row">
+            <label>rot step</label>
+            <input id="jog-rot-step" type="number" min="0.5" max="30"
+                   step="0.5" value="5"> deg
+          </div>
+          <div class="jog-grid">
+            <button data-raxis="rx" data-sign="-1" class="jog">-Rx</button>
+            <button data-raxis="rx" data-sign="+1" class="jog">+Rx</button>
+            <button data-raxis="ry" data-sign="-1" class="jog">-Ry</button>
+            <button data-raxis="ry" data-sign="+1" class="jog">+Ry</button>
+            <button data-raxis="rz" data-sign="-1" class="jog">-Rz</button>
+            <button data-raxis="rz" data-sign="+1" class="jog">+Rz</button>
+          </div>
+        </div>
+        <div class="cmd-col">
+          <button id="btn-snap-target" type="button" class="big">
+            Snap target to current pose
+          </button>
+          <div class="small" style="margin-top:6px;">
+            Last published target:
+          </div>
+          <div class="num small" id="last-target-pos">--</div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -251,6 +362,57 @@ _HTML_PAGE = r"""<!doctype html>
     $("trip").classList.toggle("bad", !!s.trip_reason);
   }
 
+  // Cache of last (active_controller, available_controllers) we rendered
+  // into the <select> so we don't blow away an in-progress selection on
+  // every 200 ms tick.
+  let renderedSelectSig = null;
+
+  function setControllerSelect(ctl) {
+    const sel = $("sel-controller");
+    const avail = ctl.available_controllers || [];
+    const sig = JSON.stringify(avail);
+    if (sig !== renderedSelectSig) {
+      sel.innerHTML = "";
+      for (const c of avail) {
+        const opt = document.createElement("option");
+        opt.value = c.name;
+        opt.textContent = c.name + " (" + c.kind + ")";
+        sel.appendChild(opt);
+      }
+      renderedSelectSig = sig;
+    }
+    // Sync select to current active unless the user is editing the
+    // dropdown right now (handled by document.activeElement guard).
+    if (document.activeElement !== sel) {
+      sel.value = ctl.active_controller || "";
+    }
+    // Lock the dropdown while engaged -- the orchestrator refuses the
+    // param change anyway, but disabling makes intent obvious.
+    sel.disabled = !!ctl.engaged;
+    // Show kind pill for whatever is currently *selected* in the
+    // dropdown, or the active one if no selection.
+    const chosen = sel.value || ctl.active_controller || "";
+    const entry = avail.find((c) => c.name === chosen);
+    const kind = entry ? entry.kind : "--";
+    $("kind-pill").textContent = "kind: " + kind;
+    setCommandPanel(kind, !!ctl.engaged);
+  }
+
+  function setCommandPanel(kind, engaged) {
+    $("cmd-kind-pill").textContent = "kind: " + kind;
+    const showForce = (kind === "force");
+    const showJog   = (kind === "motion" || kind === "compliance");
+    $("cmd-force").hidden               = !showForce;
+    $("cmd-motion-compliance").hidden   = !showJog;
+    // Jog buttons act on the *engaged* controller -- if not engaged,
+    // disable them to make intent obvious.  (Pre-engage targets get
+    // clobbered by FZI's on_activate snapshot anyway.)
+    const dis = !engaged;
+    document.querySelectorAll("#cmd-motion-compliance button.jog")
+      .forEach((b) => { b.disabled = dis; });
+    $("btn-snap-target").disabled = dis;
+  }
+
   function setStaleness(elId, ok, age) {
     const el = $(elId);
     el.classList.remove("ok", "bad", "warn");
@@ -284,6 +446,7 @@ _HTML_PAGE = r"""<!doctype html>
     if (!s) return;
     const ctl = s.control || {};
     setEngagedPill(ctl);
+    setControllerSelect(ctl);
     setOrchPill(s);
 
     const w = s.wrench;
@@ -459,6 +622,87 @@ _HTML_PAGE = r"""<!doctype html>
 
   $("btn-refresh-params").addEventListener("click", refreshParams);
 
+  // ---- jog / snap-target handlers ----
+  function fmtPos(p) {
+    if (!p) return "--";
+    return "x=" + fmt(p.x, 4) + "  y=" + fmt(p.y, 4) + "  z=" + fmt(p.z, 4);
+  }
+
+  async function postJog(body) {
+    try {
+      const r = await api("/api/jog", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      $("last-target-pos").textContent = fmtPos(r.target && r.target.position);
+    } catch (e) {
+      toast("jog failed: " + e.message, "bad");
+    }
+  }
+
+  // Translation jog buttons.
+  document.querySelectorAll("#cmd-motion-compliance button.jog[data-axis]")
+    .forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const step = parseFloat($("jog-trans-step").value);
+        if (isNaN(step) || step <= 0) {
+          toast("trans step must be > 0", "bad"); return;
+        }
+        const sign = parseInt(btn.dataset.sign, 10);
+        const body = { dx: 0, dy: 0, dz: 0 };
+        body["d" + btn.dataset.axis] = sign * step;
+        postJog(body);
+      });
+    });
+
+  // Rotation jog buttons.
+  document.querySelectorAll("#cmd-motion-compliance button.jog[data-raxis]")
+    .forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const stepDeg = parseFloat($("jog-rot-step").value);
+        if (isNaN(stepDeg) || stepDeg <= 0) {
+          toast("rot step must be > 0", "bad"); return;
+        }
+        const rad = stepDeg * Math.PI / 180.0;
+        const sign = parseInt(btn.dataset.sign, 10);
+        const body = { drx: 0, dry: 0, drz: 0 };
+        body["d" + btn.dataset.raxis] = sign * rad;
+        postJog(body);
+      });
+    });
+
+  $("btn-snap-target").addEventListener("click", async () => {
+    try {
+      const r = await api("/api/snap_target", { method: "POST" });
+      $("last-target-pos").textContent = fmtPos(r.target && r.target.position);
+      toast("target snapped to current pose", "ok");
+    } catch (e) {
+      toast("snap failed: " + e.message, "bad");
+    }
+  });
+
+  // Switch the orchestrator's ``active_controller_name`` parameter on
+  // dropdown change.  The orchestrator refuses if currently engaged --
+  // surface that as a toast and snap the dropdown back.
+  $("sel-controller").addEventListener("change", async (ev) => {
+    const name = ev.target.value;
+    if (!name) return;
+    try {
+      await api("/api/active_controller", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name })
+      });
+      toast("active controller -> " + name, "ok");
+      await refresh();
+    } catch (e) {
+      toast("switch failed: " + e.message, "bad");
+      // Re-sync to whatever the orchestrator actually thinks is active.
+      await refresh();
+    }
+  });
+
   refresh().then(() => setInterval(tick, 200));
   setInterval(refresh, 3000);
 })();
@@ -544,6 +788,19 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 body = self._read_json_body() or {}
                 self._send_json(200, self._dashboard.api_set_param(body))
                 return
+            if path == "/api/active_controller":
+                body = self._read_json_body() or {}
+                self._send_json(
+                    200, self._dashboard.api_set_active_controller(body))
+                return
+            if path == "/api/jog":
+                body = self._read_json_body() or {}
+                self._send_json(200, self._dashboard.api_jog(body))
+                return
+            if path == "/api/snap_target":
+                body = self._read_json_body() or {}
+                self._send_json(200, self._dashboard.api_snap_target(body))
+                return
             self.send_response(404)
             self.end_headers()
         except RuntimeError as exc:
@@ -563,9 +820,24 @@ class DashboardNode(Node):
     _PARAM_DECLARATIONS: List[Tuple[str, object]] = [
         # connectivity ---------------------------------------------------
         ("orchestrator_ns",  "/duco_cartesian_control"),
-        ("controller_name",  "cartesian_force_controller"),
+        # Catalogue of FZI controller node names this dashboard knows
+        # how to talk to.  Must match the orchestrator's
+        # ``available_controllers`` list (this is the *fallback* for
+        # bootstrap before the orchestrator's state topic arrives).
+        ("available_controllers", [
+            "cartesian_force_controller",
+            "cartesian_motion_controller",
+            "cartesian_compliance_controller",
+        ]),
+        ("default_controller_name",  "cartesian_force_controller"),
         ("wrench_topic",     "/duco_ft_sensor/wrench_compensated"),
         ("joint_states_topic", "/joint_states"),
+        # Frames used for jog / snap-target publishes on motion +
+        # compliance controllers.  Must match the URDF that
+        # controller_manager sees and the FZI YAML's
+        # ``robot_base_link`` / ``end_effector_link``.
+        ("base_frame", "base_link"),
+        ("tool_frame", "link_6"),
         ("service_timeout_sec", 2.0),
         # http -----------------------------------------------------------
         ("host", "0.0.0.0"),
@@ -579,9 +851,23 @@ class DashboardNode(Node):
 
         gp = lambda n: self.get_parameter(n).value  # noqa: E731
         self._orchestrator_ns = str(gp("orchestrator_ns")).rstrip("/")
-        self._controller_name = str(gp("controller_name")).strip("/")
+        # Catalogue of controller names we'll create per-controller param
+        # clients for.  Order is not significant.
+        avail = list(gp("available_controllers") or [])
+        self._available_controllers: List[str] = [
+            str(n).strip("/") for n in avail if str(n).strip("/")]
+        if not self._available_controllers:
+            self._available_controllers = ["cartesian_force_controller"]
+        # Bootstrap default until orchestrator state arrives.  The cached
+        # state's ``active_controller`` field overrides this at runtime.
+        self._default_controller_name = str(
+            gp("default_controller_name")).strip("/")
+        if self._default_controller_name not in self._available_controllers:
+            self._default_controller_name = self._available_controllers[0]
         self._wrench_topic = str(gp("wrench_topic"))
         self._joint_states_topic = str(gp("joint_states_topic"))
+        self._base_frame = str(gp("base_frame")).strip("/")
+        self._tool_frame = str(gp("tool_frame")).strip("/")
         self._service_timeout = float(gp("service_timeout_sec"))
         self._host = str(gp("host"))
         self._port = int(gp("port"))
@@ -622,17 +908,45 @@ class DashboardNode(Node):
             Trigger, f"{self._orchestrator_ns}/disengage",
             callback_group=self._cbgroup)
 
-        # Parameter clients on the FZI controller node.
-        ctrl = self._controller_name
-        self._cli_list_params = self.create_client(
-            ListParameters, f"/{ctrl}/list_parameters",
+        # Parameter clients on every FZI controller node we know about.
+        # We pre-create them so switching the *active* controller does
+        # not require any client churn.  Each entry maps controller_name
+        # -> {"list": ..., "get": ..., "set": ...}.
+        self._param_clients: Dict[str, Dict[str, Any]] = {}
+        for ctrl in self._available_controllers:
+            self._param_clients[ctrl] = {
+                "list": self.create_client(
+                    ListParameters, f"/{ctrl}/list_parameters",
+                    callback_group=self._cbgroup),
+                "get": self.create_client(
+                    GetParameters, f"/{ctrl}/get_parameters",
+                    callback_group=self._cbgroup),
+                "set": self.create_client(
+                    SetParameters, f"/{ctrl}/set_parameters",
+                    callback_group=self._cbgroup),
+            }
+        # Service client for the orchestrator's *own* parameters --
+        # used to flip ``active_controller_name`` at runtime.
+        self._cli_orchestrator_set_params = self.create_client(
+            SetParameters,
+            f"{self._orchestrator_ns}/set_parameters",
             callback_group=self._cbgroup)
-        self._cli_get_params = self.create_client(
-            GetParameters, f"/{ctrl}/get_parameters",
-            callback_group=self._cbgroup)
-        self._cli_set_params = self.create_client(
-            SetParameters, f"/{ctrl}/set_parameters",
-            callback_group=self._cbgroup)
+
+        # ---- target_frame publishers (one per controller) -------------
+        # The motion + compliance controllers consume PoseStamped on
+        # ``/<name>/target_frame``; the force controller does not, but
+        # publishing into it is harmless (no subscribers).  We pre-create
+        # one publisher per available controller so the jog / snap UI
+        # can route to whichever is active without churn.
+        self._target_frame_pubs: Dict[str, Any] = {
+            ctrl: self.create_publisher(
+                PoseStamped, f"/{ctrl}/target_frame", 10)
+            for ctrl in self._available_controllers
+        }
+
+        # ---- tf2 listener (current EE pose source for jog / snap) -----
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
 
         # ---- HTTP server ----------------------------------------------
         self._httpd: Optional[ThreadingHTTPServer] = None
@@ -682,8 +996,8 @@ class DashboardNode(Node):
                      else self._host)
             self.get_logger().info(
                 f"web dashboard: http://{shown}:{self._port}/  "
-                f"(controller={self._controller_name!r}, "
-                f"orchestrator={self._orchestrator_ns!r})")
+                f"(orchestrator={self._orchestrator_ns!r}, "
+                f"controllers={self._available_controllers})")
         except OSError as exc:
             self.get_logger().error(
                 f"web dashboard: failed to bind {self._host}:{self._port}: "
@@ -735,9 +1049,9 @@ class DashboardNode(Node):
             raise RuntimeError(resp.message or f"{kind} failed")
         return {"ok": True, "message": resp.message or kind}
 
-    def _get_param_values(self, names: List[str]
+    def _get_param_values(self, controller: str, names: List[str]
                           ) -> Dict[str, Optional[Any]]:
-        """Read parameter values from the controller node.
+        """Read parameter values from a specific controller node.
 
         Returns a dict ``{name: value_or_None}``.  ``None`` means the
         parameter does not exist (or the controller is not running).
@@ -745,23 +1059,31 @@ class DashboardNode(Node):
         result: Dict[str, Optional[Any]] = {n: None for n in names}
         if not names:
             return result
-        if not self._cli_get_params.wait_for_service(timeout_sec=0.2):
+        clients = self._param_clients.get(controller)
+        if clients is None:
+            return result
+        get_cli = clients["get"]
+        if not get_cli.wait_for_service(timeout_sec=0.2):
             return result
         req = GetParameters.Request()
         req.names = list(names)
         resp = self._service_call_sync(
-            self._cli_get_params, req, self._service_timeout)
+            get_cli, req, self._service_timeout)
         if resp is None:
             return result
         for name, pv in zip(names, resp.values):
             result[name] = _decode_param_value(pv)
         return result
 
-    def _set_param(self, name: str, kind: str, raw_value: Any
-                   ) -> Tuple[bool, str]:
-        if not self._cli_set_params.wait_for_service(timeout_sec=0.2):
+    def _set_param(self, controller: str, name: str, kind: str,
+                   raw_value: Any) -> Tuple[bool, str]:
+        clients = self._param_clients.get(controller)
+        if clients is None:
+            return False, f"unknown controller {controller!r}"
+        set_cli = clients["set"]
+        if not set_cli.wait_for_service(timeout_sec=0.2):
             return False, (f"set_parameters service unavailable -- is the "
-                           f"{self._controller_name!r} controller running?")
+                           f"{controller!r} controller running?")
         param = Parameter()
         param.name = name
         pv = ParameterValue()
@@ -780,7 +1102,7 @@ class DashboardNode(Node):
         req = SetParameters.Request()
         req.parameters = [param]
         resp = self._service_call_sync(
-            self._cli_set_params, req, self._service_timeout)
+            set_cli, req, self._service_timeout)
         if resp is None:
             return False, "set_parameters: no response"
         if not resp.results or not resp.results[0].successful:
@@ -789,19 +1111,87 @@ class DashboardNode(Node):
             return False, why or "set_parameters failed"
         return True, "ok"
 
+    def _set_orchestrator_active_controller(self, name: str
+                                            ) -> Tuple[bool, str]:
+        """Flip the orchestrator's ``active_controller_name`` parameter.
+
+        The orchestrator validates the value against its own catalogue
+        and refuses the change while engaged -- both surface here as
+        ``(False, reason)`` from the SetParameters response.
+        """
+        if not self._cli_orchestrator_set_params.wait_for_service(
+                timeout_sec=0.2):
+            return False, (f"orchestrator set_parameters service "
+                           f"unavailable at {self._orchestrator_ns!r}")
+        param = Parameter()
+        param.name = "active_controller_name"
+        pv = ParameterValue()
+        pv.type = ParameterType.PARAMETER_STRING
+        pv.string_value = str(name)
+        param.value = pv
+        req = SetParameters.Request()
+        req.parameters = [param]
+        resp = self._service_call_sync(
+            self._cli_orchestrator_set_params, req, self._service_timeout)
+        if resp is None:
+            return False, "orchestrator set_parameters: no response"
+        if not resp.results or not resp.results[0].successful:
+            why = (resp.results[0].reason
+                   if resp.results else "unknown error")
+            return False, why or "set_parameters failed"
+        return True, "ok"
+
+    # ------------------------------------------------------------------
+    # active-controller helpers (cached from orchestrator state topic)
+    # ------------------------------------------------------------------
+    def _active_controller(self) -> str:
+        """Return whichever controller the orchestrator currently
+        considers *active* (settable param).  Falls back to the
+        bootstrap default until the first state message arrives.
+        """
+        with self._lock:
+            ctl = self._control_state
+        if ctl:
+            v = ctl.get("active_controller")
+            if isinstance(v, str) and v:
+                return v
+        return self._default_controller_name
+
+    def _active_kind(self) -> str:
+        """Return the kind ("force"/"motion"/"compliance") of the
+        active controller, looked up from the orchestrator's published
+        catalogue.  Defaults to "force" if unknown.
+        """
+        active = self._active_controller()
+        with self._lock:
+            ctl = self._control_state or {}
+        for entry in ctl.get("available_controllers", []) or []:
+            if (isinstance(entry, dict)
+                    and entry.get("name") == active
+                    and isinstance(entry.get("kind"), str)):
+                return entry["kind"]
+        return "force"
+
+    def _tunables_for_active(self) -> List[Tuple[str, str]]:
+        return list(_TUNABLES_BY_KIND.get(self._active_kind(),
+                                          _BASE_TUNABLES))
+
     # ------------------------------------------------------------------
     # snapshots used by the HTTP handler
     # ------------------------------------------------------------------
     def api_state_full(self) -> Dict[str, Any]:
-        names = [n for (n, _) in _TUNABLE_PARAMS]
-        values = self._get_param_values(names)
+        active = self._active_controller()
+        tunables = self._tunables_for_active()
+        names = [n for (n, _) in tunables]
+        values = self._get_param_values(active, names)
         params = [
             {"name": n, "kind": k, "value": values.get(n)}
-            for (n, k) in _TUNABLE_PARAMS
+            for (n, k) in tunables
         ]
         live = self._snapshot_live_locked()
         live["params"] = params
-        live["controller_name"] = self._controller_name
+        live["controller_name"] = active
+        live["controller_kind"] = self._active_kind()
         live["orchestrator_ns"] = self._orchestrator_ns
         return live
 
@@ -809,13 +1199,16 @@ class DashboardNode(Node):
         return self._snapshot_live_locked()
 
     def api_params(self) -> Dict[str, Any]:
-        names = [n for (n, _) in _TUNABLE_PARAMS]
-        values = self._get_param_values(names)
+        active = self._active_controller()
+        tunables = self._tunables_for_active()
+        names = [n for (n, _) in tunables]
+        values = self._get_param_values(active, names)
         return {
-            "controller_name": self._controller_name,
+            "controller_name": active,
+            "controller_kind": self._active_kind(),
             "params": [
                 {"name": n, "kind": k, "value": values.get(n)}
-                for (n, k) in _TUNABLE_PARAMS
+                for (n, k) in tunables
             ],
         }
 
@@ -834,15 +1227,194 @@ class DashboardNode(Node):
         if kind not in ("double", "integer"):
             raise RuntimeError(
                 f"unsupported 'kind' {kind!r}; expected 'double' or 'integer'")
-        # Whitelist for safety: only allow names from _TUNABLE_PARAMS.
-        allowed = {n for (n, _) in _TUNABLE_PARAMS}
+        # Whitelist for safety: only allow names the dashboard advertises
+        # for the *currently active* controller's kind.
+        allowed = {n for (n, _) in self._tunables_for_active()}
         if name not in allowed:
             raise RuntimeError(
-                f"parameter {name!r} is not in the dashboard's tunable list")
-        ok, why = self._set_param(name, kind, value)
+                f"parameter {name!r} is not in the dashboard's tunable "
+                f"list for kind {self._active_kind()!r}")
+        active = self._active_controller()
+        ok, why = self._set_param(active, name, kind, value)
         if not ok:
             raise RuntimeError(why)
-        return {"ok": True, "name": name, "value": value, "message": why}
+        return {"ok": True, "name": name, "value": value, "message": why,
+                "controller_name": active}
+
+    def api_set_active_controller(self, body: Dict[str, Any]
+                                  ) -> Dict[str, Any]:
+        """Switch which FZI controller engage will activate.
+
+        Forwarded to the orchestrator's ``active_controller_name``
+        parameter via SetParameters; the orchestrator validates and
+        refuses the change while engaged.
+        """
+        name = body.get("name")
+        if not isinstance(name, str) or not name:
+            raise RuntimeError("missing 'name'")
+        if name not in self._available_controllers:
+            raise RuntimeError(
+                f"{name!r} is not in available_controllers "
+                f"({self._available_controllers})")
+        ok, why = self._set_orchestrator_active_controller(name)
+        if not ok:
+            raise RuntimeError(why)
+        return {"ok": True, "name": name, "message": why}
+
+    # ------------------------------------------------------------------
+    # jog / snap-target -- per-controller motion-style command surface
+    # ------------------------------------------------------------------
+    # Both ``cartesian_motion_controller`` and
+    # ``cartesian_compliance_controller`` consume PoseStamped on
+    # ``/<name>/target_frame`` and snapshot the current EE pose on
+    # activate.  The dashboard's "control" panel for those kinds lets
+    # the operator nudge that target -- each press computes
+    # ``new_target = current_ee_pose + delta`` (in the base frame) and
+    # publishes it.  The force controller has no such input, so its
+    # control panel is purely informational.
+    def _lookup_current_pose(self) -> PoseStamped:
+        """Look up ``base_frame -> tool_frame`` from /tf and return
+        it as a :class:`PoseStamped`.  Raises RuntimeError on failure
+        so the HTTP layer can surface a clean 409.
+        """
+        try:
+            t = self._tf_buffer.lookup_transform(
+                self._base_frame, self._tool_frame,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.5))
+        except TransformException as exc:
+            raise RuntimeError(
+                f"tf lookup {self._base_frame!r} -> "
+                f"{self._tool_frame!r} failed: {exc}")
+        ps = PoseStamped()
+        ps.header.frame_id = self._base_frame
+        ps.header.stamp = self.get_clock().now().to_msg()
+        ps.pose.position.x = float(t.transform.translation.x)
+        ps.pose.position.y = float(t.transform.translation.y)
+        ps.pose.position.z = float(t.transform.translation.z)
+        ps.pose.orientation = t.transform.rotation
+        return ps
+
+    @staticmethod
+    def _quat_mul(q1: Tuple[float, float, float, float],
+                  q2: Tuple[float, float, float, float]
+                  ) -> Tuple[float, float, float, float]:
+        """Hamilton product on (x, y, z, w) tuples."""
+        x1, y1, z1, w1 = q1
+        x2, y2, z2, w2 = q2
+        return (
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        )
+
+    @classmethod
+    def _axis_angle_quat(cls, drx: float, dry: float, drz: float
+                         ) -> Tuple[float, float, float, float]:
+        """Compose a quaternion that rotates by drz about Z, then dry
+        about Y, then drx about X (extrinsic, base-frame axes).
+        Returns identity when all three angles are zero.
+        """
+        def axq(axis: int, ang: float) -> Tuple[float, float, float, float]:
+            s = math.sin(ang / 2.0)
+            c = math.cos(ang / 2.0)
+            if axis == 0:
+                return (s, 0.0, 0.0, c)
+            if axis == 1:
+                return (0.0, s, 0.0, c)
+            return (0.0, 0.0, s, c)
+        q = (0.0, 0.0, 0.0, 1.0)
+        q = cls._quat_mul(axq(0, drx), q)
+        q = cls._quat_mul(axq(1, dry), q)
+        q = cls._quat_mul(axq(2, drz), q)
+        return q
+
+    def _publish_target_pose(self, controller: str, pose: PoseStamped
+                             ) -> None:
+        pub = self._target_frame_pubs.get(controller)
+        if pub is None:
+            raise RuntimeError(
+                f"no target_frame publisher for controller {controller!r}")
+        pub.publish(pose)
+
+    def api_jog(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Nudge the active motion / compliance controller's target.
+
+        Body fields (all optional, default 0): ``dx``, ``dy``, ``dz``
+        (metres), ``drx``, ``dry``, ``drz`` (radians).  The new target
+        is ``current_ee_pose * delta`` published in ``base_frame``.
+        Refused unless the active controller's kind is
+        ``motion`` or ``compliance``.
+        """
+        active = self._active_controller()
+        kind = self._active_kind()
+        if kind not in ("motion", "compliance"):
+            raise RuntimeError(
+                f"jog is only supported for motion / compliance controllers; "
+                f"active is {active!r} (kind={kind!r})")
+
+        def _f(key: str) -> float:
+            v = body.get(key, 0.0)
+            try:
+                return float(v)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"{key!r}: {exc}")
+        dx = _f("dx"); dy = _f("dy"); dz = _f("dz")
+        drx = _f("drx"); dry = _f("dry"); drz = _f("drz")
+
+        # Bounded translation step to avoid catastrophic typos.  10 cm
+        # is plenty for incremental jog use-cases; rotation is capped
+        # at ~30 deg per press for similar reasons.
+        if max(abs(dx), abs(dy), abs(dz)) > 0.10:
+            raise RuntimeError("translation step too large (>10 cm)")
+        if max(abs(drx), abs(dry), abs(drz)) > math.radians(30.0):
+            raise RuntimeError("rotation step too large (>30 deg)")
+
+        pose = self._lookup_current_pose()
+        pose.pose.position.x += dx
+        pose.pose.position.y += dy
+        pose.pose.position.z += dz
+
+        if drx or dry or drz:
+            qd = self._axis_angle_quat(drx, dry, drz)
+            qc = (pose.pose.orientation.x, pose.pose.orientation.y,
+                  pose.pose.orientation.z, pose.pose.orientation.w)
+            qn = self._quat_mul(qd, qc)
+            (pose.pose.orientation.x, pose.pose.orientation.y,
+             pose.pose.orientation.z, pose.pose.orientation.w) = qn
+
+        self._publish_target_pose(active, pose)
+        return {
+            "ok": True,
+            "controller_name": active,
+            "kind": kind,
+            "target": {
+                "frame_id": pose.header.frame_id,
+                "position": {
+                    "x": pose.pose.position.x,
+                    "y": pose.pose.position.y,
+                    "z": pose.pose.position.z,
+                },
+                "orientation": {
+                    "x": pose.pose.orientation.x,
+                    "y": pose.pose.orientation.y,
+                    "z": pose.pose.orientation.z,
+                    "w": pose.pose.orientation.w,
+                },
+            },
+            "delta": {"dx": dx, "dy": dy, "dz": dz,
+                      "drx": drx, "dry": dry, "drz": drz},
+        }
+
+    def api_snap_target(self, _body: Dict[str, Any]) -> Dict[str, Any]:
+        """Publish the current EE pose as the target.
+
+        Useful as a "reset" after the controller has been chasing an
+        old target -- after snapping, the arm will hold its current
+        pose.  Only valid for motion / compliance.
+        """
+        return self.api_jog({})  # zero delta == snap to current pose
 
     # ------------------------------------------------------------------
     def _snapshot_live_locked(self) -> Dict[str, Any]:

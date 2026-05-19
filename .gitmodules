@@ -5,3 +5,7 @@
 	path = external/cartesian_controllers
 	url = https://github.com/yizhongzhang1989/cartesian_controllers.git
 	branch = ros2
+[submodule "src/alicia_leader"]
+	path = src/alicia_leader
+	url = https://github.com/yizhongzhang1989/Alicia-D-Leader-ROS.git
+	shallow = true

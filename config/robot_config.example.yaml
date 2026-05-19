@@ -127,3 +127,55 @@ duco_robot_bringup:
   db: false                 # mongo warehouse DB (off by default; can be huge)
   debug: false              # extra ros2_control / MoveIt verbosity
   publish_frequency: 15.0   # robot_state_publisher TF rate (Hz)
+
+# ============================================================================
+# alicia_teleop (Alicia-D leader arm -> Duco GCR5_910 follower bridge)
+# ============================================================================
+# `alicia_teleop.launch.py` brings up three things together:
+#   * alicia_duo_leader_driver   (serial driver)
+#   * alicia_duo_leader_dashboard (web UI for the leader)
+#   * the alicia_teleop bridge node itself
+# Each piece can be disabled with `launch_driver:=false` or
+# `launch_dashboard:=false` if it is already running elsewhere.
+#
+# The leader-side per-joint direction / zero_offset / continuous flags
+# live in config/joint_config.yaml (loaded by the leader driver), NOT in
+# this section.
+alicia_teleop:
+  # ---- bridge node ----
+  rate: 50.0                            # Hz, JointTrajectory publish rate
+  trajectory_time: 0.1                  # seconds, time_from_start per point
+  velocity_feedforward: true            # send v_cmd with each trajectory point
+  # Per-joint hard caps on the rate-limited command interpolator. They
+  # bound how quickly the follower closes the leader/follower gap on
+  # SYNC engage, so a large initial offset no longer trips the robot's
+  # "position deviation too large" safety stop. Tune for your task.
+  max_velocity: 3.0                     # rad/s
+  max_acceleration: 10.0                # rad/s^2
+  leader_topic: "/arm_joint_state"      # ArmJointState from alicia driver
+  trajectory_topic: "/arm_1_controller/joint_trajectory"
+  forward_position_topic: "/forward_position_controller/commands"
+  # 'forward_position' (DEFAULT): FZI-style direct position streaming via
+  #   forward_command_controller. The teleop node auto-switches the active
+  #   ros2_control controller at startup, no manual setup required.
+  # 'trajectory': publish JointTrajectory to the joint_trajectory_controller.
+  command_mode: "forward_position"
+  # Set to false to skip the auto-switch and use whatever controller is
+  # already active.
+  auto_switch_controller: true
+  joint_names:                          # Duco GCR5_910 joint names, in order
+    - arm_1_joint_1
+    - arm_1_joint_2
+    - arm_1_joint_3
+    - arm_1_joint_4
+    - arm_1_joint_5
+    - arm_1_joint_6
+  joint_scale:  [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]   # leader -> follower gain
+  joint_offset: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]   # leader -> follower bias (rad)
+  # ---- alicia_duo_leader_driver pass-throughs ----
+  leader_port: ""                       # "" = driver auto-detects the USB device
+  leader_baudrate: 1000000
+  leader_query_rate: 200.0              # Hz
+  leader_debug_mode: false
+  # ---- alicia_duo_leader_dashboard pass-through ----
+  dashboard_port: 8130                  # avoid duco_dashboard (8090)
