@@ -1,0 +1,65 @@
+  :root { color-scheme: light dark; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+         margin: 0; padding: 14px; background: #0f1115; color: #e6e6e6; }
+  h1 { margin: 0 0 4px; font-size: 1.05rem; font-weight: 600; }
+  h2 { margin: 14px 0 8px; font-size: 0.95rem; font-weight: 600; color: #cfd3dc; }
+  .sub { color: #8a93a6; font-size: 0.82rem; margin-bottom: 12px; }
+  code { background: #11141a; padding: 1px 5px; border-radius: 3px; }
+  .row { display: flex; gap: 16px; flex-wrap: wrap; }
+  .col { flex: 1 1 380px; min-width: 320px; }
+  .panel { background: #181b22; border: 1px solid #262a33; border-radius: 8px;
+           padding: 10px 12px 12px; margin-bottom: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #232730;
+           font-variant-numeric: tabular-nums; }
+  th { color: #8a93a6; font-weight: 500; }
+  button { background: #2563eb; color: white; border: 0; border-radius: 4px;
+           padding: 4px 10px; font: inherit; cursor: pointer; font-size: 0.82rem; }
+  button:hover { background: #1d4ed8; }
+  button.danger  { background: #b91c1c; }
+  button.danger:hover  { background: #991b1b; }
+  button.success { background: #15803d; }
+  button.success:hover { background: #166534; }
+  button.big { padding: 8px 14px; font-size: 0.9rem; }
+  button.ghost { background: #2b3140; }
+  button.ghost:hover { background: #3a4150; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  input[type="number"] { background: #0f1218; color: #e6e6e6;
+           border: 1px solid #2b3140; border-radius: 4px; padding: 3px 6px;
+           font: inherit; font-size: 0.82rem; width: 7em;
+           font-variant-numeric: tabular-nums; }
+  select { background: #0f1218; color: #e6e6e6;
+           border: 1px solid #2b3140; border-radius: 4px; padding: 3px 6px;
+           font: inherit; font-size: 0.82rem; }
+  select:disabled { opacity: 0.5; cursor: not-allowed; }
+  .status { display: inline-block; padding: 2px 7px; border-radius: 999px;
+            background: #1f2937; color: #cfd3dc; font-variant-numeric: tabular-nums; }
+  .status.ok  { background: #14532d; color: #c6f7d6; }
+  .status.bad { background: #5a1d1d; color: #ffb4b4; }
+  .status.warn { background: #553e1a; color: #ffe6a8; }
+  .pill { display: inline-block; padding: 1px 6px; border-radius: 999px;
+          background: #11141a; border: 1px solid #2b3140; font-size: 0.75rem;
+          color: #cfd3dc; margin-right: 4px; }
+  .pill.active { background: #14532d; color: #c6f7d6; border-color: #14532d; }
+  .small { font-size: 0.78rem; color: #8a93a6; }
+  .num { font-variant-numeric: tabular-nums; }
+  .engage-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .cmd-grid { display: flex; gap: 24px; flex-wrap: wrap; margin-top: 8px; }
+  .cmd-col  { display: flex; flex-direction: column; gap: 6px; min-width: 180px; }
+  .cmd-row  { display: flex; gap: 8px; align-items: center; }
+  .cmd-row label { color: #8a93a6; font-size: 0.78rem; min-width: 5em; }
+  .jog-grid { display: grid; grid-template-columns: repeat(2, 60px);
+              grid-auto-rows: 32px; gap: 6px; }
+  button.jog { background: #2a3142; color: #e6e6e6; border: 1px solid #3a4258;
+               border-radius: 4px; cursor: pointer; font: inherit;
+               font-size: 0.85rem; padding: 4px 0; }
+  button.jog:hover:not(:disabled) { background: #3a4258; }
+  button.jog:disabled { opacity: 0.4; cursor: not-allowed; }
+  .cmd-section[hidden] { display: none; }
+  .toast { position: fixed; right: 14px; bottom: 14px; max-width: 400px;
+           background: #181b22; border: 1px solid #262a33; border-radius: 8px;
+           padding: 8px 12px; font-size: 0.82rem; color: #cfd3dc;
+           opacity: 0; transition: opacity .15s; pointer-events: none; }
+  .toast.show { opacity: 1; }
+  .toast.bad { border-color: #b91c1c; color: #ffb4b4; }
+  .toast.ok  { border-color: #15803d; color: #c6f7d6; }

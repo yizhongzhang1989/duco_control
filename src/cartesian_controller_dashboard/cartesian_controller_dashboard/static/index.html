@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Cartesian controller dashboard</title>
+<link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+  <h1>Cartesian controller dashboard</h1>
+  <div class="sub">
+    active controller <code id="controller-name">--</code>
+    &nbsp; orchestrator state <span id="orch-status" class="status">--</span>
+    &nbsp; <span id="conn" class="status">connecting...</span>
+  </div>
+
+  <div class="panel">
+    <div class="engage-bar">
+      <span id="engaged" class="status">--</span>
+      <span class="small">controller:</span>
+      <select id="sel-controller" title="select which FZI controller engage will activate"></select>
+      <span class="pill" id="kind-pill">kind: --</span>
+      <span class="small">trip:</span>
+      <span id="trip" class="status">--</span>
+      <button id="btn-engage"    type="button" class="big success">Engage</button>
+      <button id="btn-disengage" type="button" class="big danger">Disengage</button>
+    </div>
+    <div class="small" style="margin-top:6px;">
+      Use the dropdown to select a controller; click Engage to activate
+      it (only allowed while idle).  Force = pure free-drive
+      (target_wrench=0); Motion = pose-hold (snapshots current pose);
+      Compliance = pose-hold + yields to wrench.
+    </div>
+  </div>
+
+  <div class="panel" id="control-panel">
+    <h2>Controller commands <span class="pill" id="cmd-kind-pill">kind: --</span></h2>
+
+    <div id="cmd-force" class="cmd-section" hidden>
+      <div class="small">
+        The <b>force controller</b> consumes <code>target_wrench</code> and
+        minimises <code>(target - measured)</code>.  The orchestrator
+        publishes <code>target_wrench=0</code> at 10 Hz on
+        <code>/cartesian_force_controller/target_wrench</code>, so engage
+        gives you <b>pure free-drive</b> (hand-guidance) -- push the arm
+        and it yields.  No per-press commands are needed; just engage and
+        guide.
+      </div>
+    </div>
+
+    <div id="cmd-motion-compliance" class="cmd-section" hidden>
+      <div class="small" id="cmd-help">
+        Each press computes <code>new_target = current_EE_pose + delta</code>
+        in <b>base_link</b> and publishes it on
+        <code>/&lt;controller&gt;/target_frame</code>.  Active only while
+        engaged.  <b>Snap</b> resets target to the current pose.
+      </div>
+      <div class="cmd-grid">
+        <div class="cmd-col">
+          <div class="cmd-row">
+            <label>trans step</label>
+            <input id="jog-trans-step" type="number" min="0.001"
+                   max="0.10" step="0.005" value="0.010"> m
+          </div>
+          <div class="jog-grid">
+            <button data-axis="x" data-sign="-1" class="jog">-X</button>
+            <button data-axis="x" data-sign="+1" class="jog">+X</button>
+            <button data-axis="y" data-sign="-1" class="jog">-Y</button>
+            <button data-axis="y" data-sign="+1" class="jog">+Y</button>
+            <button data-axis="z" data-sign="-1" class="jog">-Z</button>
+            <button data-axis="z" data-sign="+1" class="jog">+Z</button>
+          </div>
+        </div>
+        <div class="cmd-col">
+          <div class="cmd-row">
+            <label>rot step</label>
+            <input id="jog-rot-step" type="number" min="0.5" max="30"
+                   step="0.5" value="5"> deg
+          </div>
+          <div class="jog-grid">
+            <button data-raxis="rx" data-sign="-1" class="jog">-Rx</button>
+            <button data-raxis="rx" data-sign="+1" class="jog">+Rx</button>
+            <button data-raxis="ry" data-sign="-1" class="jog">-Ry</button>
+            <button data-raxis="ry" data-sign="+1" class="jog">+Ry</button>
+            <button data-raxis="rz" data-sign="-1" class="jog">-Rz</button>
+            <button data-raxis="rz" data-sign="+1" class="jog">+Rz</button>
+          </div>
+        </div>
+        <div class="cmd-col">
+          <button id="btn-snap-target" type="button" class="big">
+            Snap target to current pose
+          </button>
+          <div class="small" style="margin-top:6px;">
+            Last published target:
+          </div>
+          <div class="num small" id="last-target-pos">--</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" id="urdf-panel">
+    <h2>
+      3D model <span class="pill" id="urdf-status">--</span>
+      <span class="small" style="margin-left:8px;">
+        skeleton of <code>/robot_description</code>; drag to orbit,
+        wheel to zoom, right-drag to pan
+      </span>
+    </h2>
+    <div style="display:flex; gap:10px; align-items:flex-start;">
+      <div style="position:relative; flex:1; min-width:0;">
+        <canvas id="urdf-canvas" style="width:100%; height:380px;
+          background:#0b0e14; border:1px solid #2b3140; border-radius:6px;
+          display:block; cursor:grab;"></canvas>
+        <div id="urdf-overlay" class="small" style="position:absolute;
+          left:10px; top:8px; color:#8a93a6; pointer-events:none;
+          font-variant-numeric:tabular-nums;"></div>
+      </div>
+      <div style="width:210px; display:flex; flex-direction:column; gap:6px;">
+        <div class="cmd-row"><label class="small">root</label>
+          <code id="urdf-root">--</code></div>
+        <div class="cmd-row"><label class="small">links</label>
+          <span class="num small" id="urdf-nlinks">--</span></div>
+        <div class="cmd-row"><label class="small">joints</label>
+          <span class="num small" id="urdf-njoints">--</span></div>
+        <div class="cmd-row"><label class="small">tf age</label>
+          <span class="num small" id="urdf-tfage">--</span></div>
+        <div class="cmd-row" style="margin-top:6px;">
+          <label class="small">labels</label>
+          <input id="urdf-labels" type="checkbox" checked>
+        </div>
+        <div class="cmd-row">
+          <label class="small">axes</label>
+          <input id="urdf-axes" type="checkbox" checked>
+        </div>
+        <button id="urdf-fit" type="button" class="ghost">Fit view</button>
+        <button id="urdf-reload" type="button" class="ghost">Reload URDF</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="col">
+      <div class="panel">
+        <h2>Live wrench (sensor frame)</h2>
+        <table>
+          <thead><tr><th></th><th>force [N]</th><th>torque [Nm]</th></tr></thead>
+          <tbody>
+            <tr><td>x</td><td class="num" id="wfx">--</td><td class="num" id="wmx">--</td></tr>
+            <tr><td>y</td><td class="num" id="wfy">--</td><td class="num" id="wmy">--</td></tr>
+            <tr><td>z</td><td class="num" id="wfz">--</td><td class="num" id="wmz">--</td></tr>
+          </tbody>
+        </table>
+        <div class="small" style="margin-top:8px;">
+          |F| <span id="fmag" class="status">-- N</span>
+          &nbsp; |T| <span id="tmag" class="status">-- Nm</span>
+          &nbsp; ft <span id="ft-status" class="status">--</span>
+          &nbsp; q <span id="q-status" class="status">--</span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Safety thresholds (orchestrator)</h2>
+        <table>
+          <tbody>
+            <tr><td>max |F|</td><td class="num" id="lim-f">--</td><td>N</td></tr>
+            <tr><td>max |T|</td><td class="num" id="lim-t">--</td><td>Nm</td></tr>
+            <tr><td>engage max |qdot|</td><td class="num" id="lim-qe">--</td><td>rad/s</td></tr>
+            <tr><td>FT stale after</td><td class="num" id="lim-ftstale">--</td><td>s</td></tr>
+            <tr><td>joint_states stale after</td><td class="num" id="lim-qstale">--</td><td>s</td></tr>
+          </tbody>
+        </table>
+        <div class="small" style="margin-top:8px;">
+          These are read-only here; tune them via parameters on
+          <code>/duco_cartesian_control</code>.
+        </div>
+      </div>
+    </div>
+
+    <div class="col">
+      <div class="panel">
+        <h2>Controller parameters</h2>
+        <div class="small" style="margin-bottom:6px;">
+          Live tuning of <code id="param-target">--</code>.  Changes apply
+          immediately to the running controller.
+        </div>
+        <table id="param-table">
+          <thead>
+            <tr><th>name</th><th>current</th><th>new</th><th></th></tr>
+          </thead>
+          <tbody id="param-body"></tbody>
+        </table>
+        <div style="margin-top:8px; display:flex; gap:8px;">
+          <button id="btn-refresh-params" class="ghost">Refresh</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+<script src="/static/dashboard.js" defer></script>
+<script src="/static/urdf_viewer.js" defer></script>
+</body>
+</html>
