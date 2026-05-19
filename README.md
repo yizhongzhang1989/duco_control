@@ -25,6 +25,9 @@ dashboards.
 | [`duco_cartesian_control`](src/duco_cartesian_control) | spawns FZI's `cartesian_force_controller` / `cartesian_motion_controller` / `cartesian_compliance_controller` (all inactive), relays the wrench, publishes a zero target_wrench heartbeat, runs the engage / disengage Trigger services and a safety supervisor | -- |
 | [`cartesian_controller_dashboard`](src/cartesian_controller_dashboard) | optional web UI for engage / disengage, controller selection (force / motion / compliance), and live-tuning of the active controller's gains | `8120` |
 | [`duco_dashboard`](src/duco_dashboard) | optional web UI for joint / controller / TCP state | `8090` |
+| [`alicia_teleop`](src/alicia_teleop) | leader-follower teleop bridge: maps Alicia-D joint angles to the Duco follower with a per-joint velocity- and acceleration-limited interpolator; auto-switches `arm_1_controller` ↔ `forward_position_controller` at launch / shutdown | -- |
+| [`alicia_duo_leader_driver`](src/alicia_leader/alicia_duo_leader_driver) | serial driver for the Alicia-D 6-DoF leader arm (publishes `/arm_joint_state`) | -- |
+| [`alicia_duo_leader_dashboard`](src/alicia_leader/alicia_duo_leader_dashboard) | optional web UI for the leader arm (button / joint state) | `8130` |
 | [`common`](src/common) | centralised config loader (reads `config/robot_config.yaml`) |
 
 The official Duco ROS 2 driver is tracked as a git submodule at
@@ -227,6 +230,65 @@ its current pose.
 
 ---
 
+## Teleoperation (Alicia-D leader arm)
+
+A second, independent workflow that drives the Duco follower from the
+Alicia-D 6-DoF leader arm.  Maps the leader's joint angles to the
+follower's joints in real time through a **per-joint velocity- and
+acceleration-limited interpolator** that is seeded from the robot's
+actual pose on every SYNC engage -- so a large leader / follower
+mismatch closes smoothly instead of tripping the driver's
+"position deviation too large" safety stop.
+
+```bash
+# 1. Same robot bringup as the Cartesian flow above.
+ros2 launch duco_robot_bringup gcr5_910_ros2_control.launch.py use_rviz:=false
+
+# 2. Plug in the Alicia-D leader arm, then in a second terminal:
+ros2 launch alicia_teleop alicia_teleop.launch.py
+```
+
+The teleop launch brings up three things together:
+
+* `alicia_duo_leader_driver` -- serial driver for the leader
+  (publishes `/arm_joint_state`),
+* `alicia_duo_leader_dashboard` -- optional leader web UI on
+  <http://localhost:8130/>,
+* the `alicia_teleop` bridge node itself.
+
+Pass `launch_driver:=false` or `launch_dashboard:=false` if either piece
+is already running elsewhere.  Press **SYNC** on the leader to engage;
+release to disengage.
+
+By default the bridge uses `command_mode:=forward_position` (FZI-style
+direct position streaming via `forward_command_controller`) and
+auto-switches `arm_1_controller` ↔ `forward_position_controller` at
+launch and on shutdown.  The interpolator caps live under
+`alicia_teleop:` in [`config/robot_config.yaml`](config/robot_config.yaml):
+
+* `max_velocity` -- rad/s per joint (default `3.0`)
+* `max_acceleration` -- rad/s² per joint (default `10.0`)
+
+Common CLI overrides:
+
+```bash
+# Slower / safer caps for first-time tuning:
+ros2 launch alicia_teleop alicia_teleop.launch.py \
+    max_velocity:=1.5 max_acceleration:=5.0
+
+# Publish JointTrajectory to the JTC instead (auto-switch follows):
+ros2 launch alicia_teleop alicia_teleop.launch.py command_mode:=trajectory
+
+# Manage the underlying ros2_control controller yourself:
+ros2 launch alicia_teleop alicia_teleop.launch.py auto_switch_controller:=false
+```
+
+On engage, the bridge logs `Rate limiter seeded from /joint_states; max
+initial gap = X.XXX rad ...` so you can confirm the limiter is starting
+from the robot's actual pose.
+
+---
+
 ## Quick start (fake hardware -- no real arm needed)
 
 For a contained sanity check without the real Duco controller:
@@ -326,7 +388,9 @@ duco_control/
 │   ├── ft_sensor_gravity_compensation/
 │   ├── duco_cartesian_control/
 │   ├── cartesian_controller_dashboard/
-│   └── duco_dashboard/
+│   ├── duco_dashboard/
+│   ├── alicia_teleop/                # leader -> follower teleop bridge
+│   └── alicia_leader/                # Alicia-D leader driver + dashboard
 └── tools/
 ```
 
