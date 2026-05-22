@@ -88,12 +88,31 @@ cartesian_motion_controller:
       rot_z:   {p: 0.5}
 
 # --- Compliance controller ----------------------------------------------
-# Combination of motion + force: drives toward target_frame while
-# yielding to target_wrench.  ``stiffness`` is the apparent impedance of
-# the end-effector in the ``compliance_ref_link`` frame -- with the aux
-# ``compliance_link`` rigidly attached at the wrist, a downward push in
-# tool-Z yields in tool-Z.  Conservative stiffness numbers; raise for
-# stiffer "stay on the path" behaviour.
+# Combination of motion + force.  FZI internally computes
+#   net_force = stiffness * (target_frame - current_frame)
+#               + (target_wrench - measured_wrench)
+# and feeds that 6D wrench through the SAME Base::computeJointControlCmds
+# pipeline that the force controller uses.  Consequence: ``pd_gains.*``
+# and ``solver.error_scale`` act on identical-units inputs in both
+# controllers, so we mirror the working force-controller values here and
+# only ``stiffness.*`` is genuinely "compliance-specific".
+#
+# Picking stiffness (this is the dominant "rigid vs flexible" knob):
+#   * trans: hand push of 1 N at K=10 N/m yields ~100 mm static
+#     displacement -- soft, hand-guidable, robot still springs back to
+#     the engage pose when released.  Raise (e.g. 30-100 N/m) for
+#     stiffer "stay on path" behaviour, lower (e.g. 3-5 N/m) for
+#     closer-to-free-drive feel (but drift on noise becomes a risk).
+#   * rot:   torque of 0.1 Nm at K=0.5 Nm/rad yields ~11 deg static
+#     rotation.  Same scaling logic.
+#
+# Picking solver.error_scale (governs how fast the inner loop chases
+# the residual net_force):
+#   * Higher = snappier response to push, but risks overshoot / chatter.
+#   * Force controller is tuned at 0.05 for steady pushing.  In
+#     compliance the spring decay shrinks net_force as displacement
+#     grows, so we bump to 0.08 to keep the EE tracking quickly when
+#     the user is actively guiding.
 #
 # Both ``ft_sensor_ref_link`` and ``compliance_ref_link`` resolve to aux
 # frames declared in ``robot_config.yaml::duco_robot_bringup.aux_frames``
@@ -114,21 +133,21 @@ cartesian_compliance_controller:
       - arm_1_joint_6
     command_interfaces:
       - position
-    stiffness:               # w.r.t. compliance_ref_link
-      trans_x: 200.0         # N/m
-      trans_y: 200.0
-      trans_z: 200.0
-      rot_x:   10.0          # Nm/rad
-      rot_y:   10.0
-      rot_z:   10.0
+    stiffness:               # virtual spring at compliance_ref_link
+      trans_x: 10.0          # N/m   (was 30 -- 3x softer for hand-guiding)
+      trans_y: 10.0
+      trans_z: 10.0
+      rot_x:   0.5           # Nm/rad (was 2.0 -- 4x softer)
+      rot_y:   0.5
+      rot_z:   0.5
     solver:
-      error_scale: 0.1
+      error_scale: 0.08      # was 0.05 -- snappier inner loop tracking
       iterations: 5
       publish_state_feedback: true
-    pd_gains:
-      trans_x: {p: 0.05, d: 0.005}
-      trans_y: {p: 0.05, d: 0.005}
-      trans_z: {p: 0.05, d: 0.005}
-      rot_x:   {p: 0.5}
-      rot_y:   {p: 0.5}
-      rot_z:   {p: 0.5}
+    pd_gains:                # mirror force controller's working values
+      trans_x: {p: 2.0}
+      trans_y: {p: 2.0}
+      trans_z: {p: 2.0}
+      rot_x:   {p: 50.0}
+      rot_y:   {p: 50.0}
+      rot_z:   {p: 50.0}
