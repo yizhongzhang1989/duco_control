@@ -39,20 +39,23 @@ Parameters
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import time
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 import rclpy
 from geometry_msgs.msg import WrenchStamped
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import (
     DurabilityPolicy,
     HistoryPolicy,
@@ -69,6 +72,33 @@ from .calibration import (
     quat_to_rotation,
 )
 from .ee_store import EndEffector, EndEffectorStore, Sample
+
+
+# ---------------------------------------------------------------------------
+# soft (continuous) deadband
+# ---------------------------------------------------------------------------
+def _soft_deadband(v: np.ndarray, thresholds: np.ndarray) -> np.ndarray:
+    """Per-axis soft deadband / dead-zone filter.
+
+    Each component ``x`` of ``v`` is shrunk toward zero by the matching
+    threshold ``t``:
+
+        y = sign(x) * max(0, |x| - t)
+
+    ``t == 0`` is a pass-through, so the default configuration leaves
+    the signal unchanged.  Unlike a hard deadband (``y = 0 if |x| < t``)
+    this is continuous at the boundary, so the downstream cartesian
+    controller doesn't see a step change in its force error when the
+    operator's push first crosses the threshold.  This is the standard
+    shape used in impedance / admittance control.
+
+    ``v`` and ``thresholds`` must be the same shape (typically (3,)).
+    Negative thresholds are treated as zero by the caller (the param
+    callback rejects them).
+    """
+    magnitude = np.abs(v)
+    shrunk = np.maximum(magnitude - thresholds, 0.0)
+    return np.sign(v) * shrunk
 
 
 # ===========================================================================
@@ -113,6 +143,8 @@ _HTML_PAGE = r"""<!doctype html>
   }
   input[type=number] { width: 90px; font-variant-numeric: tabular-nums; }
   input:focus, textarea:focus { outline: none; border-color: #4f7cff; }
+  input.db-num { width: 5.5em; }
+  input.db-num.dirty { border-color: #b08a3a; box-shadow: 0 0 0 1px #553e1a inset; }
   .status { display: inline-block; padding: 2px 7px; border-radius: 999px;
             background: #1f2937; color: #cfd3dc; font-variant-numeric: tabular-nums; }
   .status.ok { background: #14532d; color: #c6f7d6; }
@@ -163,6 +195,45 @@ _HTML_PAGE = r"""<!doctype html>
           raw rate <span id="raw-rate" class="status">-- Hz</span>
           &nbsp; tf <span id="tf-status" class="status">--</span>
           &nbsp; samples <span id="raw-recv" class="status">0</span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Wrench deadband
+          <span id="db-status" class="status">--</span>
+          <span id="db-dirty" class="small"></span>
+        </h2>
+        <div class="small" style="margin-bottom:6px;">
+          Per-axis soft dead-zone applied to the compensated wrench right
+          before it is published: <code>y = sign(x) &middot; max(0, |x| - t)</code>.
+          Use this to suppress sensor noise / residual bias so the
+          cartesian controller stops drifting at rest. <b>0 = pass-through.</b>
+        </div>
+        <table>
+          <thead>
+            <tr><th></th><th>x</th><th>y</th><th>z</th><th>unit</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>force</td>
+              <td><input type="number" min="0" step="0.1"  class="db-num" data-name="force_deadband"  data-axis="0"></td>
+              <td><input type="number" min="0" step="0.1"  class="db-num" data-name="force_deadband"  data-axis="1"></td>
+              <td><input type="number" min="0" step="0.1"  class="db-num" data-name="force_deadband"  data-axis="2"></td>
+              <td class="small">N</td>
+            </tr>
+            <tr>
+              <td>torque</td>
+              <td><input type="number" min="0" step="0.01" class="db-num" data-name="torque_deadband" data-axis="0"></td>
+              <td><input type="number" min="0" step="0.01" class="db-num" data-name="torque_deadband" data-axis="1"></td>
+              <td><input type="number" min="0" step="0.01" class="db-num" data-name="torque_deadband" data-axis="2"></td>
+              <td class="small">Nm</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="toolbar" style="margin-top:8px;">
+          <button id="btn-db-save"  type="button">Apply deadband</button>
+          <button id="btn-db-reset" type="button" class="muted">Reset edits</button>
+          <button id="btn-db-zero"  type="button" class="muted">Set all to 0</button>
         </div>
       </div>
 
@@ -585,6 +656,83 @@ _HTML_PAGE = r"""<!doctype html>
 
     liveG = (s.tf_ok && Array.isArray(s.live_g)) ? s.live_g : null;
     Sphere.draw();
+    renderDeadband(s);
+  }
+
+  // ===== wrench deadband ================================================
+  let deadbandCache = null;     // last vectors received from the server
+
+  function renderDeadband(s) {
+    const f = Array.isArray(s.force_deadband)  ? s.force_deadband  : null;
+    const t = Array.isArray(s.torque_deadband) ? s.torque_deadband : null;
+    if (!f || !t) {
+      setStatus($("db-status"), "bad", "unavailable");
+      return;
+    }
+    deadbandCache = { force_deadband: f.slice(), torque_deadband: t.slice() };
+    document.querySelectorAll("input.db-num").forEach((inp) => {
+      if (document.activeElement === inp) return;
+      if (inp.classList.contains("dirty")) return;
+      const name = inp.dataset.name;
+      const axis = parseInt(inp.dataset.axis, 10);
+      const src  = (name === "force_deadband") ? f : t;
+      const v    = src[axis];
+      inp.value  = (typeof v === "number" && isFinite(v)) ? numStr(v) : "0";
+    });
+    updateDirtyBadge();
+    setStatus($("db-status"), "ok", "live");
+  }
+
+  function markDirty(inp) {
+    inp.classList.add("dirty");
+    updateDirtyBadge();
+  }
+  function clearDirty() {
+    document.querySelectorAll("input.db-num.dirty")
+      .forEach((i) => i.classList.remove("dirty"));
+    updateDirtyBadge();
+  }
+  function updateDirtyBadge() {
+    const n = document.querySelectorAll("input.db-num.dirty").length;
+    $("db-dirty").textContent = n > 0 ? (n + " unsaved") : "";
+  }
+
+  function collectDeadband() {
+    // For each row we send the full 3-vector (so an edit to a single cell
+    // doesn't accidentally zero the other axes); use the cached value for
+    // unedited cells.
+    const cache = deadbandCache || { force_deadband: [0,0,0], torque_deadband: [0,0,0] };
+    const out = {
+      force_deadband:  cache.force_deadband.slice(),
+      torque_deadband: cache.torque_deadband.slice(),
+    };
+    document.querySelectorAll("input.db-num").forEach((inp) => {
+      const name = inp.dataset.name;
+      const axis = parseInt(inp.dataset.axis, 10);
+      const v    = parseFloat(inp.value);
+      if (!Number.isFinite(v)) {
+        throw new Error(name + "[" + axis + "] is not a finite number");
+      }
+      if (v < 0) {
+        throw new Error(name + "[" + axis + "] must be >= 0");
+      }
+      out[name][axis] = v;
+    });
+    return out;
+  }
+
+  async function saveDeadband() {
+    let body;
+    try { body = collectDeadband(); } catch (e) { alert(e.message); return; }
+    try {
+      await api("/api/deadband", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      clearDirty();
+      await refresh();
+    } catch (e) { alert(e.message); }
   }
 
   function renderEEList(s) {
@@ -844,6 +992,35 @@ _HTML_PAGE = r"""<!doctype html>
     } catch (e) { alert(e.message); }
   });
 
+  // deadband wiring
+  document.querySelectorAll("input.db-num").forEach((inp) => {
+    inp.addEventListener("input",  () => markDirty(inp));
+    inp.addEventListener("keydown", (e) => {
+      if (e.key === "Enter")  { e.preventDefault(); saveDeadband(); }
+      if (e.key === "Escape") { e.preventDefault();
+        clearDirty();
+        if (deadbandCache) renderDeadband({
+          force_deadband:  deadbandCache.force_deadband,
+          torque_deadband: deadbandCache.torque_deadband,
+        });
+      }
+    });
+  });
+  $("btn-db-save").addEventListener("click", saveDeadband);
+  $("btn-db-reset").addEventListener("click", () => {
+    clearDirty();
+    if (deadbandCache) renderDeadband({
+      force_deadband:  deadbandCache.force_deadband,
+      torque_deadband: deadbandCache.torque_deadband,
+    });
+  });
+  $("btn-db-zero").addEventListener("click", () => {
+    document.querySelectorAll("input.db-num").forEach((inp) => {
+      inp.value = "0";
+      markDirty(inp);
+    });
+  });
+
   refresh().then(() => setInterval(tick, 200));
   setInterval(refresh, 3000);   // periodic full refresh to pick up table changes
 })();
@@ -944,6 +1121,11 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 self._dashboard.api_delete_sample(q.get("name", ""), idx)
             elif path == "/api/sample/clear":
                 self._dashboard.api_clear_samples(q.get("name", ""))
+            elif path == "/api/deadband":
+                body = self._read_json_body()
+                result = self._dashboard.api_set_deadband(body)
+                self._send_json(200, result)
+                return
             elif path == "/api/calibrate":
                 result = self._dashboard.api_calibrate(q.get("name", ""))
                 self._send_json(200, result)
@@ -984,6 +1166,50 @@ class CompensationNode(Node):
         self.declare_parameter("tf_timeout", 0.05)        # sec, per lookup
         self.declare_parameter("tf_max_age", 1.0)         # sec, before tf considered stale
 
+        # --- noise / dead-zone filter on the *compensated* wrench --------
+        # Per-axis soft deadband applied AFTER gravity + bias subtraction,
+        # BEFORE the compensated wrench is published.  Models the residual
+        # noise floor left after bias calibration (which only absorbs the
+        # constant offset, not zero-mean / drifting noise).  Default 0
+        # everywhere -> pass-through, identical to the historical
+        # behaviour.  Tunable live via the standard parameter services
+        # (the cartesian-controller dashboard exposes an editor).
+        #
+        # Units: ``force_deadband`` in Newtons, ``torque_deadband`` in
+        # Newton-metres.  Both must be 3-element lists of non-negative
+        # finite numbers; violations are refused by the on-set callback.
+        #
+        # NOTE: rclpy in Humble has a quirk where array-typed parameters
+        # declared without an explicit ``ParameterDescriptor`` are
+        # missing from the unfiltered ``list_parameters`` response and
+        # the ``get_parameters`` call returns an empty values list (the
+        # rcl tracking issue calls this "PARAMETER_NOT_SET shadowing").
+        # We declare both with an explicit PARAMETER_DOUBLE_ARRAY type
+        # descriptor so the standard tools (``ros2 param list/get``)
+        # work, and so the cartesian dashboard's GetParameters call
+        # returns the actual current value instead of nothing.
+        from rcl_interfaces.msg import ParameterDescriptor, ParameterType
+        self.declare_parameter(
+            "force_deadband",
+            [0.0, 0.0, 0.0],
+            descriptor=ParameterDescriptor(
+                type=ParameterType.PARAMETER_DOUBLE_ARRAY,
+                description=("per-axis soft dead-zone for the "
+                             "compensated wrench [Fx, Fy, Fz] in N; "
+                             "must be 3 non-negative finite numbers"),
+            ),
+        )
+        self.declare_parameter(
+            "torque_deadband",
+            [0.0, 0.0, 0.0],
+            descriptor=ParameterDescriptor(
+                type=ParameterType.PARAMETER_DOUBLE_ARRAY,
+                description=("per-axis soft dead-zone for the "
+                             "compensated wrench [Tx, Ty, Tz] in Nm; "
+                             "must be 3 non-negative finite numbers"),
+            ),
+        )
+
         self._input_topic  = self.get_parameter("input_topic").get_parameter_value().string_value
         self._output_topic = self.get_parameter("output_topic").get_parameter_value().string_value
         self._world_frame  = self.get_parameter("world_frame").get_parameter_value().string_value
@@ -997,6 +1223,16 @@ class CompensationNode(Node):
         self._gravity      = self.get_parameter("gravity").get_parameter_value().double_value
         self._tf_timeout   = self.get_parameter("tf_timeout").get_parameter_value().double_value
         self._tf_max_age   = self.get_parameter("tf_max_age").get_parameter_value().double_value
+
+        # Initial deadband values.  Validated identically to the on-set
+        # callback below so a bogus launch-time override (e.g. negative
+        # threshold) is caught here as well.
+        self._force_deadband = self._validate_deadband_array(
+            self.get_parameter("force_deadband").get_parameter_value().double_array_value,
+            "force_deadband")
+        self._torque_deadband = self._validate_deadband_array(
+            self.get_parameter("torque_deadband").get_parameter_value().double_array_value,
+            "torque_deadband")
 
         # --- end-effector store ------------------------------------------
         self._store = EndEffectorStore(storage_path)
@@ -1042,6 +1278,14 @@ class CompensationNode(Node):
                 target=self._httpd.serve_forever, daemon=True)
             self._http_thread.start()
 
+        # --- parameter change callback (live tuning) ---------------------
+        # Registered after the initial values are read, so the callback
+        # fires only for subsequent updates (e.g. from the dashboard's
+        # SetParameters call).  Validates non-negativity / finiteness
+        # and rejects malformed updates with a reason string that
+        # rcl_interfaces surfaces verbatim.
+        self.add_on_set_parameters_callback(self._on_set_parameters)
+
         self.get_logger().info(
             f"subscribed: {self._input_topic} (reliability={rel.name})")
         self.get_logger().info(
@@ -1052,6 +1296,10 @@ class CompensationNode(Node):
             f"end-effector store: {self._store.path}")
         self.get_logger().info(
             f"active end-effector: {self._store.active_name!r}")
+        self.get_logger().info(
+            f"deadband: F={self._force_deadband.tolist()} N, "
+            f"T={self._torque_deadband.tolist()} Nm "
+            "(applied to compensated wrench; live-tunable)")
         if enable_dashboard:
             self.get_logger().info(
                 f"web dashboard: http://{host if host != '0.0.0.0' else _local_ip()}:{port}/")
@@ -1067,6 +1315,62 @@ class CompensationNode(Node):
             except Exception:  # noqa: BLE001
                 pass
         super().destroy_node()
+
+    # ------------------------------------------------------------------
+    # parameter validation (used at construction and from the live
+    # SetParameters callback)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _validate_deadband_array(raw, label: str) -> np.ndarray:
+        """Coerce a 3-element non-negative finite array, or raise.
+
+        ``raw`` may be a ``rclpy`` tuple, an ``array.array`` of doubles,
+        a ``numpy`` array, or a plain Python list -- whatever ROS hands
+        us when reading the parameter.  Returns a fresh ``np.ndarray``
+        of shape (3,) with dtype float64.
+        """
+        try:
+            arr = [float(v) for v in raw]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{label}: not a numeric array ({exc})") from exc
+        if len(arr) != 3:
+            raise ValueError(
+                f"{label}: must have exactly 3 elements (got {len(arr)})")
+        for i, v in enumerate(arr):
+            if not math.isfinite(v):
+                raise ValueError(
+                    f"{label}[{i}] must be finite (got {v!r})")
+            if v < 0.0:
+                raise ValueError(
+                    f"{label}[{i}] must be >= 0 (got {v})")
+        return np.array(arr, dtype=float)
+
+    def _on_set_parameters(self, params) -> SetParametersResult:
+        """Atomic ``set_parameters`` callback for live tuning."""
+        # We only handle the deadband knobs explicitly.  Anything else
+        # falls through with success (we do NOT block other writeable
+        # parameters that ROS handles natively).
+        new_f = self._force_deadband
+        new_t = self._torque_deadband
+        for p in params:
+            try:
+                if p.name == "force_deadband":
+                    new_f = self._validate_deadband_array(
+                        p.value, "force_deadband")
+                elif p.name == "torque_deadband":
+                    new_t = self._validate_deadband_array(
+                        p.value, "torque_deadband")
+            except ValueError as exc:
+                return SetParametersResult(
+                    successful=False, reason=str(exc))
+
+        # Commit atomically.  Reads in ``_on_wrench`` are guarded by
+        # ``self._lock`` so they always see a consistent pair.
+        with self._lock:
+            self._force_deadband = new_f
+            self._torque_deadband = new_t
+        return SetParametersResult(successful=True)
 
     # ------------------------------------------------------------------
     # ROS callbacks
@@ -1100,6 +1404,17 @@ class CompensationNode(Node):
         else:
             f_comp = None
             t_comp = None
+
+        # Apply the per-axis soft deadband on whatever signal we *did*
+        # compute (gravity+bias compensated, or bias-only).  Defaults to
+        # zero -> pass-through.  We snapshot the threshold vectors under
+        # the lock so a concurrent SetParameters call can't tear them.
+        if f_comp is not None:
+            with self._lock:
+                f_dead = self._force_deadband
+                t_dead = self._torque_deadband
+            f_comp = _soft_deadband(f_comp, f_dead)
+            t_comp = _soft_deadband(t_comp, t_dead)
 
         with self._lock:
             self._last_raw = (now_mono, f_raw, t_raw)
@@ -1215,6 +1530,8 @@ class CompensationNode(Node):
             "tf_age": tf_age,
             "tf_error": self._last_tf_error,
             "live_g": live_g,
+            "force_deadband":  [float(v) for v in self._force_deadband],
+            "torque_deadband": [float(v) for v in self._torque_deadband],
         }
 
     # --- end-effector CRUD ---------------------------------------------
@@ -1275,6 +1592,59 @@ class CompensationNode(Node):
 
     def api_clear_samples(self, name: str) -> None:
         self._store.clear_samples(name)
+
+    # --- wrench deadband -----------------------------------------------
+    def api_set_deadband(self, body: dict) -> dict:
+        """Apply force / torque deadband live via the parameter callback.
+
+        ``body`` shape::
+
+            {"force_deadband":  [x, y, z],   # optional, all 3 axes required
+             "torque_deadband": [x, y, z]}   # optional
+
+        Calls ``self.set_parameters`` so the existing
+        ``_on_set_parameters`` validation + atomic commit path is reused
+        verbatim.  Returns the list of parameter names that were applied.
+        """
+        if not isinstance(body, dict):
+            raise ValueError("body must be a JSON object")
+        params: List[Parameter] = []
+        for key in ("force_deadband", "torque_deadband"):
+            if key not in body:
+                continue
+            raw = body[key]
+            if not isinstance(raw, list) or len(raw) != 3:
+                raise ValueError(
+                    f"{key}: must be a 3-element list (got {raw!r})")
+            vec: List[float] = []
+            for i, v in enumerate(raw):
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"{key}[{i}] not numeric: {exc}") from exc
+                if not math.isfinite(fv):
+                    raise ValueError(
+                        f"{key}[{i}] must be finite (got {v!r})")
+                if fv < 0.0:
+                    raise ValueError(
+                        f"{key}[{i}] must be >= 0 (got {fv})")
+                vec.append(fv)
+            params.append(Parameter(key, Parameter.Type.DOUBLE_ARRAY, vec))
+        if not params:
+            return {"applied": []}
+        results = self.set_parameters(params)
+        failures = [
+            f"{p.name}: {r.reason}"
+            for p, r in zip(params, results)
+            if not r.successful
+        ]
+        if failures:
+            raise ValueError("; ".join(failures))
+        self.get_logger().info(
+            "deadband updated via dashboard: " + ", ".join(
+                f"{p.name}={list(p.value)}" for p in params))
+        return {"applied": [p.name for p in params]}
 
     def api_calibrate(self, name: str) -> dict:
         ee = self._store.get(name)

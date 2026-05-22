@@ -437,7 +437,13 @@
       drawSeg(p, c, color, j.type === "fixed" ? 1.5 : 2.5);
     }
 
-    // Per-link triads + dots + labels.
+    // Per-link triads + dots.  Labels are collected here and drawn in a
+    // post-pass below so that links whose screen positions overlap (e.g.
+    // ``ft_sensor_link`` and ``compliance_link`` mounted at the
+    // ``link_6`` flange with zero xyz/rpy) get merged into a single
+    // comma-separated label instead of stacking illegibly on top of one
+    // another.
+    const labelHits = [];  // [{ name, sx, sy }]
     for (const linkName of model.links) {
       const pose = livePose[linkName];
       const pos = (pose && pose.t) ? pose.t : staticPose(linkName);
@@ -446,7 +452,38 @@
       drawDot(pos,
               linkName === model.root_link ? "#fbbf24" : "#e6e6e6",
               linkName === model.root_link ? 4 : 2.5);
-      if (showLabels) drawText(pos, linkName, "#cfd3dc");
+      if (showLabels) {
+        const s = project(pos);
+        if (s) labelHits.push({ name: linkName, sx: s.x, sy: s.y });
+      }
+    }
+
+    if (showLabels && labelHits.length) {
+      // Greedy O(n^2) clustering by screen distance.  The first label to
+      // anchor a cluster keeps it pinned; subsequent labels within
+      // ``MERGE_PX`` of that anchor join it.  Threshold scales with DPR
+      // so HiDPI displays merge at the same visual radius as 1x.
+      const dpr = window.devicePixelRatio || 1;
+      const MERGE_PX = 12 * dpr;
+      const clusters = [];
+      for (const lbl of labelHits) {
+        let merged = false;
+        for (const c of clusters) {
+          if (Math.hypot(lbl.sx - c.sx, lbl.sy - c.sy) < MERGE_PX) {
+            c.names.push(lbl.name);
+            merged = true;
+            break;
+          }
+        }
+        if (!merged) {
+          clusters.push({ sx: lbl.sx, sy: lbl.sy, names: [lbl.name] });
+        }
+      }
+      ctx.fillStyle = "#cfd3dc";
+      ctx.font = (11 * dpr) + "px ui-sans-serif, system-ui, sans-serif";
+      for (const c of clusters) {
+        ctx.fillText(c.names.join(", "), c.sx + 6 * dpr, c.sy - 4 * dpr);
+      }
     }
 
     if (lastTfMs != null) {

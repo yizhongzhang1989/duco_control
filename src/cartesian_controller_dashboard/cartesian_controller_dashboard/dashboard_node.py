@@ -55,6 +55,40 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 
+# `common.config_manager` exposes the project's robot_config.yaml.  The
+# dashboard's "Tool frames" editor reads `duco_robot_bringup.aux_frames`
+# from the resolved config and writes back via the line-based
+# `save_aux_frames` helper (which preserves comments).  Imported with a
+# soft fallback so the dashboard still starts in environments where
+# `common` is not on the PYTHONPATH (the API simply returns a clear
+# error in that case).
+try:
+    from common.config_manager import (  # type: ignore
+        get_config as _get_config,
+        read_aux_frames as _read_aux_frames,
+        save_aux_frames as _save_aux_frames,
+    )
+    _COMMON_IMPORT_ERROR: Optional[str] = None
+except Exception as _exc:  # noqa: BLE001
+    _get_config = None  # type: ignore
+    _read_aux_frames = None  # type: ignore
+    _save_aux_frames = None  # type: ignore
+    _COMMON_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
+
+# ``duco_robot_bringup.urdf_loader.update_aux_frames`` rewrites the
+# ``<origin>`` of existing aux-frame joints in a URDF string, returning
+# a new URDF that can be pushed to ``robot_state_publisher`` via
+# SetParameters for live tool-frame updates.  Soft-imported for the
+# same reason as ``common.config_manager`` above.
+try:
+    from duco_robot_bringup.urdf_loader import (  # type: ignore
+        update_aux_frames as _update_aux_frames,
+    )
+    _URDF_LOADER_IMPORT_ERROR: Optional[str] = None
+except Exception as _exc:  # noqa: BLE001
+    _update_aux_frames = None  # type: ignore
+    _URDF_LOADER_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
+
 
 # ---------------------------------------------------------------------------
 # tunable parameter catalogue (curated, keyed by controller "kind").
@@ -91,6 +125,50 @@ _TUNABLES_BY_KIND: Dict[str, List[Tuple[str, str]]] = {
     "motion":     list(_BASE_TUNABLES),
     "compliance": list(_BASE_TUNABLES) + list(_COMPLIANCE_EXTRAS),
 }
+
+
+# ---------------------------------------------------------------------------
+# orchestrator safety thresholds editable from the dashboard.
+#
+# These parameters live on the ``/duco_cartesian_control`` node (see
+# :class:`duco_cartesian_control.control_node.CartesianControlNode`) and
+# already accept live parameter updates -- the orchestrator validates
+# they are non-negative and refuses changes that would interrupt the
+# safety supervisor's invariants.  The dashboard simply forwards a
+# typed SetParameters request and reports per-parameter results.
+#
+# Order is the display order in the UI.
+_SAFETY_THRESHOLDS: List[Tuple[str, str, str]] = [
+    # (param_name, kind, unit_label_for_ui)
+    ("max_wrench_force",          "double", "N"),
+    ("max_wrench_torque",         "double", "Nm"),
+    ("engage_max_joint_velocity", "double", "rad/s"),
+    ("ft_stale_after",            "double", "s"),
+    ("joint_states_stale_after",  "double", "s"),
+]
+_SAFETY_THRESHOLD_NAMES = {n for (n, _k, _u) in _SAFETY_THRESHOLDS}
+
+
+# ---------------------------------------------------------------------------
+# wrench dead-zone editable from the dashboard.
+#
+# These parameters live on the ``ft_sensor_gravity_compensation`` node
+# (see :module:`ft_sensor_gravity_compensation.compensation_node`) and
+# are applied to the *compensated* wrench (after gravity + bias
+# subtraction, before publishing).  Per-axis soft (continuous) shrinkage
+# so the downstream cartesian-force / compliance controller does not
+# see a step change at the dead-zone boundary.
+#
+# Each entry is ``(param_name, ui_label, unit_label)``.  All four are
+# 3-element ``double[]`` arrays of N (force) or Nm (torque); validation
+# (length 3, finite, >= 0) is done both here and in the gravity-comp
+# node's on-set-parameters callback.
+_WRENCH_DEADBAND_PARAMS: List[Tuple[str, str, str]] = [
+    # (param_name, ui_label, unit_label)
+    ("force_deadband",  "force",  "N"),
+    ("torque_deadband", "torque", "Nm"),
+]
+_WRENCH_DEADBAND_NAMES = {n for (n, _l, _u) in _WRENCH_DEADBAND_PARAMS}
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +356,17 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 # not return until the client drops.
                 self._serve_urdf_tf_stream()
                 return
+            if path == "/api/aux_frames":
+                self._send_json(200, self._dashboard.api_get_aux_frames())
+                return
+            if path == "/api/safety_thresholds":
+                self._send_json(
+                    200, self._dashboard.api_get_safety_thresholds())
+                return
+            if path == "/api/wrench_deadband":
+                self._send_json(
+                    200, self._dashboard.api_get_wrench_deadband())
+                return
             self.send_response(404)
             self.end_headers()
         except Exception as exc:  # noqa: BLE001
@@ -308,6 +397,22 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             if path == "/api/snap_target":
                 body = self._read_json_body() or {}
                 self._send_json(200, self._dashboard.api_snap_target(body))
+                return
+            if path == "/api/aux_frames":
+                body = self._read_json_body() or {}
+                self._send_json(200, self._dashboard.api_set_aux_frames(body))
+                return
+            if path == "/api/safety_thresholds":
+                body = self._read_json_body() or {}
+                self._send_json(
+                    200,
+                    self._dashboard.api_set_safety_thresholds(body))
+                return
+            if path == "/api/wrench_deadband":
+                body = self._read_json_body() or {}
+                self._send_json(
+                    200,
+                    self._dashboard.api_set_wrench_deadband(body))
                 return
             self.send_response(404)
             self.end_headers()
@@ -340,6 +445,12 @@ class DashboardNode(Node):
         ("default_controller_name",  "cartesian_force_controller"),
         ("wrench_topic",     "/duco_ft_sensor/wrench_compensated"),
         ("joint_states_topic", "/joint_states"),
+        # Fully-qualified name (relative to root, with leading slash) of
+        # the gravity-compensation node whose ``force_deadband`` /
+        # ``torque_deadband`` parameters the dashboard's "Wrench
+        # deadband" editor targets.  Default matches the node name used
+        # by ``ft_sensor_gravity_compensation.compensation_node``.
+        ("gravity_compensation_node", "/ft_sensor_gravity_compensation"),
         # Frames used for jog / snap-target publishes on motion +
         # compliance controllers.  Must match the URDF that
         # controller_manager sees and the FZI YAML's
@@ -374,6 +485,9 @@ class DashboardNode(Node):
             self._default_controller_name = self._available_controllers[0]
         self._wrench_topic = str(gp("wrench_topic"))
         self._joint_states_topic = str(gp("joint_states_topic"))
+        self._gravcomp_ns = str(gp("gravity_compensation_node")).rstrip("/")
+        if not self._gravcomp_ns.startswith("/"):
+            self._gravcomp_ns = "/" + self._gravcomp_ns
         self._base_frame = str(gp("base_frame")).strip("/")
         self._tool_frame = str(gp("tool_frame")).strip("/")
         self._service_timeout = float(gp("service_timeout_sec"))
@@ -458,6 +572,45 @@ class DashboardNode(Node):
             SetParameters,
             f"{self._orchestrator_ns}/set_parameters",
             callback_group=self._cbgroup)
+
+        # Service clients for the gravity-compensation node's parameters.
+        # Used by the "Wrench deadband" editor to read the current
+        # per-axis force / torque dead-zone (GetParameters) and to push
+        # operator edits (SetParameters).  If the node is not running
+        # the dashboard surfaces a clear timeout on both paths.
+        self._cli_gravcomp_get_params = self.create_client(
+            GetParameters,
+            f"{self._gravcomp_ns}/get_parameters",
+            callback_group=self._cbgroup)
+        self._cli_gravcomp_set_params = self.create_client(
+            SetParameters,
+            f"{self._gravcomp_ns}/set_parameters",
+            callback_group=self._cbgroup)
+
+        # Service client for ``robot_state_publisher``'s parameters.
+        # Used by the "Tool frames" editor to push an updated
+        # ``robot_description`` URDF when the operator saves aux-frame
+        # offsets, so the static TF tree refreshes live without
+        # restarting ``duco_robot_bringup`` (rsp re-parses the URDF and
+        # re-publishes ``/tf_static`` with the new offsets).  The name
+        # ``/robot_state_publisher`` is the standard one for
+        # ROS 2 Humble; if a remap is ever introduced this client will
+        # simply time out and the API surfaces a clear error.
+        self._cli_rsp_set_params = self.create_client(
+            SetParameters,
+            "/robot_state_publisher/set_parameters",
+            callback_group=self._cbgroup)
+
+        # The FZI cartesian controllers fork has been patched to react
+        # to ``robot_description`` parameter updates on their own node
+        # (not on /controller_manager): each controller rebuilds the
+        # KDL chain at runtime and swaps it in atomically from the RT
+        # update() thread, so saving new aux-frame offsets takes effect
+        # inside the engaged controller without an unload/load.  We
+        # already have ``self._param_clients[ctrl]['set']`` for each
+        # available controller; the Tool-frames editor reuses those
+        # clients.  See cartesian_controller_base.cpp::
+        # ``onParameterUpdate`` for the receiving side.
 
         # ---- target_frame publishers (one per controller) -------------
         # The motion + compliance controllers consume PoseStamped on
@@ -691,6 +844,56 @@ class DashboardNode(Node):
             return False, why or "set_parameters failed"
         return True, "ok"
 
+    def _set_orchestrator_doubles(self, updates: Dict[str, float]
+                                  ) -> Tuple[bool, List[Dict[str, Any]]]:
+        """Push a batch of ``double`` parameters to the orchestrator.
+
+        Returns ``(ok, per_param_results)`` where ``ok`` is True iff
+        the service responded AND every parameter was accepted, and
+        ``per_param_results`` is a list of dicts
+        ``{"name": str, "successful": bool, "reason": str}`` matching
+        the order of ``updates``.  Used by the safety-threshold editor.
+        """
+        if not updates:
+            return True, []
+        if not self._cli_orchestrator_set_params.wait_for_service(
+                timeout_sec=0.2):
+            return False, [{
+                "name": n, "successful": False,
+                "reason": (f"orchestrator set_parameters service "
+                           f"unavailable at {self._orchestrator_ns!r}"),
+            } for n in updates]
+        params: List[Parameter] = []
+        ordered_names: List[str] = []
+        for name, value in updates.items():
+            p = Parameter()
+            p.name = name
+            pv = ParameterValue()
+            pv.type = ParameterType.PARAMETER_DOUBLE
+            pv.double_value = float(value)
+            p.value = pv
+            params.append(p)
+            ordered_names.append(name)
+        req = SetParameters.Request()
+        req.parameters = params
+        resp = self._service_call_sync(
+            self._cli_orchestrator_set_params, req, self._service_timeout)
+        if resp is None:
+            return False, [{
+                "name": n, "successful": False,
+                "reason": (f"no response within "
+                           f"{self._service_timeout:.1f}s"),
+            } for n in ordered_names]
+        results: List[Dict[str, Any]] = []
+        for name, r in zip(ordered_names, resp.results):
+            results.append({
+                "name":       name,
+                "successful": bool(r.successful),
+                "reason":     str(r.reason or ""),
+            })
+        all_ok = all(r["successful"] for r in results)
+        return all_ok, results
+
     # ------------------------------------------------------------------
     # active-controller helpers (cached from orchestrator state topic)
     # ------------------------------------------------------------------
@@ -810,6 +1013,320 @@ class DashboardNode(Node):
         if not ok:
             raise RuntimeError(why)
         return {"ok": True, "name": name, "message": why}
+
+    # ------------------------------------------------------------------
+    # safety thresholds editor
+    # ------------------------------------------------------------------
+    # The orchestrator owns the safety supervisor's limits and exposes
+    # them as live-tunable parameters on its own node (see
+    # ``CartesianControlNode._SAFETY_KNOBS``).  The dashboard provides a
+    # typed editor for them so operators don't need to remember the
+    # ``ros2 param set`` syntax.  The orchestrator itself validates
+    # non-negativity and unknown names; we add a thin whitelist here so
+    # an obvious typo from the browser does not blindly become a
+    # SetParameters call on an unrelated parameter.
+    def api_get_safety_thresholds(self) -> Dict[str, Any]:
+        """Return the orchestrator's currently-known safety thresholds.
+
+        We read directly from the cached ``control_state`` (which the
+        orchestrator publishes ~5 Hz) rather than calling GetParameters
+        again; this keeps the GET fast and avoids serialising every
+        save round-trip through an extra RPC.
+        """
+        with self._lock:
+            ctl = dict(self._control_state) if self._control_state else {}
+            ctl_age = (time.monotonic() - self._control_state_mono
+                       if self._control_state_mono is not None else None)
+        limits = (ctl.get("limits") or {}) if isinstance(ctl, dict) else {}
+        items: List[Dict[str, Any]] = []
+        for name, kind, unit in _SAFETY_THRESHOLDS:
+            value = limits.get(name)
+            try:
+                value = float(value) if value is not None else None
+            except (TypeError, ValueError):
+                value = None
+            items.append({
+                "name":  name,
+                "kind":  kind,
+                "unit":  unit,
+                "value": value,
+            })
+        return {
+            "ok":              True,
+            "orchestrator_ns": self._orchestrator_ns,
+            "orchestrator_live": (ctl_age is not None and ctl_age <= 5.0),
+            "control_state_age": ctl_age,
+            "thresholds":      items,
+            "message": ("orchestrator-owned safety limits "
+                        "(/duco_cartesian_control); live-tunable; "
+                        "trips disengage the FZI controller"),
+        }
+
+    def api_set_safety_thresholds(self, body: Dict[str, Any]
+                                  ) -> Dict[str, Any]:
+        """Push edits to the orchestrator's safety thresholds.
+
+        Body shape::
+
+            {"thresholds": [{"name": str, "value": float}, ...]}
+
+        Unknown names are rejected (the dashboard restricts the editor
+        to ``_SAFETY_THRESHOLDS``); non-finite or negative values are
+        rejected here before the round-trip.  The orchestrator does
+        its own validation too, which we surface verbatim.
+        """
+        if not isinstance(body, dict):
+            raise RuntimeError("body must be a JSON object")
+        items = body.get("thresholds")
+        if not isinstance(items, list):
+            raise RuntimeError("body.thresholds must be a list")
+
+        updates: Dict[str, float] = {}
+        for idx, entry in enumerate(items):
+            if not isinstance(entry, dict):
+                raise RuntimeError(
+                    f"thresholds[{idx}] must be an object")
+            name = entry.get("name")
+            if not isinstance(name, str) or not name:
+                raise RuntimeError(
+                    f"thresholds[{idx}].name must be a non-empty string")
+            if name not in _SAFETY_THRESHOLD_NAMES:
+                raise RuntimeError(
+                    f"thresholds[{idx}].name={name!r} is not editable "
+                    f"({sorted(_SAFETY_THRESHOLD_NAMES)})")
+            raw = entry.get("value")
+            try:
+                value = float(raw)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"thresholds[{idx}].value not numeric: {exc}"
+                ) from exc
+            if not math.isfinite(value):
+                raise RuntimeError(
+                    f"thresholds[{idx}].value must be finite "
+                    f"(got {raw!r})")
+            if value < 0.0:
+                raise RuntimeError(
+                    f"thresholds[{idx}].name={name!r} must be >= 0 "
+                    f"(got {value})")
+            updates[name] = value
+
+        if not updates:
+            return {"ok": True, "updated": 0, "results": [],
+                    "message": "no thresholds supplied"}
+
+        ok, results = self._set_orchestrator_doubles(updates)
+        successful = sum(1 for r in results if r["successful"])
+        return {
+            "ok":      ok,
+            "updated": successful,
+            "results": results,
+            "message": (
+                f"applied {successful}/{len(results)} threshold(s) "
+                "to /duco_cartesian_control" if ok else
+                f"orchestrator rejected {len(results) - successful}/"
+                f"{len(results)} threshold(s)"
+            ),
+        }
+
+    # ------------------------------------------------------------------
+    # wrench dead-zone editor (gravity-compensation node parameters)
+    # ------------------------------------------------------------------
+    # The dead-zone is per-axis soft (continuous) shrinkage applied to
+    # the compensated wrench just before it is published.  It lives on
+    # the gravity-compensation node so that every downstream consumer
+    # (the force / compliance controllers, the dashboard's live wrench
+    # display, rosbag recorders) sees the same clean signal.  See
+    # ``ft_sensor_gravity_compensation.compensation_node`` for the
+    # validation rules: 3 doubles per parameter, non-negative, finite.
+    def _get_gravcomp_double_arrays(self, names: List[str]
+                                    ) -> Dict[str, Optional[List[float]]]:
+        """Read ``double[]`` parameters from the gravity-comp node.
+
+        Returns ``{name: list_or_None}``.  ``None`` means the parameter
+        is not declared on the remote node OR the service is not
+        reachable inside ``_service_timeout``.  Callers are responsible
+        for distinguishing those two cases via ``service_available``
+        in the caller's response payload if needed.
+        """
+        result: Dict[str, Optional[List[float]]] = {n: None for n in names}
+        if not names:
+            return result
+        if not self._cli_gravcomp_get_params.wait_for_service(
+                timeout_sec=0.2):
+            return result
+        req = GetParameters.Request()
+        req.names = list(names)
+        resp = self._service_call_sync(
+            self._cli_gravcomp_get_params, req, self._service_timeout)
+        if resp is None:
+            return result
+        for name, pv in zip(names, resp.values):
+            decoded = _decode_param_value(pv)
+            # We only accept double-array values for these parameters
+            # (anything else means the node has a name collision with a
+            # differently-typed parameter -- treat as "not available").
+            if isinstance(decoded, list) and all(
+                    isinstance(v, (int, float)) for v in decoded):
+                result[name] = [float(v) for v in decoded]
+            else:
+                result[name] = None
+        return result
+
+    def _set_gravcomp_double_arrays(self, updates: Dict[str, List[float]]
+                                    ) -> Tuple[bool, List[Dict[str, Any]]]:
+        """Push a batch of ``double[]`` parameters to the gravity-comp node.
+
+        Returns ``(ok, per_param_results)`` matching
+        ``_set_orchestrator_doubles`` in shape.  Used by the
+        wrench-deadband editor.
+        """
+        if not updates:
+            return True, []
+        if not self._cli_gravcomp_set_params.wait_for_service(
+                timeout_sec=0.2):
+            return False, [{
+                "name": n, "successful": False,
+                "reason": (f"gravity-compensation set_parameters "
+                           f"service unavailable at {self._gravcomp_ns!r}"),
+            } for n in updates]
+        params: List[Parameter] = []
+        ordered_names: List[str] = []
+        for name, vec in updates.items():
+            p = Parameter()
+            p.name = name
+            pv = ParameterValue()
+            pv.type = ParameterType.PARAMETER_DOUBLE_ARRAY
+            pv.double_array_value = [float(v) for v in vec]
+            p.value = pv
+            params.append(p)
+            ordered_names.append(name)
+        req = SetParameters.Request()
+        req.parameters = params
+        resp = self._service_call_sync(
+            self._cli_gravcomp_set_params, req, self._service_timeout)
+        if resp is None:
+            return False, [{
+                "name": n, "successful": False,
+                "reason": (f"no response within "
+                           f"{self._service_timeout:.1f}s"),
+            } for n in ordered_names]
+        results: List[Dict[str, Any]] = []
+        for name, r in zip(ordered_names, resp.results):
+            results.append({
+                "name":       name,
+                "successful": bool(r.successful),
+                "reason":     str(r.reason or ""),
+            })
+        all_ok = all(r["successful"] for r in results)
+        return all_ok, results
+
+    def api_get_wrench_deadband(self) -> Dict[str, Any]:
+        """Return the current per-axis force / torque dead-zone vectors.
+
+        Each entry's ``value`` is a 3-element list (xyz) or ``None`` if
+        the gravity-compensation node is not reachable.
+        """
+        names = [n for (n, _l, _u) in _WRENCH_DEADBAND_PARAMS]
+        values = self._get_gravcomp_double_arrays(names)
+        items: List[Dict[str, Any]] = []
+        any_missing = False
+        for name, label, unit in _WRENCH_DEADBAND_PARAMS:
+            v = values.get(name)
+            if v is None:
+                any_missing = True
+            items.append({
+                "name":  name,
+                "label": label,
+                "unit":  unit,
+                "value": v,
+            })
+        return {
+            "ok":                True,
+            "node":              self._gravcomp_ns,
+            "available":         not any_missing,
+            "deadbands":         items,
+            "message": (
+                "per-axis soft deadband applied to the compensated "
+                "wrench just before publishing; live-tunable on "
+                f"{self._gravcomp_ns}"
+            ),
+        }
+
+    def api_set_wrench_deadband(self, body: Dict[str, Any]
+                                ) -> Dict[str, Any]:
+        """Push edits to the gravity-comp node's dead-zone parameters.
+
+        Body shape::
+
+            {"deadbands": [{"name": str, "value": [x, y, z]}, ...]}
+
+        Unknown names are rejected (the dashboard restricts the editor
+        to ``_WRENCH_DEADBAND_PARAMS``); non-finite, non-3-vector, and
+        negative values are rejected here before the round-trip.  The
+        gravity-compensation node does its own validation too, which
+        we surface verbatim.
+        """
+        if not isinstance(body, dict):
+            raise RuntimeError("body must be a JSON object")
+        items = body.get("deadbands")
+        if not isinstance(items, list):
+            raise RuntimeError("body.deadbands must be a list")
+
+        updates: Dict[str, List[float]] = {}
+        for idx, entry in enumerate(items):
+            if not isinstance(entry, dict):
+                raise RuntimeError(
+                    f"deadbands[{idx}] must be an object")
+            name = entry.get("name")
+            if not isinstance(name, str) or not name:
+                raise RuntimeError(
+                    f"deadbands[{idx}].name must be a non-empty string")
+            if name not in _WRENCH_DEADBAND_NAMES:
+                raise RuntimeError(
+                    f"deadbands[{idx}].name={name!r} is not editable "
+                    f"({sorted(_WRENCH_DEADBAND_NAMES)})")
+            raw = entry.get("value")
+            if not isinstance(raw, list) or len(raw) != 3:
+                raise RuntimeError(
+                    f"deadbands[{idx}].value must be a 3-element list "
+                    f"(got {raw!r})")
+            vec: List[float] = []
+            for j, v in enumerate(raw):
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"deadbands[{idx}].value[{j}] not numeric: {exc}"
+                    ) from exc
+                if not math.isfinite(fv):
+                    raise RuntimeError(
+                        f"deadbands[{idx}].value[{j}] must be finite "
+                        f"(got {v!r})")
+                if fv < 0.0:
+                    raise RuntimeError(
+                        f"deadbands[{idx}].value[{j}] must be >= 0 "
+                        f"(got {fv})")
+                vec.append(fv)
+            updates[name] = vec
+
+        if not updates:
+            return {"ok": True, "updated": 0, "results": [],
+                    "message": "no deadbands supplied"}
+
+        ok, results = self._set_gravcomp_double_arrays(updates)
+        successful = sum(1 for r in results if r["successful"])
+        return {
+            "ok":      ok,
+            "updated": successful,
+            "results": results,
+            "message": (
+                f"applied {successful}/{len(results)} deadband(s) "
+                f"to {self._gravcomp_ns}" if ok else
+                f"gravity-compensation rejected "
+                f"{len(results) - successful}/{len(results)} deadband(s)"
+            ),
+        }
 
     # ------------------------------------------------------------------
     # jog / snap-target -- per-controller motion-style command surface
@@ -965,6 +1482,286 @@ class DashboardNode(Node):
         pose.  Only valid for motion / compliance.
         """
         return self.api_jog({})  # zero delta == snap to current pose
+
+    # ------------------------------------------------------------------
+    # tool-frame offsets (aux_frames in robot_config.yaml)
+    # ------------------------------------------------------------------
+    # The dashboard's "Tool frames" panel lets the operator tweak the
+    # xyz / rpy of each aux_frame (e.g. ft_sensor_link, compliance_link)
+    # without editing YAML by hand.  Changes are persisted to
+    # ``config/robot_config.yaml`` via the line-targeted
+    # ``common.config_manager.save_aux_frames`` helper which preserves
+    # comments and unrelated keys; they take effect on the next
+    # ``duco_robot_bringup`` launch.
+    #
+    # Adding, renaming, or removing aux_frames is intentionally NOT
+    # exposed -- those edits ripple into ``fzi_zero_gravity.yaml``
+    # (which names a specific end-effector link in the KDL chain), so
+    # operators do them by hand.
+    def api_get_aux_frames(self) -> Dict[str, Any]:
+        """Return the current aux_frames list as on disk."""
+        if _get_config is None or _read_aux_frames is None:
+            raise RuntimeError(
+                "common.config_manager not importable: "
+                f"{_COMMON_IMPORT_ERROR}")
+        cfg = _get_config()
+        config_path = cfg.config_path
+        if not config_path:
+            raise RuntimeError("config_manager has not resolved a path")
+        frames = _read_aux_frames(config_path)
+        return {
+            "ok":            True,
+            "config_path":   config_path,
+            "frames":        frames,
+            "editable_keys": ["xyz", "rpy"],
+            "message": ("changes apply live: "
+                        "/robot_state_publisher refreshes TF / RViz / "
+                        "the dashboard viewer immediately, and the FZI "
+                        "cartesian controllers (forked) rebuild their "
+                        "KDL chain at runtime via an on-set-parameters "
+                        "callback, so engaged controllers pick up the "
+                        "new tool TCP without unload/load"),
+        }
+
+    def api_set_aux_frames(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist xyz / rpy edits to robot_config.yaml.
+
+        Body shape:
+          ``{"frames": [{"name": str, "xyz": [3 floats], "rpy": [3 floats]}, ...]}``
+
+        Only entries whose ``name`` matches an existing aux_frame on
+        disk are updated; unknown names are ignored (and the response
+        reports the actual count).  Adding / renaming / removing is
+        not supported via this endpoint.
+        """
+        if _save_aux_frames is None or _get_config is None:
+            raise RuntimeError(
+                "common.config_manager not importable: "
+                f"{_COMMON_IMPORT_ERROR}")
+        if not isinstance(body, dict):
+            raise RuntimeError("body must be a JSON object")
+        frames_in = body.get("frames")
+        if not isinstance(frames_in, list):
+            raise RuntimeError("body.frames must be a list")
+
+        # Validate and normalise -> { name: { xyz: [...], rpy: [...] } }
+        updates: Dict[str, Dict[str, List[float]]] = {}
+        for idx, entry in enumerate(frames_in):
+            if not isinstance(entry, dict):
+                raise RuntimeError(
+                    f"frames[{idx}] must be an object")
+            name = entry.get("name")
+            if not isinstance(name, str) or not name:
+                raise RuntimeError(
+                    f"frames[{idx}].name must be a non-empty string")
+            triples: Dict[str, List[float]] = {}
+            for key in ("xyz", "rpy"):
+                if key not in entry:
+                    continue
+                vec = entry[key]
+                if (not isinstance(vec, (list, tuple))
+                        or len(vec) != 3):
+                    raise RuntimeError(
+                        f"frames[{idx}].{key} must be a length-3 list")
+                try:
+                    triples[key] = [float(v) for v in vec]
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"frames[{idx}].{key} not numeric: {exc}"
+                    ) from exc
+            if not triples:
+                continue  # nothing to update for this entry
+            updates[name] = triples
+
+        if not updates:
+            return {"ok": True, "updated": 0,
+                    "message": "no editable fields supplied"}
+
+        cfg = _get_config()
+        config_path = cfg.config_path
+        if not config_path:
+            raise RuntimeError("config_manager has not resolved a path")
+
+        try:
+            updated = _save_aux_frames(config_path, updates)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"failed to save aux_frames: {exc}") from exc
+
+        # ---- Live update: push the rebuilt URDF to rsp so /tf_static
+        # refreshes without restarting duco_robot_bringup.  Best-effort:
+        # any failure here is reported in the response but does not
+        # roll back the yaml save (the file edit is the source of truth
+        # for the next launch).
+        live = self._apply_aux_frames_live()
+
+        if live["ok"]:
+            message = ("saved; static TF updated live via "
+                       "robot_state_publisher")
+            if live.get("missing"):
+                message += (f" (URDF missing: "
+                            f"{', '.join(live['missing'])} -- restart "
+                            f"bringup to materialise them)")
+            warnings = live.get("controller_warnings") or []
+            if warnings:
+                message += (". FZI controllers: "
+                            + "; ".join(warnings))
+            else:
+                message += (". FZI cartesian controllers picked up "
+                            "the new chain at runtime (no reload "
+                            "needed).")
+        else:
+            message = (f"saved to yaml, but live URDF push failed: "
+                       f"{live['error']}. Restart duco_robot_bringup "
+                       f"to apply the change.")
+
+        return {
+            "ok":          True,
+            "config_path": config_path,
+            "updated":     updated,
+            "live":        live,
+            "message":     message,
+        }
+
+    # ------------------------------------------------------------------
+    # Live URDF push to robot_state_publisher
+    # ------------------------------------------------------------------
+    def _apply_aux_frames_live(self) -> Dict[str, Any]:
+        """Rebuild ``robot_description`` from the on-disk aux_frames and
+        push it to ``/robot_state_publisher`` via SetParameters.
+
+        Returns a dict ``{"ok": bool, "error": Optional[str], ...}``
+        suitable to embed in the api_set_aux_frames response.  All
+        failure modes (missing imports, no cached URDF, service
+        unavailable, rsp rejection) come back as ``ok=False`` with a
+        human-readable ``error`` so the operator can decide whether to
+        fall back to a launch restart.
+        """
+        if _update_aux_frames is None or _read_aux_frames is None:
+            return {
+                "ok":    False,
+                "error": ("duco_robot_bringup.urdf_loader not "
+                          f"importable: {_URDF_LOADER_IMPORT_ERROR}"),
+            }
+
+        # Snapshot the current URDF the rsp is publishing.  We rebuild
+        # from THIS string (rather than from xacro) because we do not
+        # know the original xacro args (robot_ip, robot_port,
+        # use_fake_hardware) at dashboard launch time and re-running
+        # xacro with the wrong args would silently drift.
+        with self._lock:
+            urdf_xml = self._urdf_xml
+        if not urdf_xml:
+            return {
+                "ok":    False,
+                "error": ("no cached /robot_description yet -- is "
+                          "robot_state_publisher running?"),
+            }
+
+        # Read the full aux_frames list back from disk (post-save) so
+        # every entry's xyz/rpy is up-to-date.
+        cfg = _get_config()
+        config_path = cfg.config_path if cfg else None
+        if not config_path:
+            return {"ok": False, "error": "config path not resolved"}
+        try:
+            frames = _read_aux_frames(config_path)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False,
+                    "error": f"could not re-read aux_frames: {exc}"}
+
+        try:
+            result = _update_aux_frames(urdf_xml, frames)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False,
+                    "error": f"URDF rewrite failed: {exc}"}
+
+        # Push the rewritten URDF to robot_state_publisher.
+        if not self._cli_rsp_set_params.wait_for_service(timeout_sec=0.5):
+            return {
+                "ok":      False,
+                "updated": result.updated,
+                "missing": result.missing,
+                "error":   ("/robot_state_publisher/set_parameters "
+                            "service unavailable -- is rsp running and "
+                            "reachable on this DDS domain?"),
+            }
+        param = Parameter()
+        param.name = "robot_description"
+        pv = ParameterValue()
+        pv.type = ParameterType.PARAMETER_STRING
+        pv.string_value = result.urdf_xml
+        param.value = pv
+        req = SetParameters.Request()
+        req.parameters = [param]
+        resp = self._service_call_sync(
+            self._cli_rsp_set_params, req, self._service_timeout)
+        if resp is None:
+            return {
+                "ok":      False,
+                "updated": result.updated,
+                "missing": result.missing,
+                "error":   ("no response from rsp set_parameters within "
+                            f"{self._service_timeout:.1f}s"),
+            }
+        if not resp.results or not resp.results[0].successful:
+            why = (resp.results[0].reason
+                   if resp.results else "unknown error")
+            return {
+                "ok":      False,
+                "updated": result.updated,
+                "missing": result.missing,
+                "error":   f"rsp rejected the new URDF: {why}",
+            }
+
+        # Also push to each FZI cartesian controller so the per-
+        # controller on-set-parameters callback can rebuild the KDL
+        # chain at runtime (see cartesian_controller_base.cpp::
+        # onParameterUpdate in the forked submodule).  Each controller
+        # owns its own node and its own ``robot_description`` parameter;
+        # pushing to /controller_manager only updates the manager's
+        # copy, which the running controllers do not observe.  Treated
+        # as best-effort per controller: if a controller isn't loaded
+        # the Save still succeeds (rsp got the new URDF) and we report
+        # a per-controller warning so the operator can decide whether
+        # to reload manually.
+        cm_warnings: List[str] = []
+        for ctrl in self._available_controllers:
+            cli = self._param_clients.get(ctrl, {}).get("set")
+            if cli is None:
+                cm_warnings.append(
+                    f"{ctrl}: no set_parameters client (not in "
+                    "available_controllers?)")
+                continue
+            if not cli.wait_for_service(timeout_sec=0.3):
+                cm_warnings.append(
+                    f"{ctrl}: /{ctrl}/set_parameters unavailable -- "
+                    "controller may not be loaded; reload it manually "
+                    "to pick up the new chain")
+                continue
+            ctrl_resp = self._service_call_sync(
+                cli, req, self._service_timeout)
+            if ctrl_resp is None:
+                cm_warnings.append(
+                    f"{ctrl}: no response from set_parameters within "
+                    f"{self._service_timeout:.1f}s -- old chain may "
+                    "persist; reload if needed")
+            elif (not ctrl_resp.results
+                  or not ctrl_resp.results[0].successful):
+                why = (ctrl_resp.results[0].reason
+                       if ctrl_resp.results else "unknown error")
+                cm_warnings.append(
+                    f"{ctrl}: rejected the URDF push: {why} -- "
+                    "controller will keep its old chain")
+
+        out: Dict[str, Any] = {
+            "ok":      True,
+            "updated": result.updated,
+            "missing": result.missing,
+        }
+        if cm_warnings:
+            out["controller_warnings"] = cm_warnings
+        return out
 
     # ------------------------------------------------------------------
     # 3D-model viewer support
@@ -1198,7 +1995,11 @@ def _decode_param_value(pv: ParameterValue) -> Optional[Any]:
         return float(pv.double_value)
     if t == ParameterType.PARAMETER_STRING:
         return str(pv.string_value)
-    return None  # arrays not supported by the dashboard
+    if t == ParameterType.PARAMETER_DOUBLE_ARRAY:
+        # rclpy hands us an ``array.array('d', ...)``; coerce to a plain
+        # Python list so the value is JSON-serialisable for the HTTP layer.
+        return [float(v) for v in pv.double_array_value]
+    return None  # other array types not used by the dashboard
 
 
 def _local_ip_hint() -> str:

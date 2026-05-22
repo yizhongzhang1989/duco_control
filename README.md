@@ -54,6 +54,13 @@ Key knobs:
 * `duco_ft_sensor.port`, `baud` -- serial device for the F/T sensor.
 * `duco_cartesian_control.max_wrench_force`, `max_wrench_torque`,
   `engage_max_joint_velocity` -- safety supervisor trip thresholds.
+* `duco_robot_bringup.aux_frames` -- list of fixed-joint TF frames the
+  bringup appends to the URDF (default chain
+  `link_6 -> ft_sensor_link -> compliance_link`). `ft_sensor_link` is
+  the gravity-compensation sensor frame; `compliance_link` is the FZI
+  `end_effector_link`. Edit xyz/rpy by hand or via the cartesian
+  dashboard's "Tool frames" panel; changes take effect on the next
+  `duco_robot_bringup` launch.
 
 Anything declared in a launch file's `_FALLBACKS` block can be overridden
 on the CLI as well, e.g. `port:=9120`.
@@ -194,9 +201,16 @@ Open <http://localhost:8120/>.  The dashboard:
 * shows engaged / tripped / idle status, live wrench, freshness pills,
 * has big **Engage** / **Disengage** buttons (call the orchestrator's
   Trigger services),
+* renders a live 3D skeleton of `/robot_description` with the URDF's
+  TF tree (drag to orbit, wheel to zoom),
 * lets you live-tune the FZI controller's gains
   (`pd_gains.trans_*.p`, `pd_gains.rot_*.p`, `solver.error_scale`,
-  `solver.iterations`) without restarting anything.
+  `solver.iterations`) without restarting anything,
+* has a **Tool frames** panel for editing the xyz / rpy of each
+  `duco_robot_bringup.aux_frames` entry (e.g. `ft_sensor_link`,
+  `compliance_link`).  Saving writes back to `config/robot_config.yaml`
+  preserving comments; the new values take effect on the next
+  `duco_robot_bringup` launch.
 
 The dashboard is purely a UI; closing it does **not** stop the
 orchestrator, the controller, or the safety supervisor.

@@ -10,6 +10,13 @@
 #   * end_effector_link / robot_base_link / ft_sensor_ref_link / joints
 #     are identical across the three controllers and should match the
 #     URDF that controller_manager sees.
+#   * The KDL chain runs base_link -> link_1..link_6 -> ft_sensor_link
+#     -> compliance_link (the latter two are aux frames declared in
+#     ``robot_config.yaml::duco_robot_bringup.aux_frames`` and appended
+#     to the URDF by ``duco_robot_bringup`` at bringup). With zero
+#     offsets the tip pose is identical to link_6 -- so JTC behaviour
+#     is unchanged -- but FZI's ``robotChainContains`` now accepts both
+#     ``ft_sensor_link`` and ``compliance_link`` as ref links.
 #   * pd_gains are deliberately conservative for first contact; tune
 #     them at runtime via the dashboard or
 #     ``ros2 param set /<controller_name> pd_gains.trans_x.p ...``.
@@ -20,11 +27,16 @@
 # --- Force controller ----------------------------------------------------
 # Minimises (target_wrench - ft_sensor_wrench).  With our orchestrator
 # publishing target_wrench=0, this is pure free-drive (hand guidance).
+#
+# ``ft_sensor_ref_link`` is the URDF frame in which the FT measurement is
+# expressed.  It must exist in the KDL chain seen by controller_manager;
+# the ``ft_sensor_link`` aux frame is appended at bringup by
+# ``duco_robot_bringup`` from ``robot_config.yaml::duco_robot_bringup.aux_frames``.
 cartesian_force_controller:
   ros__parameters:
-    end_effector_link: "link_6"
+    end_effector_link: "compliance_link"
     robot_base_link: "base_link"
-    ft_sensor_ref_link: "link_6"
+    ft_sensor_ref_link: "ft_sensor_link"
     joints:
       - arm_1_joint_1
       - arm_1_joint_2
@@ -39,12 +51,12 @@ cartesian_force_controller:
       iterations: 5
       publish_state_feedback: true
     pd_gains:
-      trans_x: {p: 0.2}
-      trans_y: {p: 0.2}
-      trans_z: {p: 0.2}
-      rot_x:   {p: 0.5}
-      rot_y:   {p: 0.5}
-      rot_z:   {p: 0.5}
+      trans_x: {p: 2.0}
+      trans_y: {p: 2.0}
+      trans_z: {p: 2.0}
+      rot_x:   {p: 50.0}
+      rot_y:   {p: 50.0}
+      rot_z:   {p: 50.0}
 
 # --- Motion controller ---------------------------------------------------
 # Drives the end-effector toward target_frame (PoseStamped on
@@ -52,7 +64,7 @@ cartesian_force_controller:
 # pose, so without an external publisher it simply holds pose.
 cartesian_motion_controller:
   ros__parameters:
-    end_effector_link: "link_6"
+    end_effector_link: "compliance_link"
     robot_base_link: "base_link"
     joints:
       - arm_1_joint_1
@@ -78,15 +90,21 @@ cartesian_motion_controller:
 # --- Compliance controller ----------------------------------------------
 # Combination of motion + force: drives toward target_frame while
 # yielding to target_wrench.  ``stiffness`` is the apparent impedance of
-# the end-effector in the compliance_ref_link frame (here = end-effector
-# link, so a downward push in tool-Z yields in tool-Z).  Conservative
-# stiffness numbers; raise for stiffer "stay on the path" behaviour.
+# the end-effector in the ``compliance_ref_link`` frame -- with the aux
+# ``compliance_link`` rigidly attached at the wrist, a downward push in
+# tool-Z yields in tool-Z.  Conservative stiffness numbers; raise for
+# stiffer "stay on the path" behaviour.
+#
+# Both ``ft_sensor_ref_link`` and ``compliance_ref_link`` resolve to aux
+# frames declared in ``robot_config.yaml::duco_robot_bringup.aux_frames``
+# and appended to the canonical URDF by ``duco_robot_bringup`` at
+# bringup time.
 cartesian_compliance_controller:
   ros__parameters:
-    end_effector_link: "link_6"
+    end_effector_link: "compliance_link"
     robot_base_link: "base_link"
-    ft_sensor_ref_link: "link_6"
-    compliance_ref_link: "link_6"
+    ft_sensor_ref_link: "ft_sensor_link"
+    compliance_ref_link: "compliance_link"
     joints:
       - arm_1_joint_1
       - arm_1_joint_2

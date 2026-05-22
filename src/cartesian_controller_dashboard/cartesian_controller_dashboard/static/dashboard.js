@@ -82,13 +82,29 @@
     const showJog   = (kind === "motion" || kind === "compliance");
     $("cmd-force").hidden               = !showForce;
     $("cmd-motion-compliance").hidden   = !showJog;
+    // Kind-aware help text + snap-button label: compliance is the
+    // pose-hold spring (snapshot on engage; push to deflect; release
+    // to spring back); motion is rigid pose-hold (drive to target).
+    const helpMotion = $("cmd-help-motion");
+    const helpComp   = $("cmd-help-compliance");
+    if (helpMotion && helpComp) {
+      helpMotion.classList.toggle("active", kind === "motion");
+      helpComp.classList.toggle("active", kind === "compliance");
+    }
+    const snapBtn = $("btn-snap-target");
+    if (snapBtn) {
+      snapBtn.textContent = (kind === "compliance")
+        ? "Re-snap hold pose"
+        : "Snap target to current pose";
+      snapBtn.classList.toggle("warn", kind === "compliance");
+    }
     // Jog buttons act on the *engaged* controller -- if not engaged,
     // disable them to make intent obvious.  (Pre-engage targets get
     // clobbered by FZI's on_activate snapshot anyway.)
     const dis = !engaged;
     document.querySelectorAll("#cmd-motion-compliance button.jog")
       .forEach((b) => { b.disabled = dis; });
-    $("btn-snap-target").disabled = dis;
+    if (snapBtn) snapBtn.disabled = dis;
   }
 
   function setStaleness(elId, ok, age) {
@@ -259,6 +275,7 @@
       $("lim-qe").textContent      = fmt(lim.engage_max_joint_velocity, 3);
       $("lim-ftstale").textContent = fmt(lim.ft_stale_after, 2);
       $("lim-qstale").textContent  = fmt(lim.joint_states_stale_after, 2);
+      syncSafetyInputs(lim);
       syncParamRows(snapshot.params || []);
       applyLive(snapshot);
     } catch (e) {
@@ -271,6 +288,13 @@
   async function tick() {
     try {
       const s = await api("/api/live");
+      const lim = (s.control || {}).limits || {};
+      $("lim-f").textContent       = fmt(lim.max_wrench_force);
+      $("lim-t").textContent       = fmt(lim.max_wrench_torque, 3);
+      $("lim-qe").textContent      = fmt(lim.engage_max_joint_velocity, 3);
+      $("lim-ftstale").textContent = fmt(lim.ft_stale_after, 2);
+      $("lim-qstale").textContent  = fmt(lim.joint_states_stale_after, 2);
+      syncSafetyInputs(lim);
       applyLive(s);
     } catch (e) {
       $("conn").textContent = "offline";
@@ -354,7 +378,12 @@
     try {
       const r = await api("/api/snap_target", { method: "POST" });
       $("last-target-pos").textContent = fmtPos(r.target && r.target.position);
-      toast("target snapped to current pose", "ok");
+      const kind = (r && r.kind) || "motion";
+      toast(
+        kind === "compliance"
+          ? "spring re-anchored at current pose"
+          : "target snapped to current pose",
+        "ok");
     } catch (e) {
       toast("snap failed: " + e.message, "bad");
     }
@@ -381,6 +410,410 @@
     }
   });
 
-  refresh().then(() => setInterval(tick, 200));
+  // ---- Tool-frames editor ------------------------------------------------
+  // Server-side write-back path is:
+  //   GET  /api/aux_frames -> { frames: [{name, parent, xyz, rpy}, ...] }
+  //   POST /api/aux_frames { frames: [...] } -> writes config/robot_config.yaml
+  //
+  // The on-disk format is the source of truth; we never auto-refresh
+  // the rendered table from server data while the user is editing --
+  // doing so could clobber in-progress typing.  Dirty inputs get a
+  // yellow ring until Save commits them.
+  function clearAuxDirty() {
+    document.querySelectorAll("#aux-table input.aux-num.dirty")
+      .forEach((el) => el.classList.remove("dirty"));
+    $("aux-dirty-pill").textContent = "";
+  }
+  function markAuxDirty(inp) {
+    inp.classList.add("dirty");
+    const n = document.querySelectorAll("#aux-table input.aux-num.dirty").length;
+    $("aux-dirty-pill").textContent =
+      n + " unsaved field" + (n === 1 ? "" : "s");
+  }
+  function renderAuxFrames(payload) {
+    const frames = (payload && payload.frames) || [];
+    if (payload && payload.config_path) {
+      $("aux-config-path").textContent = payload.config_path;
+    }
+    const body = $("aux-body");
+    body.innerHTML = "";
+    if (!frames.length) {
+      $("aux-status").textContent = "none";
+      body.innerHTML =
+        '<tr><td colspan="8" class="small">no aux_frames in config</td></tr>';
+      return;
+    }
+    $("aux-status").textContent =
+      frames.length + " frame" + (frames.length === 1 ? "" : "s");
+    for (const f of frames) {
+      const tr = document.createElement("tr");
+      const nameTd = document.createElement("td");
+      nameTd.className = "aux-name";
+      nameTd.innerHTML = "<code>" + (f.name || "?") + "</code>";
+      const parentTd = document.createElement("td");
+      parentTd.innerHTML = "<code>" + (f.parent || "?") + "</code>";
+      tr.append(nameTd, parentTd);
+      const xyz = Array.isArray(f.xyz) && f.xyz.length === 3 ? f.xyz : [0,0,0];
+      const rpy = Array.isArray(f.rpy) && f.rpy.length === 3 ? f.rpy : [0,0,0];
+      const addInput = (kind, idx, val) => {
+        const td = document.createElement("td");
+        const inp = document.createElement("input");
+        inp.type = "number"; inp.step = "0.0001";
+        inp.classList.add("aux-num");
+        inp.dataset.frame = f.name;
+        inp.dataset.kind  = kind;
+        inp.dataset.idx   = String(idx);
+        inp.value = Number(val);
+        inp.addEventListener("input", () => markAuxDirty(inp));
+        td.appendChild(inp); tr.appendChild(td);
+      };
+      for (let i = 0; i < 3; i++) addInput("xyz", i, xyz[i]);
+      for (let i = 0; i < 3; i++) addInput("rpy", i, rpy[i]);
+      body.appendChild(tr);
+    }
+    clearAuxDirty();
+  }
+  function collectAuxFrames() {
+    const byName = {};
+    document.querySelectorAll("#aux-table input.aux-num").forEach((inp) => {
+      const name = inp.dataset.frame;
+      const kind = inp.dataset.kind;
+      const idx  = parseInt(inp.dataset.idx, 10);
+      const v    = parseFloat(inp.value);
+      if (!byName[name]) byName[name] = { name, xyz: [0,0,0], rpy: [0,0,0] };
+      byName[name][kind][idx] = isNaN(v) ? 0 : v;
+    });
+    return Object.values(byName);
+  }
+  async function reloadAuxFrames() {
+    try {
+      const r = await api("/api/aux_frames");
+      renderAuxFrames(r);
+      $("aux-msg").textContent =
+        (r.message || "loaded") + " -- "
+        + (r.frames || []).length + " frame(s)";
+    } catch (e) {
+      $("aux-status").textContent = "error";
+      $("aux-msg").textContent = "load failed: " + e.message;
+      toast("aux_frames load failed: " + e.message, "bad");
+    }
+  }
+  async function saveAuxFrames() {
+    const frames = collectAuxFrames();
+    if (!frames.length) {
+      toast("nothing to save", "warn"); return;
+    }
+    try {
+      const r = await api("/api/aux_frames", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ frames })
+      });
+      // The backend now reports a structured `live` block describing
+      // whether the new URDF made it into robot_state_publisher.  When
+      // live update succeeded the message says so; when it failed we
+      // fall back to telling the operator the yaml is saved but a
+      // bringup restart is needed to apply the change.
+      let msg = "saved " + r.updated + " entrie(s) to " + r.config_path;
+      if (r.live && r.live.ok) {
+        msg += " -- applied live via robot_state_publisher";
+        toast("aux_frames applied live (" + r.updated + ")", "ok");
+      } else {
+        const why = (r.live && r.live.error) ? r.live.error : "unknown";
+        msg += " -- live URDF push failed (" + why
+             + "); restart duco_robot_bringup to apply";
+        toast("aux_frames saved (live push failed)", "warn");
+      }
+      $("aux-msg").textContent = msg;
+      // Re-fetch so the rendered values match exactly what landed on
+      // disk (the round-trip canonicalises numbers).
+      await reloadAuxFrames();
+    } catch (e) {
+      toast("save failed: " + e.message, "bad");
+    }
+  }
+  $("btn-aux-reload").addEventListener("click", reloadAuxFrames);
+  $("btn-aux-save").addEventListener("click", saveAuxFrames);
+  // Kick off an initial load (does not block the main refresh loop).
+  reloadAuxFrames();
+
+  // ---- Safety-thresholds editor ----------------------------------------
+  // Backend path:
+  //   GET  /api/safety_thresholds -> read-only summary (we don't actually
+  //                                  need it; the main /api/live tick
+  //                                  already carries control.limits).
+  //   POST /api/safety_thresholds { thresholds: [{name, value}, ...] }
+  //
+  // The "current" column tracks the orchestrator state on every tick;
+  // the "new" inputs are only auto-filled when not dirty so the
+  // operator's in-progress typing isn't clobbered.
+  function markSafetyDirty(inp) {
+    inp.classList.add("dirty");
+    const n = document.querySelectorAll(
+      "#safety-table input.safety-num.dirty").length;
+    $("safety-dirty-pill").textContent =
+      n + " unsaved field" + (n === 1 ? "" : "s");
+  }
+  function clearSafetyDirty() {
+    document.querySelectorAll("#safety-table input.safety-num.dirty")
+      .forEach((el) => el.classList.remove("dirty"));
+    $("safety-dirty-pill").textContent = "";
+  }
+  function syncSafetyInputs(limits) {
+    // Auto-fill each input from the orchestrator's published limit
+    // *only* when the operator hasn't already edited it.  Inputs that
+    // are dirty or currently focused are left alone.
+    document.querySelectorAll("#safety-table input.safety-num")
+      .forEach((inp) => {
+        if (inp.classList.contains("dirty")) return;
+        if (document.activeElement === inp) return;
+        const v = limits ? limits[inp.dataset.name] : undefined;
+        if (v == null || isNaN(v)) {
+          inp.value = "";
+        } else {
+          // 4 dp keeps room for ft_stale_after = 0.25 etc.; trailing
+          // zeros get trimmed by the browser's number input rendering.
+          inp.value = Number(v);
+        }
+      });
+    const anyMissing = (!limits || $("lim-f").textContent === "--");
+    const pill = $("safety-status");
+    pill.classList.remove("ok", "bad", "warn");
+    if (anyMissing) {
+      pill.textContent = "no orchestrator";
+      pill.classList.add("bad");
+    } else {
+      pill.textContent = "live";
+      pill.classList.add("ok");
+    }
+  }
+  document.querySelectorAll("#safety-table input.safety-num")
+    .forEach((inp) => {
+      inp.addEventListener("input", () => markSafetyDirty(inp));
+      inp.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          saveSafetyThresholds();
+        } else if (ev.key === "Escape") {
+          inp.classList.remove("dirty");
+          // Re-pull from the last snapshot's limits.
+          const lim = (snapshot && snapshot.control && snapshot.control.limits)
+                       || {};
+          syncSafetyInputs(lim);
+        }
+      });
+    });
+  async function saveSafetyThresholds() {
+    const thresholds = [];
+    document.querySelectorAll("#safety-table input.safety-num.dirty")
+      .forEach((inp) => {
+        const v = parseFloat(inp.value);
+        if (!isNaN(v)) {
+          thresholds.push({ name: inp.dataset.name, value: v });
+        }
+      });
+    if (!thresholds.length) {
+      toast("no threshold changes to apply", "warn"); return;
+    }
+    try {
+      const r = await api("/api/safety_thresholds", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ thresholds })
+      });
+      const failed = (r.results || []).filter((p) => !p.successful);
+      if (r.ok && !failed.length) {
+        toast("applied " + r.updated + " threshold(s)", "ok");
+        clearSafetyDirty();
+      } else {
+        const why = failed.map((p) => p.name + ": " + p.reason).join("; ");
+        toast("orchestrator rejected: " + (why || r.message), "bad");
+      }
+      // Re-read state so the "current" column updates.
+      await refresh();
+    } catch (e) {
+      toast("save safety thresholds failed: " + e.message, "bad");
+    }
+  }
+  function resetSafetyEdits() {
+    clearSafetyDirty();
+    const lim = (snapshot && snapshot.control && snapshot.control.limits)
+                 || {};
+    syncSafetyInputs(lim);
+  }
+  $("btn-safety-save").addEventListener("click", saveSafetyThresholds);
+  $("btn-safety-reset").addEventListener("click", resetSafetyEdits);
+
+  // ---- Wrench-deadband editor ------------------------------------------
+  // Backend paths:
+  //   GET  /api/wrench_deadband  -> per-axis force / torque dead-zone
+  //                                 currently set on the gravity-comp node.
+  //   POST /api/wrench_deadband  -> push edits
+  //     { deadbands: [{name: "force_deadband", value: [x,y,z]}, ...] }
+  //
+  // The deadband doesn't change from the outside (only the operator
+  // edits it), so we don't poll it on every tick.  We fetch it on the
+  // slow ``refresh()`` path (every 3 s) and after every successful
+  // save so the "current" inputs reflect what the node actually
+  // accepted; a manual Reload button is provided for impatient users.
+  let deadbandCache = null;   // last response from GET /api/wrench_deadband
+
+  function markDeadbandDirty(inp) {
+    inp.classList.add("dirty");
+    const n = document.querySelectorAll(
+      "#deadband-table input.deadband-num.dirty").length;
+    $("deadband-dirty-pill").textContent =
+      n + " unsaved field" + (n === 1 ? "" : "s");
+  }
+  function clearDeadbandDirty() {
+    document.querySelectorAll("#deadband-table input.deadband-num.dirty")
+      .forEach((el) => el.classList.remove("dirty"));
+    $("deadband-dirty-pill").textContent = "";
+  }
+  function syncDeadbandInputs(payload) {
+    // payload = api_get_wrench_deadband() response.  Each item is
+    //   {name, label, unit, value: [x,y,z] | null}
+    // Inputs that are dirty or focused are left alone so in-progress
+    // edits aren't clobbered by a periodic refresh.
+    const byName = {};
+    if (payload && Array.isArray(payload.deadbands)) {
+      for (const d of payload.deadbands) byName[d.name] = d.value;
+    }
+    document.querySelectorAll("#deadband-table input.deadband-num")
+      .forEach((inp) => {
+        if (inp.classList.contains("dirty")) return;
+        if (document.activeElement === inp) return;
+        const vec = byName[inp.dataset.name];
+        const idx = parseInt(inp.dataset.axis, 10);
+        if (Array.isArray(vec) && isFinite(vec[idx])) {
+          inp.value = Number(vec[idx]);
+        } else {
+          inp.value = "";
+        }
+      });
+    const pill = $("deadband-status");
+    pill.classList.remove("ok", "bad", "warn");
+    if (!payload) {
+      pill.textContent = "loading...";
+    } else if (!payload.available) {
+      pill.textContent = "node offline";
+      pill.classList.add("bad");
+    } else {
+      pill.textContent = "live";
+      pill.classList.add("ok");
+    }
+  }
+  async function loadWrenchDeadband() {
+    try {
+      deadbandCache = await api("/api/wrench_deadband");
+      syncDeadbandInputs(deadbandCache);
+    } catch (e) {
+      deadbandCache = null;
+      syncDeadbandInputs(null);
+    }
+  }
+  function collectDeadbandEdits() {
+    // Build {name: [x,y,z]} for any *row* that has at least one dirty
+    // cell, falling back to the cached values for the cells the user
+    // didn't touch.  This way a single-cell edit doesn't accidentally
+    // zero the other two axes (which would happen if we naively only
+    // sent dirty cells -- a SetParameters call for force_deadband
+    // requires the full 3-element vector).
+    const cached = {};
+    if (deadbandCache && Array.isArray(deadbandCache.deadbands)) {
+      for (const d of deadbandCache.deadbands) {
+        if (Array.isArray(d.value)) cached[d.name] = d.value.slice();
+      }
+    }
+    const dirtyByName = {};
+    document.querySelectorAll(
+        "#deadband-table input.deadband-num.dirty")
+      .forEach((inp) => {
+        const name = inp.dataset.name;
+        const idx  = parseInt(inp.dataset.axis, 10);
+        if (!dirtyByName[name]) dirtyByName[name] = [];
+        dirtyByName[name].push(idx);
+      });
+    const updates = [];
+    for (const name of Object.keys(dirtyByName)) {
+      const vec = (cached[name] || [0, 0, 0]).slice();
+      let problem = null;
+      document.querySelectorAll(
+          "#deadband-table input.deadband-num[data-name='" + name + "']")
+        .forEach((inp) => {
+          const idx = parseInt(inp.dataset.axis, 10);
+          if (inp.value === "" || inp.value == null) {
+            problem = name + "[" + idx + "] is empty";
+            return;
+          }
+          const v = parseFloat(inp.value);
+          if (isNaN(v)) {
+            problem = name + "[" + idx + "] not a number";
+            return;
+          }
+          if (v < 0) {
+            problem = name + "[" + idx + "] must be >= 0";
+            return;
+          }
+          vec[idx] = v;
+        });
+      if (problem) return { error: problem };
+      updates.push({ name, value: vec });
+    }
+    return { updates };
+  }
+  async function saveWrenchDeadband() {
+    const built = collectDeadbandEdits();
+    if (built.error) { toast(built.error, "bad"); return; }
+    if (!built.updates.length) {
+      toast("no deadband changes to apply", "warn"); return;
+    }
+    try {
+      const r = await api("/api/wrench_deadband", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ deadbands: built.updates })
+      });
+      const failed = (r.results || []).filter((p) => !p.successful);
+      if (r.ok && !failed.length) {
+        toast("applied " + r.updated + " deadband(s)", "ok");
+        clearDeadbandDirty();
+      } else {
+        const why = failed.map((p) => p.name + ": " + p.reason).join("; ");
+        toast("gravity-comp rejected: " + (why || r.message), "bad");
+      }
+      await loadWrenchDeadband();
+    } catch (e) {
+      toast("save deadband failed: " + e.message, "bad");
+    }
+  }
+  function resetDeadbandEdits() {
+    clearDeadbandDirty();
+    syncDeadbandInputs(deadbandCache);
+  }
+  document.querySelectorAll("#deadband-table input.deadband-num")
+    .forEach((inp) => {
+      inp.addEventListener("input", () => markDeadbandDirty(inp));
+      inp.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          saveWrenchDeadband();
+        } else if (ev.key === "Escape") {
+          inp.classList.remove("dirty");
+          syncDeadbandInputs(deadbandCache);
+        }
+      });
+    });
+  $("btn-deadband-save").addEventListener("click", saveWrenchDeadband);
+  $("btn-deadband-reset").addEventListener("click", resetDeadbandEdits);
+  $("btn-deadband-reload").addEventListener("click", loadWrenchDeadband);
+
+  refresh().then(() => {
+    loadWrenchDeadband();
+    setInterval(tick, 200);
+  });
   setInterval(refresh, 3000);
+  // Re-poll the deadband once every 5 s in case it gets changed by an
+  // external ``ros2 param set`` call.  Cheap (1 GetParameters round-trip).
+  setInterval(loadWrenchDeadband, 5000);
 })();

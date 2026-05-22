@@ -26,9 +26,12 @@
     </div>
     <div class="small" style="margin-top:6px;">
       Use the dropdown to select a controller; click Engage to activate
-      it (only allowed while idle).  Force = pure free-drive
-      (target_wrench=0); Motion = pose-hold (snapshots current pose);
-      Compliance = pose-hold + yields to wrench.
+      it (only allowed while idle).  <b>Force</b> = pure free-drive
+      (target_wrench=0); <b>Motion</b> = pose-hold (snapshots current
+      pose, rigid drive to target);
+      <b>Compliance</b> = pose-hold spring (snapshots current pose at
+      engage and yields to wrench &mdash; push the end-effector and it
+      bounces back like a spring).
     </div>
   </div>
 
@@ -48,11 +51,29 @@
     </div>
 
     <div id="cmd-motion-compliance" class="cmd-section" hidden>
-      <div class="small" id="cmd-help">
-        Each press computes <code>new_target = current_EE_pose + delta</code>
-        in <b>base_link</b> and publishes it on
-        <code>/&lt;controller&gt;/target_frame</code>.  Active only while
-        engaged.  <b>Snap</b> resets target to the current pose.
+      <div class="small">
+        <div class="cmd-help-kind" id="cmd-help-motion">
+          <b>Motion controller:</b> snapshots current pose on engage,
+          then rigidly drives the end-effector to whatever target you
+          publish.  Each jog press computes
+          <code>new_target = current_EE_pose + delta</code> in
+          <b>base_link</b> and publishes it on
+          <code>/cartesian_motion_controller/target_frame</code>.
+          <b>Snap</b> resets the target to the current pose.
+        </div>
+        <div class="cmd-help-kind" id="cmd-help-compliance">
+          <b>Compliance controller (spring-hold):</b> on engage the
+          controller snapshots the current end-effector pose as its
+          target.  With <code>target_wrench=0</code> (published by the
+          orchestrator) and the configured stiffness, pushing the
+          end-effector makes it yield; release and it springs back to
+          the held pose.  Use <b>Re-snap hold pose</b> after drift to
+          re-anchor the spring at the current pose.  Tune the
+          <code>stiffness.*</code> rows in &ldquo;Controller
+          parameters&rdquo; (right panel) to change how stiff the
+          spring is &mdash; higher = stiffer.  Jog presses move the
+          held pose by an incremental delta.
+        </div>
       </div>
       <div class="cmd-grid">
         <div class="cmd-col">
@@ -86,8 +107,8 @@
           </div>
         </div>
         <div class="cmd-col">
-          <button id="btn-snap-target" type="button" class="big">
-            Snap target to current pose
+          <button id="btn-snap-target" type="button" class="big warn">
+            Re-snap hold pose
           </button>
           <div class="small" style="margin-top:6px;">
             Last published target:
@@ -159,19 +180,112 @@
       </div>
 
       <div class="panel">
-        <h2>Safety thresholds (orchestrator)</h2>
-        <table>
+        <h2>
+          Safety thresholds (orchestrator)
+          <span class="pill" id="safety-status">--</span>
+        </h2>
+        <table id="safety-table">
+          <thead>
+            <tr><th>name</th><th>current</th><th>new</th><th>unit</th></tr>
+          </thead>
           <tbody>
-            <tr><td>max |F|</td><td class="num" id="lim-f">--</td><td>N</td></tr>
-            <tr><td>max |T|</td><td class="num" id="lim-t">--</td><td>Nm</td></tr>
-            <tr><td>engage max |qdot|</td><td class="num" id="lim-qe">--</td><td>rad/s</td></tr>
-            <tr><td>FT stale after</td><td class="num" id="lim-ftstale">--</td><td>s</td></tr>
-            <tr><td>joint_states stale after</td><td class="num" id="lim-qstale">--</td><td>s</td></tr>
+            <tr>
+              <td>max |F|</td>
+              <td class="num" id="lim-f">--</td>
+              <td><input type="number" min="0" step="0.5" class="safety-num"
+                         data-name="max_wrench_force"></td>
+              <td>N</td>
+            </tr>
+            <tr>
+              <td>max |T|</td>
+              <td class="num" id="lim-t">--</td>
+              <td><input type="number" min="0" step="0.1" class="safety-num"
+                         data-name="max_wrench_torque"></td>
+              <td>Nm</td>
+            </tr>
+            <tr>
+              <td>engage max |qdot|</td>
+              <td class="num" id="lim-qe">--</td>
+              <td><input type="number" min="0" step="0.005" class="safety-num"
+                         data-name="engage_max_joint_velocity"></td>
+              <td>rad/s</td>
+            </tr>
+            <tr>
+              <td>FT stale after</td>
+              <td class="num" id="lim-ftstale">--</td>
+              <td><input type="number" min="0" step="0.05" class="safety-num"
+                         data-name="ft_stale_after"></td>
+              <td>s</td>
+            </tr>
+            <tr>
+              <td>joint_states stale after</td>
+              <td class="num" id="lim-qstale">--</td>
+              <td><input type="number" min="0" step="0.05" class="safety-num"
+                         data-name="joint_states_stale_after"></td>
+              <td>s</td>
+            </tr>
           </tbody>
         </table>
-        <div class="small" style="margin-top:8px;">
-          These are read-only here; tune them via parameters on
-          <code>/duco_cartesian_control</code>.
+        <div style="margin-top:8px; display:flex; gap:8px; align-items:center;">
+          <button id="btn-safety-save" class="big">Apply thresholds</button>
+          <button id="btn-safety-reset" class="ghost">Reset edits</button>
+          <span class="small" id="safety-dirty-pill"></span>
+        </div>
+        <div class="small" style="margin-top:6px;">
+          Pushed live to <code>/duco_cartesian_control</code>.  Crossing
+          a wrench / staleness limit while engaged trips the safety
+          supervisor and disengages the FZI controller.  Values must
+          be &ge; 0.
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>
+          Wrench deadband (gravity compensation)
+          <span class="pill" id="deadband-status">--</span>
+        </h2>
+        <table id="deadband-table">
+          <thead>
+            <tr><th>axis</th><th>x</th><th>y</th><th>z</th><th>unit</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>force</td>
+              <td><input type="number" min="0" step="0.1" class="deadband-num"
+                         data-name="force_deadband" data-axis="0"></td>
+              <td><input type="number" min="0" step="0.1" class="deadband-num"
+                         data-name="force_deadband" data-axis="1"></td>
+              <td><input type="number" min="0" step="0.1" class="deadband-num"
+                         data-name="force_deadband" data-axis="2"></td>
+              <td>N</td>
+            </tr>
+            <tr>
+              <td>torque</td>
+              <td><input type="number" min="0" step="0.01" class="deadband-num"
+                         data-name="torque_deadband" data-axis="0"></td>
+              <td><input type="number" min="0" step="0.01" class="deadband-num"
+                         data-name="torque_deadband" data-axis="1"></td>
+              <td><input type="number" min="0" step="0.01" class="deadband-num"
+                         data-name="torque_deadband" data-axis="2"></td>
+              <td>Nm</td>
+            </tr>
+          </tbody>
+        </table>
+        <div style="margin-top:8px; display:flex; gap:8px; align-items:center;">
+          <button id="btn-deadband-save" class="big">Apply deadband</button>
+          <button id="btn-deadband-reset" class="ghost">Reset edits</button>
+          <button id="btn-deadband-reload" class="ghost">Reload</button>
+          <span class="small" id="deadband-dirty-pill"></span>
+        </div>
+        <div class="small" style="margin-top:6px;">
+          Per-axis soft (continuous) dead-zone applied to the
+          compensated wrench just before publishing on
+          <code>/duco_ft_sensor/wrench_compensated</code>.  Models the
+          residual noise floor left after bias calibration; the
+          downstream force / compliance controller (and the
+          <em>|F|&nbsp;/&nbsp;|T|</em> readout above) only "see" forces
+          larger than the threshold.  Defaults are <code>0&nbsp;0&nbsp;0</code>
+          (pass-through).  Values must be &ge; 0.
         </div>
       </div>
     </div>
@@ -193,6 +307,36 @@
           <button id="btn-refresh-params" class="ghost">Refresh</button>
         </div>
       </div>
+    </div>
+  </div>
+
+  <div class="panel" id="aux-frames-panel">
+    <h2>
+      Tool frames <span class="pill" id="aux-status">--</span>
+      <span class="small" style="margin-left:8px;">
+        offsets persisted to <code id="aux-config-path">config/robot_config.yaml</code>;
+        applied live to <code>/tf_static</code> (TF / RViz / 3D viewer
+        update immediately; FZI cartesian controllers need a reload to
+        pick up the new TCP)
+      </span>
+    </h2>
+    <div class="small" id="aux-msg" style="margin-bottom:6px;">
+      loading&hellip;
+    </div>
+    <table id="aux-table">
+      <thead>
+        <tr>
+          <th>name</th><th>parent</th>
+          <th>x [m]</th><th>y [m]</th><th>z [m]</th>
+          <th>roll [rad]</th><th>pitch [rad]</th><th>yaw [rad]</th>
+        </tr>
+      </thead>
+      <tbody id="aux-body"></tbody>
+    </table>
+    <div style="margin-top:8px; display:flex; gap:8px; align-items:center;">
+      <button id="btn-aux-save" class="big">Save offsets</button>
+      <button id="btn-aux-reload" class="ghost">Reload from file</button>
+      <span class="small" id="aux-dirty-pill"></span>
     </div>
   </div>
 

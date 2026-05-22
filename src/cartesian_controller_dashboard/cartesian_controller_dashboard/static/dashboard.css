@@ -63,3 +63,27 @@
   .toast.show { opacity: 1; }
   .toast.bad { border-color: #b91c1c; color: #ffb4b4; }
   .toast.ok  { border-color: #15803d; color: #c6f7d6; }
+  /* Tool-frames editor: 6 numeric inputs per row, so use a tighter width.
+     ``input.aux-num`` is the dirty-state-tracking input (changes get a
+     subtle yellow ring until Save commits them). */
+  #aux-table input.aux-num { width: 5.5em; }
+  #aux-table input.aux-num.dirty {
+    border-color: #b08a3a; box-shadow: 0 0 0 1px #553e1a inset;
+  }
+  #aux-table td.aux-name code { color: #c6f7d6; }
+  /* Safety-thresholds editor: same dirty-state styling as aux frames. */
+  #safety-table input.safety-num { width: 7em; }
+  #safety-table input.safety-num.dirty {
+    border-color: #b08a3a; box-shadow: 0 0 0 1px #553e1a inset;
+  }
+  /* Wrench-deadband editor (gravity-compensation node parameters):
+     3 numeric inputs per row (xyz), reuse the same dirty-state styling. */
+  #deadband-table input.deadband-num { width: 5.5em; }
+  #deadband-table input.deadband-num.dirty {
+    border-color: #b08a3a; box-shadow: 0 0 0 1px #553e1a inset;
+  }
+  /* Kind-aware help text inside the controller-commands panel. */
+  .cmd-help-kind { display: none; }
+  .cmd-help-kind.active { display: block; }
+  button.warn { background: #b45309; }
+  button.warn:hover { background: #92400e; }
