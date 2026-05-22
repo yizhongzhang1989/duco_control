@@ -22,9 +22,26 @@ This node provides the operational glue:
 * a **wrench relay** that republishes the gravity-compensated
   ``WrenchStamped`` from the FT sensor pipeline (BEST_EFFORT) onto every
   FZI controller's RELIABLE ``ft_sensor_wrench`` input;
-* a **zero ``target_wrench`` heartbeat** at a configurable rate to every
-  controller that consumes it (force + compliance), so any of them is
-  ready to engage in free-drive mode without an external publisher;
+* a **``target_wrench`` heartbeat** at a configurable rate to every
+  controller that consumes it (force + compliance).  Two sources can
+  drive the published value:
+
+    * a set of live parameters
+      (``target_wrench_force_x``, ..., ``target_wrench_torque_z``) on
+      this node, defaulting to all zero so a fresh engage is pure
+      free-drive (handy for ``ros2 param set`` or a dashboard);
+    * an optional external WrenchStamped topic
+      (``external_target_wrench_topic``, default empty = disabled)
+      forwarded immediately with zero added latency -- intended for
+      high-rate teleop devices such as a 3D mouse / SpaceMouse.  Each
+      axis is clamped to the safety supervisor's ``max_wrench_*``
+      envelope on its way through.  If no external message arrives
+      for ``external_target_wrench_timeout_sec``, the parameter
+      setpoint takes over.
+
+  The values are interpreted by the controller in the end-effector
+  frame when its ``hand_frame_control`` param is true (the FZI
+  default), else the robot base frame;
 * a **safety supervisor** that monitors FT staleness, joint-state
   staleness, and force / torque limits, auto-disengaging on any trip;
 * a **status topic** (``~/state``, ``std_msgs/String`` with a JSON
@@ -118,6 +135,30 @@ _PARAM_DECLARATIONS: List[Tuple[str, object]] = [
     ("fzi_target_frame",        "link_6"),
     ("fzi_target_rate_hz",      10.0),
     ("fzi_service_timeout_sec", 2.0),
+    # target_wrench setpoint published by the heartbeat ---------------
+    # Interpreted by FZI in the end-effector frame when the controller's
+    # ``hand_frame_control`` parameter is true (its default), and in the
+    # robot base frame when false.  All zero -> pure free-drive
+    # (sensor-wrench-only error -> compliance to operator pushes).
+    # Set per-axis live via, e.g.,
+    #   ros2 param set /duco_cartesian_control target_wrench_force_z 5.0
+    ("target_wrench_force_x",   0.0),   # N
+    ("target_wrench_force_y",   0.0),   # N
+    ("target_wrench_force_z",   0.0),   # N
+    ("target_wrench_torque_x",  0.0),   # Nm
+    ("target_wrench_torque_y",  0.0),   # Nm
+    ("target_wrench_torque_z",  0.0),   # Nm
+    # external high-rate target_wrench input -------------------------------
+    # When ``external_target_wrench_topic`` is non-empty, the orchestrator
+    # subscribes to it (BEST_EFFORT) and forwards every incoming message
+    # to each controller's ``target_wrench`` topic IMMEDIATELY (no rate
+    # limiting), after clamping each axis to the safety envelope below.
+    # Designed for teleoperation devices (e.g. SpaceMouse) that publish
+    # WrenchStamped at 50-125 Hz.  If no message arrives for
+    # ``external_target_wrench_timeout_sec``, the parameter setpoint
+    # above takes over via the heartbeat.  Leave topic empty to disable.
+    ("external_target_wrench_topic",        ""),
+    ("external_target_wrench_timeout_sec",  0.2),
     # supervisor loop ------------------------------------------------------
     ("loop_rate_hz",            50.0),
     # state-publish loop ---------------------------------------------------
@@ -207,6 +248,31 @@ class CartesianControlNode(Node):
                 self._pubs_target_wrench[name] = self.create_publisher(
                     WrenchStamped, f"/{name}/target_wrench", reliable_qos)
 
+        # ---- external target_wrench input ------------------------------
+        # When ``external_target_wrench_topic`` is non-empty, an outside
+        # publisher (e.g. a 3D mouse / SpaceMouse teleop bridge) can
+        # drive the target_wrench at its own rate.  We forward every
+        # message immediately to each controller's ``target_wrench``
+        # topic, after clamping to the safety envelope.  See
+        # :meth:`_on_external_target_wrench` and
+        # :meth:`_publish_fzi_target_wrench`.
+        self._external_tw: Optional[np.ndarray] = None
+        self._external_tw_mono: Optional[float] = None
+        self._external_was_fresh: bool = False
+        self._sub_external_tw = None
+        if self._external_target_wrench_topic and self._pubs_target_wrench:
+            ext_qos = QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                durability=DurabilityPolicy.VOLATILE,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=10,
+            )
+            self._sub_external_tw = self.create_subscription(
+                WrenchStamped,
+                self._external_target_wrench_topic,
+                self._on_external_target_wrench,
+                ext_qos)
+
         # State topic: TRANSIENT_LOCAL so late subscribers (e.g. a
         # dashboard launched after the orchestrator) see the most
         # recent state immediately.
@@ -236,7 +302,7 @@ class CartesianControlNode(Node):
         # ---- timers ----------------------------------------------------
         rate = max(self._fzi_target_rate_hz, 0.1)
         self._fzi_target_timer = self.create_timer(
-            1.0 / rate, self._publish_fzi_target_zero,
+            1.0 / rate, self._publish_fzi_target_wrench,
             callback_group=self._cbgroup)
         self._loop_timer = self.create_timer(
             1.0 / max(self._loop_rate_hz, 1.0), self._on_supervisor_tick,
@@ -246,13 +312,19 @@ class CartesianControlNode(Node):
             self._publish_state, callback_group=self._cbgroup)
 
         ctl_list = ", ".join(f"{n}({k})" for n, k in self._controllers)
+        ext = (f"external target_wrench input from "
+               f"{self._external_target_wrench_topic!r} "
+               f"(timeout {self._external_target_wrench_timeout:.2f}s)"
+               if self._sub_external_tw is not None
+               else "no external target_wrench input (parameter setpoint only)")
         self.get_logger().info(
             f"orchestrating FZI: available controllers=[{ctl_list}]; "
             f"engage will switch "
             f"{self._fzi_jtc_controller_name!r} -> "
             f"{self._active_controller_name!r}; relaying wrench "
             f"{self._wrench_topic!r} -> /<each controller>/ft_sensor_wrench; "
-            f"target_wrench=0 to force/compliance @ {rate:.0f} Hz")
+            f"target_wrench={self._target_wrench.tolist()} to "
+            f"force/compliance @ {rate:.0f} Hz; {ext}")
         self.get_logger().info(
             f"engage via `ros2 service call /duco_cartesian_control/engage "
             f"std_srvs/srv/Trigger`")
@@ -300,6 +372,25 @@ class CartesianControlNode(Node):
         self._fzi_target_rate_hz = float(gp("fzi_target_rate_hz"))
         self._fzi_service_timeout = float(gp("fzi_service_timeout_sec"))
 
+        # target_wrench setpoint (6-vector: fx,fy,fz, tx,ty,tz) -----------
+        # Stored as a numpy array for the heartbeat publisher; the names
+        # match the flat parameter declarations so live updates only need
+        # to touch one element of this array.
+        self._target_wrench = np.array([
+            float(gp("target_wrench_force_x")),
+            float(gp("target_wrench_force_y")),
+            float(gp("target_wrench_force_z")),
+            float(gp("target_wrench_torque_x")),
+            float(gp("target_wrench_torque_y")),
+            float(gp("target_wrench_torque_z")),
+        ], dtype=float)
+
+        # external high-rate target_wrench input --------------------------
+        self._external_target_wrench_topic = str(
+            gp("external_target_wrench_topic")).strip()
+        self._external_target_wrench_timeout = float(
+            gp("external_target_wrench_timeout_sec"))
+
         self._loop_rate_hz = float(gp("loop_rate_hz"))
         self._state_publish_rate_hz = float(gp("state_publish_rate_hz"))
 
@@ -310,12 +401,43 @@ class CartesianControlNode(Node):
         self._joint_states_stale_after = float(gp("joint_states_stale_after"))
 
     def _on_param_change(self, params) -> SetParametersResult:
+        # target_wrench axis names -> (slot in self._target_wrench, kind)
+        # where kind is "force" (limited by max_wrench_force) or
+        # "torque" (limited by max_wrench_torque).
+        tw_axes = {
+            "target_wrench_force_x":  (0, "force"),
+            "target_wrench_force_y":  (1, "force"),
+            "target_wrench_force_z":  (2, "force"),
+            "target_wrench_torque_x": (3, "torque"),
+            "target_wrench_torque_y": (4, "torque"),
+            "target_wrench_torque_z": (5, "torque"),
+        }
         # Validate non-negative safety knobs.
         for p in params:
             if p.name in self._SAFETY_KNOBS and float(p.value) < 0.0:
                 return SetParametersResult(
                     successful=False,
                     reason=f"{p.name!r} must be >= 0")
+            if p.name == "external_target_wrench_timeout_sec" and float(p.value) <= 0.0:
+                return SetParametersResult(
+                    successful=False,
+                    reason=("external_target_wrench_timeout_sec must be > 0 "
+                            "(otherwise the heartbeat would never wait for "
+                            "the external publisher)"))
+            if p.name in tw_axes:
+                # Refuse setpoints exceeding the safety supervisor's
+                # trip limit -- otherwise the robot would push toward a
+                # value the supervisor would immediately trip on.
+                _, kind = tw_axes[p.name]
+                limit = (self._max_wrench_force if kind == "force"
+                         else self._max_wrench_torque)
+                if abs(float(p.value)) > limit:
+                    return SetParametersResult(
+                        successful=False,
+                        reason=(f"|{p.name}|={abs(float(p.value)):.3f} exceeds "
+                                f"max_wrench_{kind}={limit:.3f}; "
+                                f"raise the safety limit first or "
+                                f"choose a smaller setpoint"))
             if p.name == "active_controller_name":
                 # Must be one of the known controllers, and we refuse to
                 # change it while engaged (otherwise the engaged-controller
@@ -347,6 +469,17 @@ class CartesianControlNode(Node):
                 self.get_logger().info(
                     f"active_controller_name -> {self._active_controller_name!r} "
                     f"(kind={self._kind_by_name[self._active_controller_name]})")
+            elif p.name in tw_axes:
+                slot, _ = tw_axes[p.name]
+                self._target_wrench[slot] = float(p.value)
+                self.get_logger().info(
+                    f"{p.name} -> {float(p.value):.4f} "
+                    f"(target_wrench={self._target_wrench.tolist()})")
+            elif p.name == "external_target_wrench_timeout_sec":
+                self._external_target_wrench_timeout = float(p.value)
+                self.get_logger().info(
+                    f"external_target_wrench_timeout_sec -> "
+                    f"{self._external_target_wrench_timeout:.4f}")
         return SetParametersResult(successful=True)
 
     # ------------------------------------------------------------------
@@ -366,6 +499,61 @@ class CartesianControlNode(Node):
                 msg.wrench.torque.x, msg.wrench.torque.y, msg.wrench.torque.z,
             ])
             self._last_wrench_mono = time.monotonic()
+
+    def _on_external_target_wrench(self, msg: WrenchStamped) -> None:
+        """Forward an externally-published setpoint to every consumer.
+
+        Called on every message from the high-frequency target topic
+        (e.g. a 3D-mouse / SpaceMouse teleop publisher).  Each axis is
+        clamped to the safety supervisor's ``max_wrench_*`` envelope so
+        an unbounded external publisher cannot make the robot exceed
+        the configured limit, then the result is forwarded to every
+        controller's ``target_wrench`` topic immediately -- no rate
+        limiting.
+
+        When messages stop for ``external_target_wrench_timeout_sec``
+        the parameter setpoint (:attr:`_target_wrench`) takes over via
+        the heartbeat in :meth:`_publish_fzi_target_wrench`.
+        """
+        vec = np.array([
+            msg.wrench.force.x,  msg.wrench.force.y,  msg.wrench.force.z,
+            msg.wrench.torque.x, msg.wrench.torque.y, msg.wrench.torque.z,
+        ], dtype=float)
+        clamped = self._clamp_wrench(vec)
+        with self._lock:
+            self._external_tw = clamped
+            self._external_tw_mono = time.monotonic()
+            became_fresh = not self._external_was_fresh
+            self._external_was_fresh = True
+        if became_fresh:
+            self.get_logger().info(
+                f"external target_wrench stream ACTIVE on "
+                f"{self._external_target_wrench_topic!r}; "
+                f"parameter setpoint suspended")
+        msg_out = WrenchStamped()
+        msg_out.header.stamp = self.get_clock().now().to_msg()
+        msg_out.header.frame_id = self._fzi_target_frame
+        msg_out.wrench.force.x  = float(clamped[0])
+        msg_out.wrench.force.y  = float(clamped[1])
+        msg_out.wrench.force.z  = float(clamped[2])
+        msg_out.wrench.torque.x = float(clamped[3])
+        msg_out.wrench.torque.y = float(clamped[4])
+        msg_out.wrench.torque.z = float(clamped[5])
+        for pub in self._pubs_target_wrench.values():
+            pub.publish(msg_out)
+
+    def _clamp_wrench(self, vec: np.ndarray) -> np.ndarray:
+        """Clip a 6-vector to ``+/- max_wrench_force`` and ``+/- max_wrench_torque``."""
+        out = np.array(vec, dtype=float, copy=True)
+        if self._max_wrench_force > 0.0:
+            out[0:3] = np.clip(out[0:3],
+                               -self._max_wrench_force,
+                               +self._max_wrench_force)
+        if self._max_wrench_torque > 0.0:
+            out[3:6] = np.clip(out[3:6],
+                               -self._max_wrench_torque,
+                               +self._max_wrench_torque)
+        return out
 
     def _on_joint_states(self, msg: JointState) -> None:
         with self._lock:
@@ -466,14 +654,37 @@ class CartesianControlNode(Node):
     # ------------------------------------------------------------------
     # FZI orchestration helpers (also used by tests)
     # ------------------------------------------------------------------
-    def _publish_fzi_target_zero(self) -> None:
-        """Send an all-zero ``WrenchStamped`` to every consumer's setpoint.
+    def _publish_fzi_target_wrench(self) -> None:
+        """Send the configured ``WrenchStamped`` to every consumer's setpoint.
 
-        FZI minimises (target - measured), so an identically zero
-        target means FZI tries to drive the operator-applied wrench to
-        zero -- pure free-drive.  Always running so the topic stays
-        warm for every controller that consumes it (force, compliance);
-        harmless when the corresponding controller is inactive.
+        FZI minimises (target_wrench - measured), so an identically
+        zero target means FZI tries to drive the operator-applied
+        wrench to zero -- pure free-drive.  A non-zero target means
+        FZI drives the end-effector until the FT sensor reads that
+        value -- i.e. the robot applies that wrench against the
+        environment (push, twist, etc.).  The setpoint is interpreted
+        by FZI in the end-effector frame when the controller's
+        ``hand_frame_control`` parameter is true (its default), and in
+        the robot base frame when false.
+
+        Always running so the topic stays warm for every controller
+        that consumes it (force, compliance); harmless when the
+        corresponding controller is inactive.
+
+        Source of the published value is determined per-tick:
+          * if an external publisher on
+            ``external_target_wrench_topic`` produced a fresh message
+            within ``external_target_wrench_timeout_sec``, this tick is
+            a NO-OP -- the per-message forward in
+            :meth:`_on_external_target_wrench` already published with
+            zero added latency;
+          * otherwise (stale or no external publisher), publish the
+            parameter setpoint :attr:`_target_wrench` so the
+            controllers always see a recent reliable value.
+
+        The 6-vector ``self._target_wrench`` is mutated live by
+        :meth:`_on_param_change` so operators (or the dashboard) can
+        retune the fallback setpoint without restarting.
 
         Motion / compliance controllers also accept a ``target_frame``
         but their ``on_activate`` snapshots the current end-effector
@@ -484,16 +695,35 @@ class CartesianControlNode(Node):
         """
         if not self._pubs_target_wrench:
             return
+        now = time.monotonic()
+        with self._lock:
+            external_fresh = (
+                self._external_tw is not None
+                and self._external_tw_mono is not None
+                and (now - self._external_tw_mono)
+                < self._external_target_wrench_timeout)
+            became_stale = self._external_was_fresh and not external_fresh
+            if became_stale:
+                self._external_was_fresh = False
+        if became_stale:
+            self.get_logger().warn(
+                f"external target_wrench stream STALE "
+                f"(>{self._external_target_wrench_timeout:.2f}s on "
+                f"{self._external_target_wrench_topic!r}); "
+                f"reverting to parameter setpoint "
+                f"{self._target_wrench.tolist()}")
+        if external_fresh:
+            return  # per-message forward already published this tick
         msg = WrenchStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self._fzi_target_frame
-        # All wrench fields default to 0.0 (explicit for clarity).
-        msg.wrench.force.x = 0.0
-        msg.wrench.force.y = 0.0
-        msg.wrench.force.z = 0.0
-        msg.wrench.torque.x = 0.0
-        msg.wrench.torque.y = 0.0
-        msg.wrench.torque.z = 0.0
+        tw = self._target_wrench
+        msg.wrench.force.x = float(tw[0])
+        msg.wrench.force.y = float(tw[1])
+        msg.wrench.force.z = float(tw[2])
+        msg.wrench.torque.x = float(tw[3])
+        msg.wrench.torque.y = float(tw[4])
+        msg.wrench.torque.z = float(tw[5])
         for pub in self._pubs_target_wrench.values():
             pub.publish(msg)
 

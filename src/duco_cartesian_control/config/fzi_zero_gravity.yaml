@@ -20,6 +20,12 @@
 #   * pd_gains are deliberately conservative for first contact; tune
 #     them at runtime via the dashboard or
 #     ``ros2 param set /<controller_name> pd_gains.trans_x.p ...``.
+#   * Each pd_gains axis carries BOTH a ``p`` and a ``d`` term -- the
+#     D term damps the rate of change of the wrench error and is what
+#     prevents limit-cycle bouncing when the EE makes contact with a
+#     rigid surface under force control.  Rule of thumb on this arm:
+#     start at d ~= p / 40 for trans_*, d ~= p / 10 for rot_*; both
+#     can be live-tuned via ``ros2 param set /<ctl> pd_gains.<ax>.d``.
 #   * The compliance controller adds ``stiffness.*`` -- this is the
 #     impedance the arm projects on its environment when an external
 #     wrench is applied (units: N/m for trans_*, Nm/rad for rot_*).
@@ -51,12 +57,17 @@ cartesian_force_controller:
       iterations: 5
       publish_state_feedback: true
     pd_gains:
-      trans_x: {p: 2.0}
-      trans_y: {p: 2.0}
-      trans_z: {p: 2.0}
-      rot_x:   {p: 50.0}
-      rot_y:   {p: 50.0}
-      rot_z:   {p: 50.0}
+      # P alone is undamped against a rigid environment -- pure P force
+      # control + light virtual mass (solver.forward_dynamics.link_mass)
+      # is an oscillator.  The D term damps de/dt of the wrench error
+      # and is what kills the contact bounce.  See header comment for
+      # the d ~ p/40 (trans) / p/10 (rot) sizing rule used here.
+      trans_x: {p: 2.0,  d: 0.05}
+      trans_y: {p: 2.0,  d: 0.05}
+      trans_z: {p: 2.0,  d: 0.05}
+      rot_x:   {p: 50.0, d: 5.0}
+      rot_y:   {p: 50.0, d: 5.0}
+      rot_z:   {p: 50.0, d: 5.0}
 
 # --- Motion controller ---------------------------------------------------
 # Drives the end-effector toward target_frame (PoseStamped on
@@ -145,9 +156,11 @@ cartesian_compliance_controller:
       iterations: 5
       publish_state_feedback: true
     pd_gains:                # mirror force controller's working values
-      trans_x: {p: 2.0}
-      trans_y: {p: 2.0}
-      trans_z: {p: 2.0}
-      rot_x:   {p: 50.0}
-      rot_y:   {p: 50.0}
-      rot_z:   {p: 50.0}
+      # D mirrors the force controller so contact dynamics are damped
+      # the same way when the user switches modes mid-task.
+      trans_x: {p: 2.0,  d: 0.05}
+      trans_y: {p: 2.0,  d: 0.05}
+      trans_z: {p: 2.0,  d: 0.05}
+      rot_x:   {p: 50.0, d: 5.0}
+      rot_y:   {p: 50.0, d: 5.0}
+      rot_z:   {p: 50.0, d: 5.0}
