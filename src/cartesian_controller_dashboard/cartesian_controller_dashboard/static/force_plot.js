@@ -313,27 +313,43 @@
       const resp = await fetch(url, { cache: "no-store" });
       if (!resp.ok) throw new Error("HTTP " + resp.status);
       const data = await resp.json();
-      // Always update tNow from server clock so the x-axis right edge
-      // tracks reality even when frozen (we just won't append samples).
-      if (typeof data.now === "number") tNow = data.now;
+      // Server-reported publish rate is harmless to track every tick
+      // -- it only feeds the "alive" status pill, not the plot, so we
+      // want it to keep ticking even while frozen so the user can see
+      // the connection is still live.
       if (typeof data.hz === "number" || data.hz === null) {
         serverHz = (data.hz == null) ? NaN : data.hz;
       }
       const samples = data.samples || [];
-      if (samples.length && !frozen) {
-        for (const s of samples) {
-          pushSample(s[0], s[1], s[2], s[3], s[4], s[5], s[6]);
-        }
+      // Always advance the cursor: when frozen we still want the
+      // backend to stop replaying samples we've already declined to
+      // display, so unfreeze resumes cleanly with fresh data.
+      if (samples.length) {
         cursor = samples[samples.length - 1][0];
-        tLastReceived = tNow;
-      } else if (samples.length && frozen) {
-        // Even when frozen, advance the cursor so we don't replay the
-        // same samples again on unfreeze; they'll just be skipped.
-        cursor = samples[samples.length - 1][0];
-        tLastReceived = tNow;
       }
-      compact(false);
-      updateLegend();
+      if (!frozen) {
+        // Match ft_sensor_dashboard's freeze semantics: the visible
+        // window, sample buffer, and last-value legend all freeze
+        // together.  We only touch tNow / push / compact / updateLegend
+        // when we're actively rendering live data; otherwise the chart
+        // stays exactly where the user paused it.
+        if (typeof data.now === "number") tNow = data.now;
+        if (samples.length) {
+          for (const s of samples) {
+            pushSample(s[0], s[1], s[2], s[3], s[4], s[5], s[6]);
+          }
+          tLastReceived = tNow;
+        }
+        compact(false);
+        updateLegend();
+      } else if (samples.length && typeof data.now === "number") {
+        // Frozen, but data is still flowing on the backend -- record
+        // freshness so the status pill keeps reading "live" instead of
+        // flipping to "no data".  We deliberately do NOT advance tNow
+        // here, otherwise the frozen window would scroll rightward and
+        // the captured samples would slide off the left edge.
+        tLastReceived = data.now;
+      }
       updateStatusPill();
     } catch (_e) {
       // Network blips are normal on a busy ROS host; just retry.
