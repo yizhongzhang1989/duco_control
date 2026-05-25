@@ -136,19 +136,62 @@
   }
 
   // ---- Canvas helpers -------------------------------------------------
-  // Resize the canvas backing store to match its CSS box × devicePixelRatio
-  // so 1-pixel strokes stay crisp on hi-DPI displays.  Returns the DPR so
-  // the caller can scale paddings, line widths, font sizes, etc.
-  function fitCanvas(c) {
+  // The rAF render loop runs every frame (60 Hz typical), and calling
+  // ``getBoundingClientRect()`` inside rAF forces a synchronous layout
+  // flush.  During scroll the browser is already mutating layout at
+  // compositor rate, so per-frame layout reads + unconditional canvas
+  // resizes turn into the classic forced-synchronous-layout stall --
+  // exactly the symptom the user reported as "page freezes for 1-2 s
+  // when scrolling".  We avoid it by caching the CSS-pixel size of
+  // each canvas and only refreshing the backing store when a
+  // ResizeObserver tells us the box actually changed.  Inside drawPlot
+  // we now read from cached ``canvas.width`` / ``canvas.height`` -- no
+  // layout query, no allocation, no clear-on-resize.
+  const canvasSizes = new WeakMap();  // canvas -> { cssW, cssH }
+  function syncCanvasSize(c) {
     const dpr = window.devicePixelRatio || 1;
     const r = c.getBoundingClientRect();
-    c.width  = Math.max(1, Math.round(r.width  * dpr));
-    c.height = Math.max(1, Math.round(r.height * dpr));
-    return dpr;
+    const wCss = Math.max(1, r.width);
+    const hCss = Math.max(1, r.height);
+    const prev = canvasSizes.get(c);
+    if (prev && prev.cssW === wCss && prev.cssH === hCss
+        && prev.dpr === dpr) {
+      return;
+    }
+    canvasSizes.set(c, { cssW: wCss, cssH: hCss, dpr });
+    c.width  = Math.round(wCss * dpr);
+    c.height = Math.round(hCss * dpr);
+  }
+  // ResizeObserver fires off the layout/paint critical path, so reads
+  // here don't stall scroll.  Only thing we touch synchronously is the
+  // canvas backbuffer; ``draw()`` picks up the new dimensions on its
+  // next rAF tick.
+  const ro = new ResizeObserver(() => {
+    syncCanvasSize(cvForce);
+    syncCanvasSize(cvTorque);
+  });
+  ro.observe(cvForce);
+  ro.observe(cvTorque);
+  // Initial sync so the very first frame has correct dimensions.
+  syncCanvasSize(cvForce);
+  syncCanvasSize(cvTorque);
+  // devicePixelRatio can change when the window moves between displays
+  // of different scaling; refresh on that signal too.
+  if (window.matchMedia) {
+    const mq = window.matchMedia(
+      `(resolution: ${window.devicePixelRatio}dppx)`);
+    if (mq && typeof mq.addEventListener === "function") {
+      mq.addEventListener("change", () => {
+        syncCanvasSize(cvForce);
+        syncCanvasSize(cvTorque);
+      });
+    }
   }
 
   function drawPlot(c, channels) {
-    const dpr = fitCanvas(c);
+    // Use the cached dimensions; no getBoundingClientRect() in rAF.
+    const dpr = (canvasSizes.get(c) || {}).dpr
+                || (window.devicePixelRatio || 1);
     const ctx = c.getContext("2d");
     const W = c.width, H = c.height;
     ctx.fillStyle = "#0c0e13"; ctx.fillRect(0, 0, W, H);

@@ -149,13 +149,49 @@
   }
 
   // -------------------------- HiDPI sizing -------------------------------
-  function resize() {
-    const rect = canvas.getBoundingClientRect();
-    const dpr  = window.devicePixelRatio || 1;
-    const w = Math.max(64, Math.round(rect.width  * dpr));
-    const h = Math.max(64, Math.round(rect.height * dpr));
+  // Resizing logic runs OFF the rAF render loop.  Calling
+  // ``getBoundingClientRect()`` inside the per-frame draw() forces a
+  // synchronous layout flush; when the browser is also scrolling that
+  // pins the main thread for the duration of the layout pass and was
+  // visible as 1-2 s page freezes on scroll.  We now keep the
+  // backbuffer in sync via a ResizeObserver (which fires outside the
+  // critical layout/paint path) plus a one-shot media-query listener
+  // for devicePixelRatio changes (when the window moves between
+  // displays of different scaling).  draw() reads ``canvas.width`` /
+  // ``canvas.height`` directly -- no layout query.
+  let _cssW = 0, _cssH = 0, _cssDpr = 0;
+  function syncCanvas(cssW, cssH) {
+    const dpr = window.devicePixelRatio || 1;
+    if (cssW === _cssW && cssH === _cssH && dpr === _cssDpr) return;
+    _cssW = cssW; _cssH = cssH; _cssDpr = dpr;
+    const w = Math.max(64, Math.round(cssW * dpr));
+    const h = Math.max(64, Math.round(cssH * dpr));
     if (canvas.width !== w || canvas.height !== h) {
       canvas.width = w; canvas.height = h;
+    }
+  }
+  // One initial measurement is unavoidable (we need the size before
+  // the first frame).  After that, every update flows through the
+  // ResizeObserver.
+  {
+    const r = canvas.getBoundingClientRect();
+    syncCanvas(r.width, r.height);
+  }
+  const _canvasRO = new ResizeObserver((entries) => {
+    for (const e of entries) {
+      // ``contentRect`` is the post-layout CSS box; using it instead
+      // of getBoundingClientRect() avoids an extra reflow.
+      syncCanvas(e.contentRect.width, e.contentRect.height);
+    }
+  });
+  _canvasRO.observe(canvas);
+  // devicePixelRatio doesn't fire ``resize``; this is the standard
+  // recipe for detecting display-scale changes.
+  if (window.matchMedia) {
+    const _mq = window.matchMedia(
+      `(resolution: ${window.devicePixelRatio}dppx)`);
+    if (_mq && typeof _mq.addEventListener === "function") {
+      _mq.addEventListener("change", () => syncCanvas(_cssW, _cssH));
     }
   }
   // Drawing is driven by requestAnimationFrame (see renderLoop below),
@@ -163,7 +199,8 @@
   // call draw() themselves.  This keeps mouse interaction at the
   // browser's compositor rate (typically 60 Hz) and decouples render
   // smoothness from data-update frequency.
-  window.addEventListener("resize", resize);
+  // (No window resize listener needed -- the ResizeObserver above
+  // catches both window resizes and panel/layout reflows.)
 
   // -------------------------- arcball mapping ----------------------------
   // Map a canvas-space pixel to a unit vector on the arcball (in view
@@ -527,7 +564,8 @@
   }
 
   function draw() {
-    resize();
+    // No layout query here -- ResizeObserver keeps canvas.width /
+    // canvas.height in sync; reading them inside rAF is free.
     ctx.fillStyle = "#0b0e14";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
@@ -653,7 +691,6 @@
     requestAnimationFrame(renderLoop);
   }
 
-  resize();
   loadModel();
   startTfStream();
   requestAnimationFrame(renderLoop);
