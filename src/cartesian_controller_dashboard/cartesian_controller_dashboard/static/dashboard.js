@@ -359,7 +359,8 @@
   async function refresh() {
     try {
       snapshot = await api("/api/state");
-      $("controller-name").textContent = snapshot.controller_name || "--";
+      const nameEl = $("controller-name");
+      if (nameEl) nameEl.textContent = snapshot.controller_name || "--";
       $("param-target").textContent    = snapshot.controller_name || "--";
       const ctl = snapshot.control || {};
       const lim = ctl.limits || {};

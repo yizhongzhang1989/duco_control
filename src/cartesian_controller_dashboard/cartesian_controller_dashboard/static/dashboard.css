@@ -152,3 +152,51 @@
                         color: #8a93a6; font-weight: 400;
                         font-size: 0.85rem;
                         margin-left: -2px; }
+
+  /* Top-of-body row: 3D model on the left, FT plot on the right.
+     Both panels share the row 1:1 and fall to a single column on
+     narrow viewports via flex-wrap. */
+  .top-row { display: flex; gap: 12px; align-items: flex-start;
+             flex-wrap: wrap; margin-bottom: 12px; }
+  .top-row > .panel { flex: 1 1 480px; min-width: 0;
+                      margin-bottom: 0; }
+
+  /* Force / torque plot panel layout.  Two stacked canvas rows
+     (Force / Torque) each have a rotated y-axis label on the left
+     and a full-width canvas on the right.  The canvas is sized in
+     CSS pixels here; the JS layer multiplies by devicePixelRatio
+     when (re)sizing the backing store so the drawing stays crisp
+     on hi-DPI displays. */
+  #ft-plot-panel .ft-plot-controls {
+                       display: flex; gap: 12px; align-items: center;
+                       flex-wrap: wrap; margin-bottom: 4px; }
+  #ft-plot-panel .ft-plot-controls input[type=number] {
+                       width: 4em; background: #11141a; color: #e6e6e6;
+                       border: 1px solid #2b3140; border-radius: 4px;
+                       padding: 2px 4px; font-variant-numeric: tabular-nums; }
+  #ft-plot-panel .ft-plot-legend {
+                       display: inline-flex; gap: 14px; align-items: center; }
+  #ft-plot-panel .ft-plot-legend b {
+                       color: #f1f4fb; font-weight: 600;
+                       font-variant-numeric: tabular-nums;
+                       min-width: 4.5em; display: inline-block;
+                       text-align: right; }
+  #ft-plot-panel .swatch {
+                       display: inline-block; width: 10px; height: 10px;
+                       border-radius: 2px; margin-right: 4px;
+                       vertical-align: -1px; }
+  #ft-plot-panel .ft-plot-row {
+                       display: flex; align-items: stretch; gap: 6px;
+                       margin-top: 4px; }
+  #ft-plot-panel .ft-plot-label {
+                       /* Rotated y-axis label.  Fixed-width column so
+                          the canvases on Force / Torque rows line up
+                          horizontally even when their text differs. */
+                       writing-mode: vertical-rl;
+                       transform: rotate(180deg);
+                       text-align: center; flex: 0 0 14px;
+                       color: #8a93a6; padding: 4px 0; }
+  #ft-plot-panel canvas {
+                       flex: 1 1 auto; width: 100%; height: 180px;
+                       display: block; background: #0c0e13;
+                       border: 1px solid #2b3140; border-radius: 6px; }

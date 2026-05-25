@@ -40,7 +40,7 @@ from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import rclpy
 from geometry_msgs.msg import (PoseStamped, WrenchStamped)
@@ -436,6 +436,20 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             if path == "/api/live":
                 self._send_json(200, self._dashboard.api_state_live())
                 return
+            if path == "/api/wrench_samples":
+                # Optional ?since=<mono_sec> cursor.  Anything that
+                # doesn't parse as a float is treated as "no cursor"
+                # (which then returns up to max_window_s of history).
+                params = parse_qs(urlparse(self.path).query)
+                since: Optional[float] = None
+                if "since" in params and params["since"]:
+                    try:
+                        since = float(params["since"][0])
+                    except ValueError:
+                        since = None
+                self._send_json(
+                    200, self._dashboard.api_wrench_samples(since=since))
+                return
             if path == "/api/params":
                 self._send_json(200, self._dashboard.api_params())
                 return
@@ -610,6 +624,17 @@ class DashboardNode(Node):
         self._wrench_rate = _RateTracker(window_s=1.0, stale_after=1.0)
         self._js_rate     = _RateTracker(window_s=1.0, stale_after=1.0)
         self._tf_rate     = _RateTracker(window_s=1.0, stale_after=1.0)
+
+        # Wrench plot ring buffer.  Sized for ~30 s @ 300 Hz; the
+        # front-end's force/torque plot polls /api/wrench_samples with
+        # a ``since`` cursor and only fetches new tuples.  We store
+        # (mono_sec, fx, fy, fz, tx, ty, tz) so the client can lay out
+        # the x-axis in relative seconds without depending on a
+        # particular ROS clock domain.  Append happens on the spin
+        # thread under ``_lock``; reads happen on the HTTP thread,
+        # also under ``_lock``.
+        self._wrench_log: Deque[Tuple[float, float, float, float,
+                                       float, float, float]] = deque(maxlen=10000)
         # Cached TF stamp (nanoseconds) used by ``_tick_tf_rate`` to
         # detect *new* TF samples and bump ``_tf_rate``.  Polled at
         # 50 Hz, so the displayed TF rate is capped at ~50 Hz -- enough
@@ -769,17 +794,24 @@ class DashboardNode(Node):
         self._state_rate.tick()
 
     def _on_wrench(self, msg: WrenchStamped) -> None:
+        mono = time.monotonic()
+        fx = float(msg.wrench.force.x)
+        fy = float(msg.wrench.force.y)
+        fz = float(msg.wrench.force.z)
+        tx = float(msg.wrench.torque.x)
+        ty = float(msg.wrench.torque.y)
+        tz = float(msg.wrench.torque.z)
         with self._lock:
             self._wrench = {
-                "fx": float(msg.wrench.force.x),
-                "fy": float(msg.wrench.force.y),
-                "fz": float(msg.wrench.force.z),
-                "tx": float(msg.wrench.torque.x),
-                "ty": float(msg.wrench.torque.y),
-                "tz": float(msg.wrench.torque.z),
+                "fx": fx, "fy": fy, "fz": fz,
+                "tx": tx, "ty": ty, "tz": tz,
             }
-            self._wrench_mono = time.monotonic()
-        self._wrench_rate.tick()
+            self._wrench_mono = mono
+            # Append to the plot ring buffer.  The deque has maxlen
+            # so old samples are evicted automatically when the buffer
+            # is full -- no compaction needed.
+            self._wrench_log.append((mono, fx, fy, fz, tx, ty, tz))
+        self._wrench_rate.tick(mono)
 
     def _on_joint_states(self, msg: JointState) -> None:  # noqa: ARG002
         with self._lock:
@@ -1100,6 +1132,53 @@ class DashboardNode(Node):
 
     def api_state_live(self) -> Dict[str, Any]:
         return self._snapshot_live_locked()
+
+    def api_wrench_samples(self, since: Optional[float] = None,
+                           max_window_s: float = 30.0) -> Dict[str, Any]:
+        """Return wrench samples newer than ``since`` (monotonic).
+
+        The dashboard's force/torque plot polls this endpoint at
+        ~30 Hz with the timestamp of its last received sample as
+        ``since``; the backend returns only new tuples since then,
+        keeping the network payload proportional to the publish rate
+        rather than the entire history.  On the first poll (or after
+        a buffer flush) ``since`` is ``None`` and the response is
+        capped at ``max_window_s`` seconds of trailing history so the
+        client doesn't have to load a multi-megabyte JSON blob to
+        bootstrap.
+
+        The returned ``samples`` are a list of
+        ``[mono_sec, fx, fy, fz, tx, ty, tz]`` tuples (lists in JSON);
+        the client maintains its own typed-array buffer keyed off
+        ``mono_sec``.  ``now`` is the server's current monotonic time
+        so the client can sync its x-axis without round-trip drift.
+        """
+        now = time.monotonic()
+        with self._lock:
+            # Defensive copy; the deque is mutated on the spin thread
+            # but we're already holding ``_lock`` so the snapshot is
+            # consistent.  Cast to a list so we can JSON-encode without
+            # touching the deque again outside the lock.
+            buf = list(self._wrench_log)
+            hz = self._wrench_rate.hz()
+        if not buf:
+            return {"samples": [], "now": now, "hz": hz}
+        # Determine cutoff time for new samples.
+        if since is None:
+            cutoff = now - max_window_s
+        else:
+            cutoff = float(since)
+        # Linear walk from the *end* of the buffer (newest first)
+        # until we hit a sample <= cutoff.  Almost all polls land in
+        # the last few hundred samples, so this is effectively O(K)
+        # where K is the number of new samples since the last poll.
+        out: List[List[float]] = []
+        for t, fx, fy, fz, tx, ty, tz in reversed(buf):
+            if t <= cutoff:
+                break
+            out.append([t, fx, fy, fz, tx, ty, tz])
+        out.reverse()
+        return {"samples": out, "now": now, "hz": hz}
 
     def api_params(self) -> Dict[str, Any]:
         active = self._active_controller()
