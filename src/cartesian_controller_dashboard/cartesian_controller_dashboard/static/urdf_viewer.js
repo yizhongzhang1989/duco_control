@@ -25,12 +25,25 @@
   const axesCb    = document.getElementById("urdf-axes");
   const fitBtn    = document.getElementById("urdf-fit");
   const reloadBtn = document.getElementById("urdf-reload");
+  const jointsHost = document.getElementById("urdf-joints");
+  const floatingEl   = document.getElementById("urdf-floating");
+  const collapseBtn  = document.getElementById("urdf-collapse");
   const ctx       = canvas.getContext("2d");
+
+  // Per-joint color palette for the floating-panel bars (matches the
+  // 6-axis convention used by duco_dashboard: J1=blue, J2=green,
+  // J3=orange, J4=red, J5=purple, J6=cyan; extra axes cycle).
+  const JOINT_COLORS = [
+    "#42a5f5", "#66bb6a", "#ffa726",
+    "#ef5350", "#ab47bc", "#26c6da",
+  ];
 
   // ------------------------------ state ----------------------------------
   let model    = null;     // {root_link, links, joints}
   let livePose = {};       // link_name -> {t:[x,y,z], q:[x,y,z,w]} | null
   let lastTfMs = null;
+  let jointPositions = {}; // joint_name -> rad / m  (latest from SSE)
+  let jointRowEls = [];    // [{name, type, lower, upper, bar, val, ...}, ...]
 
   // Arcball camera: orientation stored as a quaternion (world -> view),
   // plus a target point (world coords) and a scalar distance.  View axes
@@ -261,10 +274,111 @@
       statusEl.textContent  = "loaded";
       statusEl.classList.add("active");
       overlay.textContent = "";
+      renderJointRows();
+      updateJointRows();
       fitView();
     } catch (e) {
       statusEl.textContent = "error";
       overlay.textContent = "fetch /api/urdf_model failed: " + e.message;
+    }
+  }
+
+  // ---- floating-panel joint rows ----------------------------------------
+  // One row per non-fixed joint (revolute, continuous, prismatic).  Each
+  // row has a centred bar that fills outward to the right (positive) or
+  // left (negative) of the joint's mid-range.  The numeric value is
+  // shown in degrees for rotary joints and metres for prismatic.
+  function renderJointRows() {
+    if (!jointsHost) return;
+    jointsHost.innerHTML = "";
+    jointRowEls = [];
+    if (!model || !Array.isArray(model.joints)) return;
+    let idx = 0;
+    for (const j of model.joints) {
+      // ``fixed`` and ``floating`` don't have a 1-D position to bar.
+      if (j.type === "fixed" || j.type === "floating") continue;
+      const color = JOINT_COLORS[idx % JOINT_COLORS.length];
+      const row = document.createElement("div");
+      row.className = "urdf-joint-row";
+      // Cache as raw HTML to keep DOM allocations to one createElement
+      // per joint; updateJointRows() only writes to the bar / val nodes.
+      row.innerHTML =
+        '<span class="urdf-joint-label" style="color:' + color + '">'
+        +   "J" + (idx + 1) + "</span>"
+        + '<div class="urdf-joint-bar-bg">'
+        +   '<div class="urdf-joint-center"></div>'
+        +   '<div class="urdf-joint-bar" style="background:' + color + '"></div>'
+        + "</div>"
+        + '<span class="urdf-joint-val">--</span>';
+      const lower = (typeof j.lower === "number") ? j.lower : null;
+      const upper = (typeof j.upper === "number") ? j.upper : null;
+      const hasLimits = lower !== null && upper !== null && upper > lower;
+      // Hover tooltip shows the joint name + URDF type + limit range.
+      let tip = j.name + " (" + j.type + ")";
+      if (hasLimits) {
+        if (j.type === "prismatic") {
+          tip += "\nlimits: [" + lower.toFixed(3)
+              + ", " + upper.toFixed(3) + "] m";
+        } else {
+          tip += "\nlimits: [" + (lower * 180 / Math.PI).toFixed(1)
+              + ", " + (upper * 180 / Math.PI).toFixed(1) + "] deg";
+        }
+      } else if (j.type === "continuous") {
+        tip += "\nno joint limit (continuous)";
+      } else {
+        tip += "\nno limits in URDF";
+      }
+      row.title = tip;
+      jointsHost.appendChild(row);
+      jointRowEls.push({
+        name:      j.name,
+        type:      j.type,
+        lower:     lower,
+        upper:     upper,
+        hasLimits: hasLimits,
+        bar:       row.querySelector(".urdf-joint-bar"),
+        val:       row.querySelector(".urdf-joint-val"),
+      });
+      idx++;
+    }
+  }
+
+  function updateJointRows() {
+    if (!jointRowEls.length) return;
+    for (const r of jointRowEls) {
+      const pos = jointPositions ? jointPositions[r.name] : undefined;
+      if (typeof pos !== "number" || !isFinite(pos)) {
+        r.val.textContent = "--";
+        r.bar.style.width = "0%";
+        continue;
+      }
+      // Display value.
+      if (r.type === "prismatic") {
+        r.val.textContent = pos.toFixed(3) + " m";
+      } else {
+        r.val.textContent = (pos * 180 / Math.PI).toFixed(1) + "\u00b0";
+      }
+      // Bar fraction in [-1, +1] relative to the joint's mid-range.
+      // Without a URDF limit (or for continuous joints) wrap the
+      // angle to [-pi, +pi] and use that as the bar range so the
+      // visualisation still does something useful.
+      let frac;
+      if (r.hasLimits) {
+        const mid = 0.5 * (r.lower + r.upper);
+        const half = 0.5 * (r.upper - r.lower);
+        frac = half > 0 ? (pos - mid) / half : 0;
+      } else {
+        let p = pos;
+        while (p >  Math.PI) p -= 2 * Math.PI;
+        while (p < -Math.PI) p += 2 * Math.PI;
+        frac = p / Math.PI;
+      }
+      if (frac > 1)  frac = 1;
+      if (frac < -1) frac = -1;
+      const pct = Math.abs(frac) * 50;
+      r.bar.style.width = pct + "%";
+      r.bar.className = "urdf-joint-bar "
+                      + (frac >= 0 ? "positive" : "negative");
     }
   }
 
@@ -284,6 +398,10 @@
         if (j && j.ok) {
           livePose = j.transforms || {};
           lastTfMs = performance.now();
+          if (j.joint_positions) {
+            jointPositions = j.joint_positions;
+            updateJointRows();
+          }
         }
       } catch (_) { /* ignore malformed frame */ }
     };
@@ -501,6 +619,31 @@
   // labels / axes toggles just flip state -- the rAF loop redraws.
   labelsCb.addEventListener("change", () => {});
   axesCb.addEventListener("change", () => {});
+
+  // Floating-panel collapse/expand.  When collapsed, .urdf-floating gets
+  // the .collapsed class which hides .urdf-floating-body via CSS; the
+  // panel shrinks to just its header strip so the 3D canvas can use the
+  // full panel area.  The chosen state survives page reloads via
+  // localStorage so it sticks across F5.
+  const COLLAPSE_KEY = "urdf-floating-collapsed";
+  function setCollapsed(collapsed) {
+    if (!floatingEl || !collapseBtn) return;
+    floatingEl.classList.toggle("collapsed", collapsed);
+    collapseBtn.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    collapseBtn.textContent = collapsed ? "+" : "\u2212";  // "-" minus sign
+    collapseBtn.title = collapsed ? "Expand panel" : "Collapse panel";
+    try { localStorage.setItem(COLLAPSE_KEY, collapsed ? "1" : "0"); }
+    catch (_) { /* private mode etc -- non-fatal */ }
+  }
+  if (collapseBtn) {
+    let initial = false;
+    try { initial = localStorage.getItem(COLLAPSE_KEY) === "1"; }
+    catch (_) { initial = false; }
+    setCollapsed(initial);
+    collapseBtn.addEventListener("click", () => {
+      setCollapsed(!floatingEl.classList.contains("collapsed"));
+    });
+  }
 
   // Continuous render loop, decoupled from data.  rAF is throttled
   // automatically when the tab is hidden so this is free in the

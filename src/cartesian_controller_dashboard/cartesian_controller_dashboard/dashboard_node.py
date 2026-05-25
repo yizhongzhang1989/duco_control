@@ -609,6 +609,12 @@ class DashboardNode(Node):
         self._wrench: Optional[Dict[str, float]] = None
         self._wrench_mono: Optional[float] = None
         self._js_mono: Optional[float] = None
+        # Latest joint positions, keyed by joint name (rad for
+        # revolute / continuous, metres for prismatic).  Updated on
+        # every /joint_states message and surfaced to the dashboard
+        # via the URDF SSE stream so the floating panel's per-joint
+        # bars stay in sync with the live robot pose.
+        self._joint_positions: Dict[str, float] = {}
 
         # Per-source publish-rate trackers.  All four integrate over a
         # 1 s window and recompute (and refresh the cached readout)
@@ -813,9 +819,18 @@ class DashboardNode(Node):
             self._wrench_log.append((mono, fx, fy, fz, tx, ty, tz))
         self._wrench_rate.tick(mono)
 
-    def _on_joint_states(self, msg: JointState) -> None:  # noqa: ARG002
+    def _on_joint_states(self, msg: JointState) -> None:
         with self._lock:
             self._js_mono = time.monotonic()
+            # Record the latest position of every named joint.  We
+            # merge into the existing dict rather than replacing it
+            # because some publishers (e.g. dual-arm setups) split
+            # joint_states across multiple topics / messages.
+            names = list(msg.name) if msg.name else []
+            positions = list(msg.position) if msg.position else []
+            for i, name in enumerate(names):
+                if i < len(positions):
+                    self._joint_positions[name] = float(positions[i])
         self._js_rate.tick()
 
     def _tick_tf_rate(self) -> None:
@@ -2039,6 +2054,9 @@ class DashboardNode(Node):
         """
         with self._lock:
             model = self._urdf_model
+            # Snapshot the joint positions while we hold the lock so
+            # the dict isn't mutated mid-iteration by ``_on_joint_states``.
+            joint_positions = dict(self._joint_positions)
         if model is None:
             return {
                 "ok":      False,
@@ -2065,9 +2083,10 @@ class DashboardNode(Node):
                 "q": [float(q.x), float(q.y), float(q.z), float(q.w)],
             }
         return {
-            "ok":         True,
-            "root_link":  root,
-            "transforms": out,
+            "ok":              True,
+            "root_link":       root,
+            "transforms":      out,
+            "joint_positions": joint_positions,
         }
 
     # ------------------------------------------------------------------
@@ -2255,6 +2274,29 @@ def _parse_urdf(xml_text: str) -> Optional[Dict[str, Any]]:
         axis = joint.find("axis")
         axis_xyz = _floats(axis.get("xyz") if axis is not None else None,
                            [1.0, 0.0, 0.0])
+        # <limit> is required by URDF spec for revolute / prismatic
+        # joints (optional for continuous / fixed / floating /
+        # planar).  We expose ``lower``/``upper`` so the dashboard
+        # can scale the per-joint position bars; ``effort``/``velocity``
+        # are forwarded for completeness even though the floating
+        # panel doesn't visualise them today.
+        lim_el = joint.find("limit")
+        lower: Optional[float] = None
+        upper: Optional[float] = None
+        effort: Optional[float] = None
+        velocity: Optional[float] = None
+        if lim_el is not None:
+            def _opt_float(s: Optional[str]) -> Optional[float]:
+                if s is None:
+                    return None
+                try:
+                    return float(s)
+                except ValueError:
+                    return None
+            lower = _opt_float(lim_el.get("lower"))
+            upper = _opt_float(lim_el.get("upper"))
+            effort = _opt_float(lim_el.get("effort"))
+            velocity = _opt_float(lim_el.get("velocity"))
         joints.append({
             "name":       jname,
             "type":       jtype,
@@ -2263,6 +2305,10 @@ def _parse_urdf(xml_text: str) -> Optional[Dict[str, Any]]:
             "origin_xyz": origin_xyz,
             "origin_rpy": origin_rpy,
             "axis_xyz":   axis_xyz,
+            "lower":      lower,
+            "upper":      upper,
+            "effort":     effort,
+            "velocity":   velocity,
         })
         parents[child] = parent
 
