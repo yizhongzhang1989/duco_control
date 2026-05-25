@@ -6,21 +6,82 @@
 <link rel="stylesheet" href="/static/dashboard.css">
 </head>
 <body>
+  <!-- ============================================================
+       Sticky top bar: condensed always-visible read-out of the
+       robot's state.  Layout is two rows that stay glued to the
+       top of the viewport while the rest of the dashboard scrolls
+       beneath it.
+
+       Row 1 (compact status + freshness pills): all rate
+       indicators live here so the operator has one place to glance
+       at "is everything flowing?".  Each rate pill shows publish
+       frequency in Hz (computed from inter-arrival intervals on
+       the backend); "no data" / "no tf" appears when a stream
+       stops.
+         engaged | trip | orch | ft | q | tf | conn
+       Row 2 (BIG, single line): TCP pose + wrench, vector format
+         XYZ (x, y, z) m  RPY (r, p, y) deg | F (fx, fy, fz) N
+         T (tx, ty, tz) Nm.  The base/tool frame names appear as a
+         tooltip when hovering the row (set by dashboard.js via
+         title=) so they don't compete for visual real estate.
+
+       Row 2 uses deliberately oversized typography so the
+       readout is legible from across the workshop.
+       ============================================================ -->
+  <header class="sticky-bar" id="sticky-bar">
+    <div class="sb-row sb-row-status">
+      <span id="engaged" class="status">--</span>
+      <span class="sb-sep"></span>
+      <span class="sb-label">trip</span>
+      <span id="trip" class="status">--</span>
+      <span class="sb-sep"></span>
+      <span class="sb-label">orch</span>
+      <span id="orch-status" class="status">--</span>
+      <span class="sb-label">ft</span>
+      <span id="ft-status" class="status">--</span>
+      <span class="sb-label">q</span>
+      <span id="q-status" class="status">--</span>
+      <span class="sb-label">tf</span>
+      <span id="tcp-status" class="status">--</span>
+      <span class="sb-spacer"></span>
+      <span id="conn" class="status">connecting...</span>
+    </div>
+    <div class="sb-row sb-row-data sb-tcp-wrench" id="sb-data-row">
+      <span class="sb-vec">
+        <span class="sb-vec-label">XYZ</span>
+        <span class="sb-vec-paren">(<span id="tcp-x" class="num">--</span>, <span id="tcp-y" class="num">--</span>, <span id="tcp-z" class="num">--</span>)</span>
+        <span class="sb-vec-unit">m</span>
+      </span>
+      <span class="sb-vec">
+        <span class="sb-vec-label">RPY</span>
+        <span class="sb-vec-paren">(<span id="tcp-r" class="num">--</span>, <span id="tcp-p" class="num">--</span>, <span id="tcp-yaw" class="num">--</span>)</span>
+        <span class="sb-vec-unit">deg</span>
+      </span>
+      <span class="sb-sep"></span>
+      <span class="sb-vec">
+        <span class="sb-vec-label">F</span>
+        <span class="sb-vec-paren">(<span id="wfx" class="num">--</span>, <span id="wfy" class="num">--</span>, <span id="wfz" class="num">--</span>)</span>
+        <span class="sb-vec-unit">N</span>
+      </span>
+      <span class="sb-vec">
+        <span class="sb-vec-label">T</span>
+        <span class="sb-vec-paren">(<span id="wmx" class="num">--</span>, <span id="wmy" class="num">--</span>, <span id="wmz" class="num">--</span>)</span>
+        <span class="sb-vec-unit">Nm</span>
+      </span>
+    </div>
+  </header>
+
   <h1>Cartesian controller dashboard</h1>
   <div class="sub">
     active controller <code id="controller-name">--</code>
-    &nbsp; orchestrator state <span id="orch-status" class="status">--</span>
-    &nbsp; <span id="conn" class="status">connecting...</span>
+    <span class="pill" id="active-kind-pill">kind: --</span>
   </div>
 
   <div class="panel">
     <div class="engage-bar">
-      <span id="engaged" class="status">--</span>
       <span class="small">controller:</span>
       <select id="sel-controller" title="select which FZI controller engage will activate"></select>
       <span class="pill" id="kind-pill">kind: --</span>
-      <span class="small">trip:</span>
-      <span id="trip" class="status">--</span>
       <button id="btn-engage"    type="button" class="big success">Engage</button>
       <button id="btn-disengage" type="button" class="big danger">Disengage</button>
     </div>
@@ -161,24 +222,6 @@
 
   <div class="row">
     <div class="col">
-      <div class="panel">
-        <h2>Live wrench (sensor frame)</h2>
-        <table>
-          <thead><tr><th></th><th>force [N]</th><th>torque [Nm]</th></tr></thead>
-          <tbody>
-            <tr><td>x</td><td class="num" id="wfx">--</td><td class="num" id="wmx">--</td></tr>
-            <tr><td>y</td><td class="num" id="wfy">--</td><td class="num" id="wmy">--</td></tr>
-            <tr><td>z</td><td class="num" id="wfz">--</td><td class="num" id="wmz">--</td></tr>
-          </tbody>
-        </table>
-        <div class="small" style="margin-top:8px;">
-          |F| <span id="fmag" class="status">-- N</span>
-          &nbsp; |T| <span id="tmag" class="status">-- Nm</span>
-          &nbsp; ft <span id="ft-status" class="status">--</span>
-          &nbsp; q <span id="q-status" class="status">--</span>
-        </div>
-      </div>
-
       <div class="panel">
         <h2>
           Safety thresholds (orchestrator)

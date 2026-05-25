@@ -1,8 +1,7 @@
   :root { color-scheme: light dark; }
   body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
          margin: 0; padding: 14px; background: #0f1115; color: #e6e6e6; }
-  h1 { margin: 0 0 4px; font-size: 1.05rem; font-weight: 600; }
-  h2 { margin: 14px 0 8px; font-size: 0.95rem; font-weight: 600; color: #cfd3dc; }
+  h1 { margin: 0 0 4px; font-size: 1.05rem; font-weight: 600; }  h2 { margin: 14px 0 8px; font-size: 0.95rem; font-weight: 600; color: #cfd3dc; }
   .sub { color: #8a93a6; font-size: 0.82rem; margin-bottom: 12px; }
   code { background: #11141a; padding: 1px 5px; border-radius: 3px; }
   .row { display: flex; gap: 16px; flex-wrap: wrap; }
@@ -87,3 +86,69 @@
   .cmd-help-kind.active { display: block; }
   button.warn { background: #b45309; }
   button.warn:hover { background: #92400e; }
+
+  /* ------------------------------------------------------------------
+     Sticky top bar.
+
+     Lives at the very top of <body>; pins to the viewport top while
+     the rest of the dashboard scrolls beneath it.  The bar bleeds
+     into the body's 14px padding via negative margins so it spans
+     the full width of the window.  Background is semi-opaque dark
+     indigo so it visually separates from the near-black body and
+     slate panels beneath.
+
+     Layout is two rows:
+       .sb-row-status: small status pills (engaged, trip, orch, ft, q, conn)
+       .sb-row-data:   BIG single-line TCP pose + wrench data, no
+                       group labels (axis shorthand is self-evident).
+                       Base/tool frame names live in the row's
+                       title= tooltip so they don't clutter the bar.
+     ------------------------------------------------------------------ */
+  .sticky-bar { position: sticky; top: 0; z-index: 100;
+                margin: -14px -14px 12px -14px;
+                padding: 8px 16px 10px;
+                background: rgba(28, 35, 56, 0.96);
+                backdrop-filter: saturate(140%) blur(6px);
+                -webkit-backdrop-filter: saturate(140%) blur(6px);
+                border-bottom: 1px solid #3a4368;
+                box-shadow: 0 4px 12px -8px #000; }
+  .sticky-bar .sb-row { display: flex; flex-wrap: wrap;
+                        gap: 8px 10px; align-items: center;
+                        font-variant-numeric: tabular-nums; }
+  .sticky-bar .sb-row-status { font-size: 0.82rem; line-height: 1.4; }
+  .sticky-bar .sb-row + .sb-row { margin-top: 6px;
+                                  padding-top: 6px;
+                                  border-top: 1px dashed #3a4368; }
+  .sticky-bar .sb-label { color: #aab3c8; font-size: 0.75rem; }
+  .sticky-bar .sb-sep { display: inline-block; width: 1px; height: 22px;
+                        background: #3a4368; }
+  .sticky-bar .sb-spacer { flex: 1 1 auto; }
+
+  /* --- BIG single-line data row (TCP pose + wrench) -------------------- */
+  /* Compact vector format:  LABEL (a, b, c)
+       XYZ (x, y, z)  RPY (r, p, y)  F (fx, fy, fz)  T (tx, ty, tz)
+     Units are not shown inline; hover the row to see them (set as
+     title= by dashboard.js).  Each .sb-vec group is laid out
+     inline-flex so the label, opening paren, numbers and closing
+     paren sit on one baseline. */
+  .sticky-bar .sb-row-data { font-size: 1.4rem; line-height: 1.2;
+                             gap: 10px 18px; }
+  .sticky-bar .sb-vec { display: inline-flex; align-items: baseline;
+                        gap: 8px;
+                        color: #cfd3dc;
+                        background: #1a2138;
+                        border: 1px solid #2e3756;
+                        border-radius: 6px;
+                        padding: 4px 12px; }
+  .sticky-bar .sb-vec-label {
+                        color: #aab3c8; font-weight: 600;
+                        letter-spacing: 0.04em;
+                        font-size: 1.05rem; }
+  .sticky-bar .sb-vec-paren {
+                        color: #f1f4fb; font-weight: 600;
+                        font-variant-numeric: tabular-nums; }
+  .sticky-bar .sb-vec-paren .num { color: #f1f4fb; }
+  .sticky-bar .sb-vec-unit {
+                        color: #8a93a6; font-weight: 400;
+                        font-size: 0.85rem;
+                        margin-left: -2px; }

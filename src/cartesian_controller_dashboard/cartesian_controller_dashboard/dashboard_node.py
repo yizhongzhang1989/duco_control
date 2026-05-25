@@ -35,10 +35,11 @@ import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
+from collections import deque
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import rclpy
@@ -88,6 +89,99 @@ try:
 except Exception as _exc:  # noqa: BLE001
     _update_aux_frames = None  # type: ignore
     _URDF_LOADER_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
+
+
+# ---------------------------------------------------------------------------
+# Time-windowed publish-rate estimator.
+#
+# Each subscriber callback (or TF sampler timer) calls ``tick()`` once per
+# message; ``hz()`` returns the rate computed over the last
+# ``window_s`` seconds of arrivals.  Using a *time* window (rather than
+# a fixed sample count) means the computed Hz itself is stable at
+# whatever the publisher's rate happens to be -- a 250 Hz wrench
+# integrates over ~250 samples, a 5 Hz orchestrator over ~5, but both
+# produce a once-per-second number that varies by at most a couple of
+# counts.
+#
+# ``hz()`` returns ``None`` when fewer than two samples are inside the
+# current window *or* the most recent arrival is older than
+# ``stale_after`` seconds (so the displayed Hz drops to "no data" as
+# soon as a publisher stops, instead of decaying through a long false
+# history).
+#
+# A short cache (``update_period``, default 1 s) keeps the value
+# returned to the HTTP poller constant within each integration window
+# even when /api/live is polled at 5 Hz: each poll reuses the last
+# computation instead of re-counting the deque.  The stale check runs
+# on every call regardless, so a stopped publisher still shows
+# "no data" within ``stale_after`` seconds.
+#
+# Reads are intentionally lock-free: the underlying ``deque`` is only
+# mutated on the rclpy spin thread, and ``hz()`` snapshots ``len`` +
+# endpoints atomically enough for a UI readout.
+# ---------------------------------------------------------------------------
+class _RateTracker:
+    __slots__ = ("_buf", "_window_s", "_stale_after", "_update_period",
+                 "_cached_hz", "_cached_mono")
+
+    def __init__(self, window_s: float = 1.0,
+                 stale_after: float = 1.0,
+                 update_period: float = 1.0) -> None:
+        self._buf: Deque[float] = deque()
+        self._window_s = float(window_s)
+        self._stale_after = float(stale_after)
+        self._update_period = float(update_period)
+        self._cached_hz: Optional[float] = None
+        self._cached_mono: Optional[float] = None
+
+    def tick(self, t: Optional[float] = None) -> None:
+        ts = time.monotonic() if t is None else t
+        buf = self._buf
+        buf.append(ts)
+        # Evict samples older than the integration window so the
+        # deque size stays bounded by the publish rate, not by
+        # uptime.
+        cutoff = ts - self._window_s
+        while buf and buf[0] < cutoff:
+            buf.popleft()
+
+    def hz(self) -> Optional[float]:
+        now = time.monotonic()
+        buf = self._buf
+        # Re-evict here too so a stopped publisher's old samples
+        # don't keep the rate artificially high until the next tick
+        # (and so the stale check below sees the most recent state).
+        cutoff = now - self._window_s
+        while buf and buf[0] < cutoff:
+            buf.popleft()
+        n = len(buf)
+        if n < 2:
+            return None
+        last = buf[-1]
+        if now - last > self._stale_after:
+            # Publisher stopped: invalidate the cache so the next
+            # ``tick()`` doesn't briefly resurrect an old value.
+            self._cached_hz = None
+            self._cached_mono = None
+            return None
+        # Return the cached value if recent enough.  This is what
+        # gives the sticky-bar pills a stable once-per-second
+        # readout -- the value changes only when a new integration
+        # is performed, not on every HTTP poll.
+        if (self._cached_hz is not None
+                and self._cached_mono is not None
+                and now - self._cached_mono < self._update_period):
+            return self._cached_hz
+        first = buf[0]
+        span = last - first
+        if span <= 0.0:
+            # Single instant: keep the previous reading rather than
+            # report a spurious infinity.
+            return self._cached_hz
+        val = (n - 1) / span
+        self._cached_hz = val
+        self._cached_mono = now
+        return val
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +595,27 @@ class DashboardNode(Node):
         self._wrench: Optional[Dict[str, float]] = None
         self._wrench_mono: Optional[float] = None
         self._js_mono: Optional[float] = None
+
+        # Per-source publish-rate trackers.  All four integrate over a
+        # 1 s window and recompute (and refresh the cached readout)
+        # at most once per second, so the sticky-bar Hz numbers are
+        # stable to within ±1 count regardless of underlying publish
+        # rate.  ``stale_after`` is per-source: the orchestrator is
+        # slow (~5 Hz), so a 5 s silence is still considered alive;
+        # wrench / joint_states / tf are fast (~250 Hz) and we treat
+        # >1 s gaps as a stopped publisher.  Reads are lock-free (the
+        # deques are only mutated on the rclpy spin thread, and
+        # ``hz()`` only inspects head + tail snapshots).
+        self._state_rate  = _RateTracker(window_s=1.0, stale_after=5.0)
+        self._wrench_rate = _RateTracker(window_s=1.0, stale_after=1.0)
+        self._js_rate     = _RateTracker(window_s=1.0, stale_after=1.0)
+        self._tf_rate     = _RateTracker(window_s=1.0, stale_after=1.0)
+        # Cached TF stamp (nanoseconds) used by ``_tick_tf_rate`` to
+        # detect *new* TF samples and bump ``_tf_rate``.  Polled at
+        # 50 Hz, so the displayed TF rate is capped at ~50 Hz -- enough
+        # to confirm "data flowing", not a precise measurement of the
+        # underlying publish rate.
+        self._last_tf_stamp_ns: Optional[int] = None
         # Cached URDF skeleton parsed from /robot_description.  The
         # 3D-model panel polls /api/urdf_model once on load (and on
         # request) to seed its renderer; live joint motion comes from
@@ -628,6 +743,13 @@ class DashboardNode(Node):
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
 
+        # Periodic TF-rate sampler.  tf2's C++ listener doesn't surface
+        # a per-message Python callback, so we instead poll the buffer
+        # at 50 Hz and count *new* stamps -- enough to confirm the TF
+        # tree is updating at controller rate.
+        self._tf_rate_timer = self.create_timer(
+            0.02, self._tick_tf_rate, callback_group=self._cbgroup)
+
         # ---- HTTP server ----------------------------------------------
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._http_thread: Optional[threading.Thread] = None
@@ -644,6 +766,7 @@ class DashboardNode(Node):
         with self._lock:
             self._control_state = payload
             self._control_state_mono = time.monotonic()
+        self._state_rate.tick()
 
     def _on_wrench(self, msg: WrenchStamped) -> None:
         with self._lock:
@@ -656,10 +779,37 @@ class DashboardNode(Node):
                 "tz": float(msg.wrench.torque.z),
             }
             self._wrench_mono = time.monotonic()
+        self._wrench_rate.tick()
 
     def _on_joint_states(self, msg: JointState) -> None:  # noqa: ARG002
         with self._lock:
             self._js_mono = time.monotonic()
+        self._js_rate.tick()
+
+    def _tick_tf_rate(self) -> None:
+        """50 Hz sampler that bumps ``_tf_rate`` on each new TF stamp.
+
+        ``tf2`` doesn't expose a per-message Python callback, so we
+        peek at the latest available ``base_frame -> tool_frame`` and
+        record a tick only when the stamp differs from the one seen
+        last cycle.  This caps the *displayed* TF rate at the timer's
+        50 Hz, which is plenty for a freshness indicator.
+        """
+        try:
+            t = self._tf_buffer.lookup_transform(
+                self._base_frame, self._tool_frame,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.0))
+        except TransformException:
+            return
+        stamp_ns = int(t.header.stamp.sec) * 1_000_000_000 \
+                 + int(t.header.stamp.nanosec)
+        if stamp_ns <= 0:
+            return  # static / unstamped TF -- no rate to compute
+        if self._last_tf_stamp_ns is None \
+           or stamp_ns != self._last_tf_stamp_ns:
+            self._last_tf_stamp_ns = stamp_ns
+            self._tf_rate.tick()
 
     def _on_urdf(self, msg: String) -> None:
         """Cache and parse the latched ``/robot_description`` payload.
@@ -1842,6 +1992,68 @@ class DashboardNode(Node):
         }
 
     # ------------------------------------------------------------------
+    def _try_lookup_tcp_pose(self) -> Optional[Dict[str, Any]]:
+        """Best-effort TF lookup of ``base_frame -> tool_frame`` for the
+        sticky-bar TCP-pose readout.  Returns ``None`` on any failure
+        (frame missing, no TF yet) instead of raising -- this is a
+        polled read, not a user action.
+
+        The returned dict contains the cartesian xyz, the quaternion,
+        roll/pitch/yaw expressed in degrees (ZYX-extrinsic convention,
+        same as ``tf2`` ``getRPY``), and an estimated age of the TF
+        sample (seconds since the TF stamp; may be ``None`` if the
+        stamp is zero / unavailable).
+        """
+        try:
+            t = self._tf_buffer.lookup_transform(
+                self._base_frame, self._tool_frame,
+                rclpy.time.Time(),  # latest available
+                timeout=rclpy.duration.Duration(seconds=0.0))
+        except TransformException:
+            return None
+        tr = t.transform.translation
+        q = t.transform.rotation
+        # RPY from quaternion (roll about X, pitch about Y, yaw about Z,
+        # extrinsic).  Pitch is clamped at +/- pi/2 in the singular case.
+        sinr_cosp = 2.0 * (q.w * q.x + q.y * q.z)
+        cosr_cosp = 1.0 - 2.0 * (q.x * q.x + q.y * q.y)
+        roll = math.atan2(sinr_cosp, cosr_cosp)
+        sinp = 2.0 * (q.w * q.y - q.z * q.x)
+        if abs(sinp) >= 1.0:
+            pitch = math.copysign(math.pi / 2.0, sinp)
+        else:
+            pitch = math.asin(sinp)
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+        # Age of the TF sample: now - stamp.  Stamp of zero means
+        # "static" (or no stamp); report ``None`` then.
+        age: Optional[float] = None
+        try:
+            stamp_sec = (int(t.header.stamp.sec)
+                         + int(t.header.stamp.nanosec) * 1e-9)
+            if stamp_sec > 0.0:
+                now_sec = self.get_clock().now().nanoseconds * 1e-9
+                age = max(0.0, now_sec - stamp_sec)
+        except Exception:  # noqa: BLE001
+            age = None
+        return {
+            "frame_id":       t.header.frame_id,
+            "child_frame_id": t.child_frame_id,
+            "x":              float(tr.x),
+            "y":              float(tr.y),
+            "z":              float(tr.z),
+            "qx":             float(q.x),
+            "qy":             float(q.y),
+            "qz":             float(q.z),
+            "qw":             float(q.w),
+            "roll_deg":       math.degrees(roll),
+            "pitch_deg":      math.degrees(pitch),
+            "yaw_deg":        math.degrees(yaw),
+            "age":            age,
+        }
+
+    # ------------------------------------------------------------------
     def _snapshot_live_locked(self) -> Dict[str, Any]:
         with self._lock:
             now = time.monotonic()
@@ -1865,13 +2077,26 @@ class DashboardNode(Node):
                      and wrench.get("age", 99.0) <= 1.0)
             joint_states_ok = (js_age is not None and js_age <= 1.0)
 
+        # TF lookup is independent of the local cache lock -- tf2's
+        # Buffer is thread-safe and this is a cheap latest-time read.
+        tcp = self._try_lookup_tcp_pose()
+        if tcp is not None:
+            tcp["hz"] = self._tf_rate.hz()
+        if wrench is not None:
+            wrench["hz"] = self._wrench_rate.hz()
+
         return {
             "control":            ctl,
             "control_state_age":  ctl_age,
+            "control_state_hz":   self._state_rate.hz(),
             "wrench":             wrench,
             "joint_states_age":   js_age,
+            "joint_states_hz":    self._js_rate.hz(),
             "ft_ok":              ft_ok,
             "joint_states_ok":    joint_states_ok,
+            "tcp":                tcp,
+            "base_frame":         self._base_frame,
+            "tool_frame":         self._tool_frame,
         }
 
 

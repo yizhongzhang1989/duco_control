@@ -2,6 +2,15 @@
   const $  = (id) => document.getElementById(id);
   const fmt = (v, d) => (v == null || isNaN(v)) ? "--" : Number(v).toFixed(d ?? 2);
   const fmtAge = (a) => a == null ? "--" : (a < 1 ? (a*1000).toFixed(0) + " ms" : a.toFixed(2) + " s");
+  // Publish-rate formatter for the sticky-bar freshness pills.  The
+  // backend ships ``..._hz`` fields next to ``..._age``; we display
+  // the Hz directly.  Sub-10 Hz gets one decimal so a 5 Hz
+  // orchestrator feed doesn't show "5 Hz" when it's actually 4.7 Hz;
+  // higher rates round to an integer to avoid jitter in the readout.
+  const fmtHz = (hz) =>
+    (hz == null || !isFinite(hz) || hz <= 0)
+      ? "--"
+      : (hz < 10 ? hz.toFixed(1) : Math.round(hz).toString()) + " Hz";
 
   let snapshot = null;
 
@@ -73,6 +82,13 @@
     const entry = avail.find((c) => c.name === chosen);
     const kind = entry ? entry.kind : "--";
     $("kind-pill").textContent = "kind: " + kind;
+    // Sticky-bar pill: always reflects the *active* controller's kind
+    // (independent of dropdown selection).  When the dropdown happens
+    // to track the active controller, these two pills agree.
+    const activeEntry = avail.find((c) => c.name === ctl.active_controller);
+    const activeKind = activeEntry ? activeEntry.kind : "--";
+    const activePill = $("active-kind-pill");
+    if (activePill) activePill.textContent = "kind: " + activeKind;
     setCommandPanel(kind, !!ctl.engaged);
   }
 
@@ -107,14 +123,20 @@
     if (snapBtn) snapBtn.disabled = dis;
   }
 
-  function setStaleness(elId, ok, age) {
+  // Render a publish-rate pill.  ``hz`` is the backend's measured
+  // rate (sliding-window Hz); ``age`` is only used to decide whether
+  // the stream is OK / bad according to the source's freshness
+  // threshold -- when ``hz`` is null we fall back to displaying
+  // "no data" instead of an inverted age, because for high publish
+  // rates 1/age is too jittery to be useful.
+  function setRatePill(elId, ok, hz) {
     const el = $(elId);
     el.classList.remove("ok", "bad", "warn");
-    if (age == null) {
+    if (hz == null) {
       el.textContent = "no data";
       el.classList.add("warn");
     } else {
-      el.textContent = fmtAge(age);
+      el.textContent = fmtHz(hz);
       el.classList.add(ok ? "ok" : "bad");
     }
   }
@@ -122,17 +144,81 @@
   function setOrchPill(s) {
     const el = $("orch-status");
     el.classList.remove("ok", "bad", "warn");
-    if (!s || !s.control_state_age || s.control_state_age == null) {
+    if (!s || s.control_state_age == null) {
       el.textContent = "no orchestrator";
       el.classList.add("bad");
       return;
     }
-    if (s.control_state_age > 5.0) {
-      el.textContent = "stale (" + fmtAge(s.control_state_age) + ")";
-      el.classList.add("warn");
-    } else {
-      el.textContent = "live (" + fmtAge(s.control_state_age) + ")";
-      el.classList.add("ok");
+    const alive = s.control_state_age <= 5.0;
+    const hz = s.control_state_hz;
+    if (hz == null) {
+      // Fresh enough that age <= 5s but rate tracker doesn't have
+      // two samples yet (e.g. just-started orchestrator): say
+      // "live" rather than "no data" so the operator isn't alarmed.
+      el.textContent = alive ? "live" : "stale";
+      el.classList.add(alive ? "ok" : "warn");
+      return;
+    }
+    el.textContent = fmtHz(hz);
+    el.classList.add(alive ? "ok" : "warn");
+  }
+
+  // Sticky-bar TCP-pose readout.  Values come from /api/live's
+  // ``tcp`` field, which the backend fills via tf2 (base_frame ->
+  // tool_frame).  When the lookup fails (no /tf yet or stale TF)
+  // the field is null; we show "--" in the TCP cells and a "no tf"
+  // pill so failure is obvious without dimming half of the shared
+  // data row (the wrench cells are unaffected).  The base/tool
+  // frame names live in the row's title= tooltip so the operator
+  // can hover to confirm what frame the pose is expressed in.
+  //
+  // The TF pill lives in the row-1 status strip and shows publish
+  // rate in Hz (capped at the backend's 50 Hz sampler), or "static"
+  // for a static/unstamped TF, or "no tf" when the lookup fails.
+  function setTcpPose(s) {
+    const row = $("sb-data-row");
+    const tcp = s && s.tcp;
+    const base = (s && s.base_frame) || "?";
+    const tool = (s && s.tool_frame) || "?";
+    if (row) row.title =
+        "XYZ / RPY in " + base + " \u2192 " + tool + "\n"
+      + "F / T in sensor frame";
+    const statusPill = $("tcp-status");
+    if (!tcp) {
+      $("tcp-x").textContent  = "--";
+      $("tcp-y").textContent  = "--";
+      $("tcp-z").textContent  = "--";
+      $("tcp-r").textContent  = "--";
+      $("tcp-p").textContent  = "--";
+      $("tcp-yaw").textContent = "--";
+      if (statusPill) {
+        statusPill.textContent = "no tf";
+        statusPill.classList.remove("ok", "warn");
+        statusPill.classList.add("bad");
+      }
+      return;
+    }
+    $("tcp-x").textContent  = fmt(tcp.x, 4);
+    $("tcp-y").textContent  = fmt(tcp.y, 4);
+    $("tcp-z").textContent  = fmt(tcp.z, 4);
+    $("tcp-r").textContent  = fmt(tcp.roll_deg, 1);
+    $("tcp-p").textContent  = fmt(tcp.pitch_deg, 1);
+    $("tcp-yaw").textContent = fmt(tcp.yaw_deg, 1);
+    if (statusPill) {
+      statusPill.classList.remove("ok", "warn", "bad");
+      if (tcp.age == null) {
+        // Static / unstamped transform -- no rate to compute.
+        statusPill.textContent = "static";
+        statusPill.classList.add("ok");
+      } else if (tcp.hz != null) {
+        statusPill.textContent = fmtHz(tcp.hz);
+        statusPill.classList.add(tcp.age > 1.0 ? "warn" : "ok");
+      } else {
+        // Have a stamped TF but the rate tracker doesn't have two
+        // samples yet (just started).
+        statusPill.textContent = tcp.age > 1.0 ? "stale" : "live";
+        statusPill.classList.add(tcp.age > 1.0 ? "warn" : "ok");
+      }
     }
   }
 
@@ -142,6 +228,7 @@
     setEngagedPill(ctl);
     setControllerSelect(ctl);
     setOrchPill(s);
+    setTcpPose(s);
 
     const w = s.wrench;
     $("wfx").textContent = w ? fmt(w.fx) : "--";
@@ -150,18 +237,24 @@
     $("wmx").textContent = w ? fmt(w.tx, 3) : "--";
     $("wmy").textContent = w ? fmt(w.ty, 3) : "--";
     $("wmz").textContent = w ? fmt(w.tz, 3) : "--";
-    if (w) {
-      const fm = Math.hypot(w.fx, w.fy, w.fz);
-      const tm = Math.hypot(w.tx, w.ty, w.tz);
-      $("fmag").textContent = fmt(fm) + " N";
-      $("tmag").textContent = fmt(tm, 3) + " Nm";
-    } else {
-      $("fmag").textContent = "-- N";
-      $("tmag").textContent = "-- Nm";
+    // Force / torque magnitudes are no longer shown in the sticky
+    // bar (compact "XYZ RPY F T" format); keep guarded writes for
+    // any external consumer that may still inject those elements.
+    const fmagEl = $("fmag"), tmagEl = $("tmag");
+    if (fmagEl || tmagEl) {
+      if (w) {
+        const fm = Math.hypot(w.fx, w.fy, w.fz);
+        const tm = Math.hypot(w.tx, w.ty, w.tz);
+        if (fmagEl) fmagEl.textContent = fmt(fm) + " N";
+        if (tmagEl) tmagEl.textContent = fmt(tm, 3) + " Nm";
+      } else {
+        if (fmagEl) fmagEl.textContent = "-- N";
+        if (tmagEl) tmagEl.textContent = "-- Nm";
+      }
     }
 
-    setStaleness("ft-status", !!s.ft_ok, w ? w.age : null);
-    setStaleness("q-status",  !!s.joint_states_ok, s.joint_states_age);
+    setRatePill("ft-status", !!s.ft_ok, w ? w.hz : null);
+    setRatePill("q-status",  !!s.joint_states_ok, s.joint_states_hz);
 
     $("conn").textContent = "live";
     $("conn").classList.remove("warn", "bad");
