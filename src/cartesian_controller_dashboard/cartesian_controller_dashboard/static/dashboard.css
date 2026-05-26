@@ -117,6 +117,151 @@
   button.warn:hover { background: #92400e; }
 
   /* ------------------------------------------------------------------
+     Merged controller panel (engage / commands / parameters).
+
+     Sub-sections are separated by a subtle top border + spacing so
+     the merged panel still reads as three logically distinct blocks
+     without paying for the visual cost (and screen real estate) of
+     three separate .panel boxes.  Section titles use h3 weight so
+     they sit visually *below* the h2 panel titles used elsewhere.
+     ------------------------------------------------------------------ */
+  #ctrl-panel .ctrl-section + .ctrl-section {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid #232730;
+  }
+  #ctrl-panel .ctrl-section-title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    margin: 0 0 8px 0;
+    color: #d8dbe2;
+  }
+  #ctrl-panel .ctrl-section-title .pill {
+    font-weight: 400;
+    vertical-align: 2px;
+  }
+
+  /* ------------------------------------------------------------------
+     Target-wrench publish-enable toggle.
+
+     Sits above the slider widget; controls the orchestrator's master
+     ``publish_target_wrench`` parameter so the operator can hand off
+     the FZI controllers' ``target_wrench`` topics to an external
+     publisher (teleop, scripts, RViz marker) without contention.
+
+     Color reflects current state:
+       data-enabled="true"  -> green (orchestrator driving)
+       data-enabled="false" -> red   (silent, external owns it)
+       data-enabled="?"     -> grey  (unknown / not yet fetched)
+     ------------------------------------------------------------------ */
+  .tw-publish-bar {
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    margin: 10px 0 4px 0;
+    padding: 8px 10px;
+    background: #11141a;
+    border: 1px solid #232730;
+    border-radius: 6px;
+  }
+  #btn-tw-publish-toggle[data-enabled="true"]  { background: #15803d; }
+  #btn-tw-publish-toggle[data-enabled="true"]:hover  { background: #166534; }
+  #btn-tw-publish-toggle[data-enabled="false"] { background: #b91c1c; }
+  #btn-tw-publish-toggle[data-enabled="false"]:hover { background: #991b1b; }
+  #btn-tw-publish-toggle[data-enabled="?"] { background: #2b3140; }
+  #btn-tw-publish-toggle[data-enabled="?"]:hover { background: #3a4150; }
+  #tw-publish-hint { flex: 1 1 220px; min-width: 0; }
+
+  /* ------------------------------------------------------------------
+     Target-wrench sliders (force-controller commands).
+
+     Six rows, one per axis (Fx/y/z, Tx/y/z).  Each row is a CSS grid
+     with five tracks:
+       [label] [slider, flex] [number] [unit] [zero-btn]
+     The slider expands to take whatever width remains so dragging
+     gives a meaningful resolution even in the narrow half-width col.
+     Sliders pick up a ``.suppressed`` modifier (added by the JS when
+     ``publish_target_wrench`` is OFF) to hint that the values are
+     stored on the orchestrator but the heartbeat is muted.
+     ------------------------------------------------------------------ */
+  .wrench-sliders {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .wrench-row {
+    display: grid;
+    grid-template-columns: 2.3em minmax(0, 1fr) 5.5em 1.7em 1.8em;
+    gap: 8px;
+    align-items: center;
+  }
+  .wrench-row .wrench-label {
+    color: #cfd3dc;
+    font-size: 0.85rem;
+    font-weight: 600;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  .wrench-row input.wrench-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 4px;
+    background: #2b3140;
+    border-radius: 2px;
+    outline: none;
+    margin: 0;
+  }
+  .wrench-row input.wrench-slider::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: #2563eb; cursor: pointer; border: 0;
+  }
+  .wrench-row input.wrench-slider::-moz-range-thumb {
+    width: 14px; height: 14px; border-radius: 50%;
+    background: #2563eb; cursor: pointer; border: 0;
+  }
+  .wrench-row input.wrench-slider:focus::-webkit-slider-thumb {
+    box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.4);
+  }
+  .wrench-row input.wrench-num {
+    width: 100%;
+    text-align: right;
+  }
+  /* Strip native spinner chrome from the wrench numeric input so the
+     visible field width is the actual cell budget (otherwise the
+     5.5em slot loses ~16px to the spinner buttons).  Editing is via
+     direct typing + scroll-wheel; the zero button covers the most
+     common shortcut. */
+  .wrench-row input.wrench-num::-webkit-outer-spin-button,
+  .wrench-row input.wrench-num::-webkit-inner-spin-button {
+    -webkit-appearance: none; margin: 0;
+  }
+  .wrench-row input.wrench-num { -moz-appearance: textfield; }
+  .wrench-row .wrench-unit {
+    color: #8a93a6;
+    font-size: 0.78rem;
+  }
+  .wrench-row button.wrench-zero {
+    padding: 2px 0;
+    font-size: 0.78rem;
+    background: #2b3140;
+    width: 100%;
+  }
+  .wrench-row button.wrench-zero:hover { background: #3a4150; }
+  /* Highlight a slider whose value is non-zero so the operator can
+     see at a glance which axes are commanding force. */
+  .wrench-row.nonzero .wrench-label { color: #ffe6a8; }
+  .wrench-row.nonzero input.wrench-slider {
+    background: linear-gradient(to right, #2b3140, #b45309 50%, #2b3140);
+  }
+  /* When the orchestrator's publish_target_wrench is OFF the slider
+     values are stored in the orchestrator's parameters but the
+     heartbeat is muted; dim the whole widget so the operator notices
+     the disconnect at a glance.  Inputs stay enabled so values can be
+     pre-set before flipping the toggle back on. */
+  .wrench-sliders.suppressed { opacity: 0.55; }
+
+  /* ------------------------------------------------------------------
      Sticky top bar.
 
      Lives at the very top of <body>; pins to the viewport top while

@@ -389,6 +389,28 @@
       $("lim-ftstale").textContent = fmt(lim.ft_stale_after, 2);
       $("lim-qstale").textContent  = fmt(lim.joint_states_stale_after, 2);
       syncSafetyInputs(lim);
+      // Keep target-wrench slider bounds in sync with the orchestrator's
+      // safety limits -- if the operator raises max_wrench_force in the
+      // Safety thresholds panel, the slider range widens immediately.
+      if (typeof updateWrenchSliderBounds === "function" &&
+          lim.max_wrench_force != null && lim.max_wrench_torque != null) {
+        updateWrenchSliderBounds(
+          Number(lim.max_wrench_force), Number(lim.max_wrench_torque));
+      }
+      // Reflect the orchestrator's master publish-enable in the toggle
+      // button so an external ``ros2 param set`` doesn't leave the UI
+      // out of sync.  Skip while a click-driven POST is still in flight
+      // or just landed -- the orchestrator publishes state at ~5 Hz so
+      // there's a ~200 ms window where the stale value would otherwise
+      // snap the button back.  ``twPublishPendingUntil`` is set by the
+      // click handler; once it elapses we resume trusting the stream.
+      const pubEnabled = (s.control || {}).publish_target_wrench;
+      if (typeof pubEnabled === "boolean" &&
+          pubEnabled !== twPublishEnabled &&
+          performance.now() >= twPublishPendingUntil) {
+        twPublishEnabled = pubEnabled;
+        setTwPublishButtonUi(twPublishEnabled);
+      }
       applyLive(s);
     } catch (e) {
       $("conn").textContent = "offline";
@@ -902,12 +924,409 @@
   $("btn-deadband-reset").addEventListener("click", resetDeadbandEdits);
   $("btn-deadband-reload").addEventListener("click", loadWrenchDeadband);
 
+  // ---- Target-wrench slider editor (force-controller commands) ----------
+  // Six rows (Fx/y/z, Tx/y/z); each row = slider + numeric input + zero
+  // button.  The orchestrator owns the canonical setpoint via six
+  //   target_wrench_force_x/y/z, target_wrench_torque_x/y/z
+  // parameters which it republishes on every FZI controller's
+  // ``target_wrench`` topic at the configured heartbeat rate.  Our
+  // POST /api/target_wrench forwards a SetParameters call; the
+  // orchestrator validates |value| <= max_wrench_{force,torque} and
+  // surfaces a rejection reason verbatim.
+  //
+  // POSTs are throttled to ~10 Hz during drag (trailing-edge) so we
+  // don't swamp the SetParameters service while the user is sliding.
+  // On final release (`change` event), on number-input commit, and on
+  // zero-button presses the latest value is force-flushed.
+  const TW_AXES = [
+    { name: "target_wrench_force_x",  label: "Fx", kind: "force"  },
+    { name: "target_wrench_force_y",  label: "Fy", kind: "force"  },
+    { name: "target_wrench_force_z",  label: "Fz", kind: "force"  },
+    { name: "target_wrench_torque_x", label: "Tx", kind: "torque" },
+    { name: "target_wrench_torque_y", label: "Ty", kind: "torque" },
+    { name: "target_wrench_torque_z", label: "Tz", kind: "torque" },
+  ];
+  // Defaults used until /api/target_wrench reports the orchestrator's
+  // limits.  Slider visible range = ±max; number input accepts any
+  // value (orchestrator enforces the hard limit at SetParameters).
+  let twMaxForce  = 50.0;
+  let twMaxTorque = 5.0;
+  // Cached values (axis name -> float) for dirty-tracking and Zero-all.
+  const twValues = Object.fromEntries(TW_AXES.map((a) => [a.name, 0.0]));
+  let twUserEditing = false;   // suppress poll-driven UI clobber while
+                               // the user is actively dragging / typing
+  let twEditingTimer = null;
+
+  function twBeginUserEdit() {
+    twUserEditing = true;
+    clearTimeout(twEditingTimer);
+    twEditingTimer = setTimeout(() => { twUserEditing = false; }, 600);
+  }
+
+  function renderWrenchSliders() {
+    const host = $("wrench-sliders");
+    if (!host || host.dataset.rendered === "1") return;
+    host.innerHTML = "";
+    for (const ax of TW_AXES) {
+      const max  = (ax.kind === "force") ? twMaxForce : twMaxTorque;
+      const step = (ax.kind === "force") ? 0.1 : 0.01;
+      const unit = (ax.kind === "force") ? "N"  : "Nm";
+      const row = document.createElement("div");
+      row.className = "wrench-row";
+      row.dataset.name = ax.name;
+      row.innerHTML =
+        `<label class="wrench-label" for="tw-slider-${ax.name}">${ax.label}</label>` +
+        `<input type="range" id="tw-slider-${ax.name}"` +
+        ` class="wrench-slider" data-name="${ax.name}"` +
+        ` min="${(-max).toFixed(3)}" max="${max.toFixed(3)}"` +
+        ` step="${step}" value="0">` +
+        `<input type="number" class="wrench-num"` +
+        ` data-name="${ax.name}" step="${step}" value="0">` +
+        `<span class="wrench-unit">${unit}</span>` +
+        `<button type="button" class="wrench-zero" data-name="${ax.name}"` +
+        ` title="set ${ax.label} to 0">0</button>`;
+      host.appendChild(row);
+    }
+    host.dataset.rendered = "1";
+
+    // Wire all rows.  We share these handlers across all six axes by
+    // pulling the axis name from the input's data-name attribute.
+    host.querySelectorAll("input.wrench-slider").forEach((inp) => {
+      inp.addEventListener("input", onSliderInput);
+      inp.addEventListener("change", onSliderChange);
+    });
+    host.querySelectorAll("input.wrench-num").forEach((inp) => {
+      inp.addEventListener("input", onNumberInput);
+      inp.addEventListener("change", onNumberCommit);
+      inp.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          onNumberCommit({ target: inp });
+          inp.blur();
+        }
+      });
+    });
+    host.querySelectorAll("button.wrench-zero").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        setAxisValue(btn.dataset.name, 0.0);
+        flushTargetWrench();
+      });
+    });
+  }
+
+  // Re-build the slider min/max if the safety limits changed.  Called
+  // after the initial GET and whenever max_wrench_force /
+  // max_wrench_torque updates noticeably in the live feed.  We keep
+  // the current values when re-bounding, clamping if they now fall
+  // outside the new range (the orchestrator would reject them too).
+  function updateWrenchSliderBounds(maxF, maxT) {
+    if (!isFinite(maxF) || maxF <= 0) return;
+    if (!isFinite(maxT) || maxT <= 0) return;
+    if (Math.abs(maxF - twMaxForce) < 1e-6 &&
+        Math.abs(maxT - twMaxTorque) < 1e-6) return;
+    twMaxForce  = maxF;
+    twMaxTorque = maxT;
+    for (const ax of TW_AXES) {
+      const slider = document.getElementById("tw-slider-" + ax.name);
+      if (!slider) continue;
+      const max = (ax.kind === "force") ? twMaxForce : twMaxTorque;
+      slider.min = (-max).toFixed(3);
+      slider.max = max.toFixed(3);
+      // Clamp current value to the new range for the slider thumb
+      // position only; the canonical value lives in twValues and is
+      // displayed in the number input (so an over-limit value can
+      // still be visible to the operator).
+      const v = twValues[ax.name];
+      slider.value = Math.max(-max, Math.min(max, v)).toString();
+    }
+  }
+
+  function setAxisValue(name, value) {
+    if (!(name in twValues)) return;
+    const v = isFinite(value) ? value : 0.0;
+    twValues[name] = v;
+    const slider = document.getElementById("tw-slider-" + name);
+    const num    = document.querySelector(
+      `#wrench-sliders input.wrench-num[data-name="${name}"]`);
+    if (slider) {
+      const max = (TW_AXES.find((a) => a.name === name).kind === "force")
+                  ? twMaxForce : twMaxTorque;
+      slider.value = Math.max(-max, Math.min(max, v)).toString();
+    }
+    if (num && document.activeElement !== num) {
+      // Display with appropriate precision; force = 0.1 N, torque = 0.01 Nm.
+      const kind = TW_AXES.find((a) => a.name === name).kind;
+      num.value = (kind === "force") ? v.toFixed(2) : v.toFixed(3);
+    }
+    const row = document.querySelector(
+      `#wrench-sliders .wrench-row[data-name="${name}"]`);
+    if (row) row.classList.toggle("nonzero", Math.abs(v) > 1e-6);
+  }
+
+  function onSliderInput(ev) {
+    const name = ev.target.dataset.name;
+    const v = parseFloat(ev.target.value);
+    if (!isFinite(v)) return;
+    twBeginUserEdit();
+    twValues[name] = v;
+    // Sync the number input live so the operator sees the same value.
+    const num = document.querySelector(
+      `#wrench-sliders input.wrench-num[data-name="${name}"]`);
+    if (num && document.activeElement !== num) {
+      const kind = TW_AXES.find((a) => a.name === name).kind;
+      num.value = (kind === "force") ? v.toFixed(2) : v.toFixed(3);
+    }
+    const row = document.querySelector(
+      `#wrench-sliders .wrench-row[data-name="${name}"]`);
+    if (row) row.classList.toggle("nonzero", Math.abs(v) > 1e-6);
+    scheduleTargetWrenchPost();
+  }
+  function onSliderChange() {
+    // Final release -- force-flush so the orchestrator sees the
+    // exact final value regardless of throttle phase.
+    flushTargetWrench();
+  }
+  function onNumberInput(ev) {
+    const name = ev.target.dataset.name;
+    const v = parseFloat(ev.target.value);
+    if (!isFinite(v)) return;
+    twBeginUserEdit();
+    twValues[name] = v;
+    // Keep the slider thumb tracking the typed value (clamped).
+    const slider = document.getElementById("tw-slider-" + name);
+    if (slider) {
+      const max = (TW_AXES.find((a) => a.name === name).kind === "force")
+                  ? twMaxForce : twMaxTorque;
+      slider.value = Math.max(-max, Math.min(max, v)).toString();
+    }
+    const row = document.querySelector(
+      `#wrench-sliders .wrench-row[data-name="${name}"]`);
+    if (row) row.classList.toggle("nonzero", Math.abs(v) > 1e-6);
+    // Don't post-on-every-keystroke -- wait for commit / Enter / blur.
+  }
+  function onNumberCommit(ev) {
+    const inp = ev.target;
+    const v = parseFloat(inp.value);
+    if (!isFinite(v)) {
+      // Reject NaN -- revert to cached value.
+      const cached = twValues[inp.dataset.name];
+      const kind = TW_AXES.find((a) => a.name === inp.dataset.name).kind;
+      inp.value = (kind === "force") ? cached.toFixed(2) : cached.toFixed(3);
+      return;
+    }
+    twValues[inp.dataset.name] = v;
+    flushTargetWrench();
+  }
+
+  // Throttled POST: at most one in-flight + at most one queued.  When
+  // a request lands while one is already pending, the latest values
+  // get sent on the next tick (trailing-edge).
+  let twPostInFlight = false;
+  let twPostPending  = false;
+  let twPostTimer    = null;
+  const TW_POST_PERIOD_MS = 100;   // ~10 Hz cap during slider drag
+
+  function scheduleTargetWrenchPost() {
+    if (twPostTimer) return;       // already coalescing
+    twPostTimer = setTimeout(() => {
+      twPostTimer = null;
+      flushTargetWrench();
+    }, TW_POST_PERIOD_MS);
+  }
+  async function flushTargetWrench() {
+    if (twPostInFlight) {
+      twPostPending = true;
+      return;
+    }
+    if (twPostTimer) { clearTimeout(twPostTimer); twPostTimer = null; }
+    twPostInFlight = true;
+    const body = { axes: TW_AXES.map((ax) => ({
+      name: ax.name, value: twValues[ax.name],
+    })) };
+    try {
+      const r = await api("/api/target_wrench", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const failed = (r.results || []).filter((x) => !x.successful);
+      const status = $("tw-status");
+      if (failed.length) {
+        if (status) {
+          status.textContent = "rejected: " + failed[0].name +
+            " -- " + (failed[0].reason || "(no reason)");
+          status.className = "pill";
+          status.style.borderColor = "#b91c1c";
+          status.style.color = "#ffb4b4";
+        }
+      } else {
+        if (status) {
+          const nonzero = TW_AXES.filter(
+            (a) => Math.abs(twValues[a.name]) > 1e-6).length;
+          status.textContent = nonzero ?
+            `${nonzero} axis(es) commanding` : "all zero";
+          status.className = "pill" + (nonzero ? " active" : "");
+          status.style.borderColor = "";
+          status.style.color = "";
+        }
+      }
+    } catch (e) {
+      const status = $("tw-status");
+      if (status) {
+        status.textContent = "post failed: " + e.message;
+        status.className = "pill";
+        status.style.borderColor = "#b91c1c";
+        status.style.color = "#ffb4b4";
+      }
+    } finally {
+      twPostInFlight = false;
+      if (twPostPending) {
+        twPostPending = false;
+        // Trailing-edge: send the most recent values.
+        scheduleTargetWrenchPost();
+      }
+    }
+  }
+
+  async function loadTargetWrench() {
+    // Skip the GET if the user is mid-drag / mid-typing so we don't
+    // clobber an in-progress edit with a stale orchestrator snapshot.
+    if (twUserEditing) return;
+    try {
+      const r = await api("/api/target_wrench");
+      // Update slider bounds first so subsequent setAxisValue calls
+      // can clamp against them.
+      if (r.max_wrench_force != null && r.max_wrench_torque != null) {
+        updateWrenchSliderBounds(
+          Number(r.max_wrench_force), Number(r.max_wrench_torque));
+      }
+      for (const ax of (r.axes || [])) {
+        if (ax.value == null) continue;
+        // Only update if the cached value differs noticeably; avoids
+        // re-rendering the number input on every poll (would steal the
+        // caret if the operator was typing).
+        if (Math.abs(twValues[ax.name] - ax.value) > 1e-6) {
+          setAxisValue(ax.name, ax.value);
+        }
+      }
+    } catch (e) {
+      // GET failures are silent -- the slider just keeps showing
+      // whatever values it had cached.  Toasting on every failed
+      // 5 s poll would be noisy.
+    }
+  }
+
+  $("btn-tw-zero-all").addEventListener("click", () => {
+    for (const ax of TW_AXES) setAxisValue(ax.name, 0.0);
+    flushTargetWrench();
+  });
+
+  // ---- Master publish-enable toggle for the orchestrator ----------------
+  // The orchestrator's ``publish_target_wrench`` bool parameter gates BOTH
+  // the heartbeat (parameter-based publishes) AND the external-topic
+  // forwarding.  Toggling OFF leaves every FZI controller's
+  // ``target_wrench`` topic silent so a third-party publisher (teleop,
+  // scripts, RViz marker) can drive them directly without contention.
+  //
+  // Button state is driven by ``tw-publish-toggle`` data-enabled attr,
+  // which is updated:
+  //   * from the live state stream (/api/live -> control.publish_target_wrench)
+  //     so an external `ros2 param set` is reflected in the UI;
+  //   * synchronously on click after a successful POST.
+  // Until the first state arrives the button is disabled (data-enabled="?",
+  // text "--") so the operator can't fire a click whose ``next`` value
+  // would be guessed.  Clicks while disabled are dropped.
+  let twPublishEnabled = null;
+  // After a successful click-driven POST, the orchestrator takes up to
+  // one state-publish period (~200 ms at 5 Hz) before its next state
+  // message carries the new value.  Without a lockout the next ``tick()``
+  // would read the stale value and snap the button back.  Set this to
+  // ``performance.now() + N ms`` to suppress stream-driven updates for
+  // N ms.  600 ms covers 3 state periods comfortably while still
+  // responding quickly to external ``ros2 param set`` calls.
+  let twPublishPendingUntil = 0;
+  let twPublishInFlight = false;
+  function setTwPublishButtonUi(enabled) {
+    const btn = $("btn-tw-publish-toggle");
+    if (!btn) return;
+    if (enabled === null || enabled === undefined) {
+      btn.dataset.enabled = "?";
+      btn.textContent = "--";
+      btn.disabled = true;
+      btn.title = "waiting for orchestrator state...";
+    } else if (enabled) {
+      btn.dataset.enabled = "true";
+      btn.textContent = "ON";
+      btn.disabled = twPublishInFlight;
+      btn.title = "click to STOP the orchestrator from publishing " +
+        "target_wrench (lets an external publisher drive FZI directly)";
+    } else {
+      btn.dataset.enabled = "false";
+      btn.textContent = "OFF";
+      btn.disabled = twPublishInFlight;
+      btn.title = "click to RESUME orchestrator target_wrench heartbeat";
+    }
+    const host = $("wrench-sliders");
+    if (host) host.classList.toggle("suppressed", enabled === false);
+  }
+  setTwPublishButtonUi(twPublishEnabled);
+
+  async function setTargetWrenchPublish(enabled) {
+    twPublishInFlight = true;
+    // Hold off the stream-driven update from the moment we start the
+    // POST until ~600 ms after it lands; otherwise an in-flight tick()
+    // would clobber the optimistic UI back to the pre-click value.
+    twPublishPendingUntil = performance.now() + 600;
+    setTwPublishButtonUi(twPublishEnabled);  // refresh disabled state
+    try {
+      const r = await api("/api/target_wrench_publish", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: !!enabled }),
+      });
+      if (r.ok) {
+        twPublishEnabled = !!enabled;
+        twPublishPendingUntil = performance.now() + 600;
+        toast(
+          enabled
+            ? "orchestrator now publishing target_wrench"
+            : "orchestrator target_wrench MUTED -- external publisher owns FZI",
+          "ok");
+      } else {
+        toast("publish toggle rejected: " +
+          (r.reason || r.message || "(no reason)"), "bad");
+      }
+    } catch (e) {
+      toast("publish toggle failed: " + e.message, "bad");
+    } finally {
+      twPublishInFlight = false;
+      setTwPublishButtonUi(twPublishEnabled);
+    }
+  }
+  $("btn-tw-publish-toggle").addEventListener("click", () => {
+    // Refuse clicks before the first state arrives -- we'd be guessing
+    // the current value and could surprise the operator.
+    if (twPublishEnabled === null) {
+      toast("orchestrator state not yet available", "bad");
+      return;
+    }
+    if (twPublishInFlight) return;  // de-dup rapid clicks
+    setTargetWrenchPublish(!twPublishEnabled);
+  });
+
+  renderWrenchSliders();
+
   refresh().then(() => {
     loadWrenchDeadband();
+    loadTargetWrench();
     setInterval(tick, 200);
   });
   setInterval(refresh, 3000);
   // Re-poll the deadband once every 5 s in case it gets changed by an
   // external ``ros2 param set`` call.  Cheap (1 GetParameters round-trip).
   setInterval(loadWrenchDeadband, 5000);
+  // Re-poll the target_wrench every 5 s for the same reason (external
+  // ``ros2 param set`` would otherwise go un-displayed).  Skipped
+  // while the operator is actively dragging / typing.
+  setInterval(loadTargetWrench, 5000);
 })();

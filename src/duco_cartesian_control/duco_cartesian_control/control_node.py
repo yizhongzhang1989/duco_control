@@ -159,6 +159,17 @@ _PARAM_DECLARATIONS: List[Tuple[str, object]] = [
     # above takes over via the heartbeat.  Leave topic empty to disable.
     ("external_target_wrench_topic",        ""),
     ("external_target_wrench_timeout_sec",  0.2),
+    # master enable for the orchestrator's target_wrench output ------------
+    # When ``False`` the heartbeat AND the external-topic forwarding both
+    # become NO-OPs, so the FZI controllers' ``target_wrench`` topics are
+    # left silent for another publisher (a teleop script, RViz marker,
+    # custom skill node) to drive directly.  Live-tunable via parameter,
+    # so the dashboard's "Send target_wrench" toggle flips this without
+    # restarting the orchestrator.  Default is ``False`` -- on startup the
+    # orchestrator stays silent so an external publisher can own the
+    # ``target_wrench`` topics; the operator opts in to the heartbeat from
+    # the dashboard once they're ready.
+    ("publish_target_wrench",  False),
     # supervisor loop ------------------------------------------------------
     ("loop_rate_hz",            50.0),
     # state-publish loop ---------------------------------------------------
@@ -391,6 +402,9 @@ class CartesianControlNode(Node):
         self._external_target_wrench_timeout = float(
             gp("external_target_wrench_timeout_sec"))
 
+        # master enable for the orchestrator's target_wrench output -------
+        self._publish_target_wrench = bool(gp("publish_target_wrench"))
+
         self._loop_rate_hz = float(gp("loop_rate_hz"))
         self._state_publish_rate_hz = float(gp("state_publish_rate_hz"))
 
@@ -480,6 +494,15 @@ class CartesianControlNode(Node):
                 self.get_logger().info(
                     f"external_target_wrench_timeout_sec -> "
                     f"{self._external_target_wrench_timeout:.4f}")
+            elif p.name == "publish_target_wrench":
+                new_val = bool(p.value)
+                if new_val != self._publish_target_wrench:
+                    self._publish_target_wrench = new_val
+                    self.get_logger().info(
+                        f"publish_target_wrench -> {new_val} "
+                        f"("
+                        f"{'orchestrator now drives every FZI target_wrench topic' if new_val else 'orchestrator now SILENT on every FZI target_wrench topic; external publisher may drive them directly'}"
+                        f")")
         return SetParametersResult(successful=True)
 
     # ------------------------------------------------------------------
@@ -503,6 +526,11 @@ class CartesianControlNode(Node):
     def _on_external_target_wrench(self, msg: WrenchStamped) -> None:
         """Forward an externally-published setpoint to every consumer.
 
+        Suppressed entirely (NO-OP) while ``publish_target_wrench`` is
+        ``False`` -- in that mode the orchestrator stays silent on the
+        FZI controllers' ``target_wrench`` topics so another publisher
+        can drive them directly without contention.
+
         Called on every message from the high-frequency target topic
         (e.g. a 3D-mouse / SpaceMouse teleop publisher).  Each axis is
         clamped to the safety supervisor's ``max_wrench_*`` envelope so
@@ -515,6 +543,8 @@ class CartesianControlNode(Node):
         the parameter setpoint (:attr:`_target_wrench`) takes over via
         the heartbeat in :meth:`_publish_fzi_target_wrench`.
         """
+        if not self._publish_target_wrench:
+            return
         vec = np.array([
             msg.wrench.force.x,  msg.wrench.force.y,  msg.wrench.force.z,
             msg.wrench.torque.x, msg.wrench.torque.y, msg.wrench.torque.z,
@@ -692,8 +722,15 @@ class CartesianControlNode(Node):
         Tools that want to drive them around (teleop, scripts, RViz
         markers) should publish ``target_frame`` themselves; the
         orchestrator does not own the trajectory.
+
+        While ``publish_target_wrench`` is ``False`` this method is a
+        NO-OP -- the FZI controllers' ``target_wrench`` topics are left
+        silent for another publisher (teleop, scripts) to drive them
+        directly.
         """
         if not self._pubs_target_wrench:
+            return
+        if not self._publish_target_wrench:
             return
         now = time.monotonic()
         with self._lock:
@@ -904,6 +941,7 @@ class CartesianControlNode(Node):
                     "ft_stale_after":            self._ft_stale_after,
                     "joint_states_stale_after":  self._joint_states_stale_after,
                 },
+                "publish_target_wrench": self._publish_target_wrench,
             }
         msg = String()
         msg.data = json.dumps(payload, separators=(",", ":"))

@@ -244,6 +244,34 @@ _SAFETY_THRESHOLD_NAMES = {n for (n, _k, _u) in _SAFETY_THRESHOLDS}
 
 
 # ---------------------------------------------------------------------------
+# target_wrench setpoint editable from the dashboard (force-controller UI).
+#
+# These six parameters live on the ``/duco_cartesian_control`` node (see
+# :class:`duco_cartesian_control.control_node.CartesianControlNode`) --
+# the orchestrator publishes them at a configurable heartbeat rate to
+# every FZI controller's ``/<ctrl>/target_wrench`` topic.  With all six
+# set to 0 the force controller gives pure free-drive (hand-guidance);
+# non-zero values let the operator command a constant wrench on top of
+# the FT-sensor feedback (push the arm in a chosen direction).
+#
+# Each entry is ``(param_name, axis_label, kind)`` where ``kind`` is
+# ``"force"`` (limited by ``max_wrench_force``) or ``"torque"`` (limited
+# by ``max_wrench_torque``).  The orchestrator validates |value| against
+# the matching safety limit on every SetParameters call and rejects
+# setpoints that would immediately trip the safety supervisor.
+_TARGET_WRENCH_PARAMS: List[Tuple[str, str, str]] = [
+    # (param_name,              axis_label, kind)
+    ("target_wrench_force_x",   "Fx",       "force"),
+    ("target_wrench_force_y",   "Fy",       "force"),
+    ("target_wrench_force_z",   "Fz",       "force"),
+    ("target_wrench_torque_x",  "Tx",       "torque"),
+    ("target_wrench_torque_y",  "Ty",       "torque"),
+    ("target_wrench_torque_z",  "Tz",       "torque"),
+]
+_TARGET_WRENCH_NAMES = {n for (n, _l, _k) in _TARGET_WRENCH_PARAMS}
+
+
+# ---------------------------------------------------------------------------
 # wrench dead-zone editable from the dashboard.
 #
 # These parameters live on the ``ft_sensor_gravity_compensation`` node
@@ -471,6 +499,10 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     200, self._dashboard.api_get_safety_thresholds())
                 return
+            if path == "/api/target_wrench":
+                self._send_json(
+                    200, self._dashboard.api_get_target_wrench())
+                return
             if path == "/api/wrench_deadband":
                 self._send_json(
                     200, self._dashboard.api_get_wrench_deadband())
@@ -515,6 +547,18 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     200,
                     self._dashboard.api_set_safety_thresholds(body))
+                return
+            if path == "/api/target_wrench":
+                body = self._read_json_body() or {}
+                self._send_json(
+                    200,
+                    self._dashboard.api_set_target_wrench(body))
+                return
+            if path == "/api/target_wrench_publish":
+                body = self._read_json_body() or {}
+                self._send_json(
+                    200,
+                    self._dashboard.api_set_target_wrench_publish(body))
                 return
             if path == "/api/wrench_deadband":
                 body = self._read_json_body() or {}
@@ -717,6 +761,13 @@ class DashboardNode(Node):
         self._cli_orchestrator_set_params = self.create_client(
             SetParameters,
             f"{self._orchestrator_ns}/set_parameters",
+            callback_group=self._cbgroup)
+        # GetParameters counterpart -- used by the target_wrench editor
+        # to fetch the orchestrator's current setpoint on page load (so
+        # the sliders start in the right position even after a restart).
+        self._cli_orchestrator_get_params = self.create_client(
+            GetParameters,
+            f"{self._orchestrator_ns}/get_parameters",
             callback_group=self._cbgroup)
 
         # Service clients for the gravity-compensation node's parameters.
@@ -1091,6 +1142,66 @@ class DashboardNode(Node):
         all_ok = all(r["successful"] for r in results)
         return all_ok, results
 
+    def _get_orchestrator_doubles(self, names: List[str]
+                                  ) -> Dict[str, Optional[float]]:
+        """Read ``double`` parameters from the orchestrator.
+
+        Returns ``{name: float_or_None}``.  ``None`` means the parameter
+        is not declared on the remote node OR the service is not
+        reachable inside ``_service_timeout``.  Used by the
+        target-wrench editor to seed the sliders on page load.
+        """
+        result: Dict[str, Optional[float]] = {n: None for n in names}
+        if not names:
+            return result
+        if not self._cli_orchestrator_get_params.wait_for_service(
+                timeout_sec=0.2):
+            return result
+        req = GetParameters.Request()
+        req.names = list(names)
+        resp = self._service_call_sync(
+            self._cli_orchestrator_get_params, req, self._service_timeout)
+        if resp is None:
+            return result
+        for name, pv in zip(names, resp.values):
+            decoded = _decode_param_value(pv)
+            if isinstance(decoded, (int, float)):
+                result[name] = float(decoded)
+            else:
+                result[name] = None
+        return result
+
+    def _set_orchestrator_bool(self, name: str, value: bool
+                               ) -> Tuple[bool, str]:
+        """Push a single ``bool`` parameter to the orchestrator.
+
+        Returns ``(ok, reason)`` -- ``ok`` is True iff the service
+        responded AND the parameter was accepted; ``reason`` is the
+        orchestrator's verbatim rejection reason (empty on success).
+        Used by the dashboard's "Send target_wrench" toggle.
+        """
+        if not self._cli_orchestrator_set_params.wait_for_service(
+                timeout_sec=0.2):
+            return False, (f"orchestrator set_parameters service "
+                           f"unavailable at {self._orchestrator_ns!r}")
+        p = Parameter()
+        p.name = name
+        pv = ParameterValue()
+        pv.type = ParameterType.PARAMETER_BOOL
+        pv.bool_value = bool(value)
+        p.value = pv
+        req = SetParameters.Request()
+        req.parameters = [p]
+        resp = self._service_call_sync(
+            self._cli_orchestrator_set_params, req, self._service_timeout)
+        if resp is None:
+            return False, (f"no response within "
+                           f"{self._service_timeout:.1f}s")
+        if not resp.results:
+            return False, "set_parameters: empty results"
+        r = resp.results[0]
+        return bool(r.successful), str(r.reason or "")
+
     # ------------------------------------------------------------------
     # active-controller helpers (cached from orchestrator state topic)
     # ------------------------------------------------------------------
@@ -1370,6 +1481,165 @@ class DashboardNode(Node):
                 "to /duco_cartesian_control" if ok else
                 f"orchestrator rejected {len(results) - successful}/"
                 f"{len(results)} threshold(s)"
+            ),
+        }
+
+    # ------------------------------------------------------------------
+    # target_wrench editor (orchestrator parameters)
+    # ------------------------------------------------------------------
+    # Six ``double`` parameters (``target_wrench_force_x/y/z``,
+    # ``target_wrench_torque_x/y/z``) live on the orchestrator and are
+    # republished at the heartbeat rate to every FZI controller's
+    # ``target_wrench`` topic.  With all six set to 0 the force /
+    # compliance controllers give pure free-drive / spring-hold; the
+    # dashboard's slider widget lets the operator command a constant
+    # additive wrench on top of the FT-sensor feedback.
+    #
+    # GET reads the current values via GetParameters; POST forwards the
+    # 6-value JSON body via the existing ``_set_orchestrator_doubles``
+    # helper (per-parameter results bubble up so the JS can surface a
+    # rejection reason -- e.g. |value| > max_wrench_force).
+    def api_get_target_wrench(self) -> Dict[str, Any]:
+        """Return the orchestrator's current target_wrench setpoint.
+
+        Also returns the matching safety limits (``max_wrench_force`` /
+        ``max_wrench_torque``) read from the cached ``control_state``,
+        so the JS can use them as slider bounds.  When the orchestrator
+        is unreachable, ``values`` slots come back as ``None``.
+        """
+        names = [n for (n, _l, _k) in _TARGET_WRENCH_PARAMS]
+        fetched = self._get_orchestrator_doubles(names)
+        with self._lock:
+            ctl = dict(self._control_state) if self._control_state else {}
+            ctl_age = (time.monotonic() - self._control_state_mono
+                       if self._control_state_mono is not None else None)
+        limits = (ctl.get("limits") or {}) if isinstance(ctl, dict) else {}
+        try:
+            max_f = float(limits.get("max_wrench_force"))
+        except (TypeError, ValueError):
+            max_f = None
+        try:
+            max_t = float(limits.get("max_wrench_torque"))
+        except (TypeError, ValueError):
+            max_t = None
+        items: List[Dict[str, Any]] = []
+        for name, label, kind in _TARGET_WRENCH_PARAMS:
+            items.append({
+                "name":  name,
+                "label": label,
+                "kind":  kind,
+                "value": fetched.get(name),
+            })
+        return {
+            "ok":              True,
+            "orchestrator_ns": self._orchestrator_ns,
+            "orchestrator_live": (ctl_age is not None and ctl_age <= 5.0),
+            "max_wrench_force":  max_f,
+            "max_wrench_torque": max_t,
+            "axes":            items,
+            "message": ("orchestrator-owned target_wrench setpoint "
+                        "(/duco_cartesian_control); republished to every "
+                        "FZI controller's target_wrench topic at the "
+                        "heartbeat rate"),
+        }
+
+    def api_set_target_wrench(self, body: Dict[str, Any]
+                              ) -> Dict[str, Any]:
+        """Push edits to the orchestrator's target_wrench setpoint.
+
+        Body shape::
+
+            {"axes": [{"name": str, "value": float}, ...]}
+
+        Unknown names are rejected (the dashboard restricts the editor
+        to ``_TARGET_WRENCH_PARAMS``); non-finite values are rejected
+        here before the round-trip.  The orchestrator enforces
+        ``|value| <= max_wrench_{force,torque}`` and surfaces its
+        rejection reason verbatim through the per-parameter results.
+        """
+        if not isinstance(body, dict):
+            raise RuntimeError("body must be a JSON object")
+        items = body.get("axes")
+        if not isinstance(items, list):
+            raise RuntimeError("body.axes must be a list")
+
+        updates: Dict[str, float] = {}
+        for idx, entry in enumerate(items):
+            if not isinstance(entry, dict):
+                raise RuntimeError(
+                    f"axes[{idx}] must be an object")
+            name = entry.get("name")
+            if not isinstance(name, str) or not name:
+                raise RuntimeError(
+                    f"axes[{idx}].name must be a non-empty string")
+            if name not in _TARGET_WRENCH_NAMES:
+                raise RuntimeError(
+                    f"axes[{idx}].name={name!r} is not editable "
+                    f"({sorted(_TARGET_WRENCH_NAMES)})")
+            raw = entry.get("value")
+            try:
+                value = float(raw)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"axes[{idx}].value not numeric: {exc}"
+                ) from exc
+            if not math.isfinite(value):
+                raise RuntimeError(
+                    f"axes[{idx}].value must be finite "
+                    f"(got {raw!r})")
+            updates[name] = value
+
+        if not updates:
+            return {"ok": True, "updated": 0, "results": [],
+                    "message": "no axes supplied"}
+
+        ok, results = self._set_orchestrator_doubles(updates)
+        successful = sum(1 for r in results if r["successful"])
+        return {
+            "ok":      ok,
+            "updated": successful,
+            "results": results,
+            "message": (
+                f"applied {successful}/{len(results)} axis(es) "
+                "to /duco_cartesian_control" if ok else
+                f"orchestrator rejected {len(results) - successful}/"
+                f"{len(results)} axis(es)"
+            ),
+        }
+
+    def api_set_target_wrench_publish(self, body: Dict[str, Any]
+                                      ) -> Dict[str, Any]:
+        """Toggle the orchestrator's master target_wrench publish enable.
+
+        Body shape::
+
+            {"enabled": bool}
+
+        When ``False`` the orchestrator suppresses both the heartbeat
+        and the external-topic forwarding, leaving every FZI
+        controller's ``target_wrench`` topic silent so a third-party
+        publisher (teleop, scripts, RViz marker) can drive them
+        directly without contention.  Default on the orchestrator is
+        ``True`` (legacy heartbeat-on behaviour).
+        """
+        if not isinstance(body, dict):
+            raise RuntimeError("body must be a JSON object")
+        if "enabled" not in body:
+            raise RuntimeError("body.enabled is required (bool)")
+        raw = body["enabled"]
+        if not isinstance(raw, bool):
+            raise RuntimeError(
+                f"body.enabled must be a boolean (got {type(raw).__name__})")
+        ok, reason = self._set_orchestrator_bool(
+            "publish_target_wrench", raw)
+        return {
+            "ok":      ok,
+            "enabled": raw if ok else None,
+            "reason":  reason,
+            "message": (
+                f"orchestrator publish_target_wrench -> {raw}" if ok else
+                f"orchestrator rejected publish_target_wrench={raw}: "
+                f"{reason or '(no reason)'}"
             ),
         }
 
