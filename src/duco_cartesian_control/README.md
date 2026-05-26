@@ -238,3 +238,219 @@ orchestration logic (request shape, timeout / failure handling,
 controller-name routing).  The full engage flow (which depends on
 rclpy timers + executors + a live controller_manager) is covered by
 end-to-end runs on the real arm.
+
+## Controller math & parameter reference
+
+This section documents what each FZI controller actually computes and
+how its parameters map onto observable behaviour, so operators can
+tune them with intent instead of trial-and-error.  It starts with the
+force controller because that is what `cartesian_control_real.launch.py`
+brings up by default; motion and compliance controllers will be added
+to the same section as their numerical models are documented.
+
+### Force controller
+
+#### What it computes
+
+The hot path runs inside `controller_manager` at the bringup rate
+(250 Hz on this arm) and goes through four blocks per cycle:
+
+```
+                                                         joint cmd
+   FT sensor ----> ftSensorWrenchCallback                (to HW)
+                            |                              ^
+                            v   m_ft_sensor_wrench         |
+target_wrench ----> computeForceError() --> spatial PD --> IK ---> writeJointControlCmds()
+                            ^                |             ^
+                            |          solver.error_scale  |
+                            +-------- ft sensor frame      |
+                                       transform           |
+                                  (precomputed at          |
+                                   on_configure)           |
+                                                           |
+   joint_states ----> synchronizeJointPositions -----------+
+```
+
+The four blocks correspond to the four parameter groups (`ft_sensor_ref_link`,
+`pd_gains.*`, `solver.*`, `command_interfaces`); the rest of this
+subsection walks through them in order.
+
+#### 1. Wrench error in base frame
+
+[`computeForceError`](../../external/cartesian_controllers/cartesian_force_controller/src/cartesian_force_controller.cpp)
+produces a 6-vector "net Cartesian wrench to apply":
+
+$$
+\mathbf{e}(t) \;=\; \underbrace{R_{\text{base}\leftarrow\text{sensor}}\, T_{\text{ft}\rightarrow\text{ee}}\, \mathbf{w}_{\text{measured}}(t)}_{\text{FT residual in base frame}}
+\;+\;
+\underbrace{R_{\text{base}\leftarrow\text{ee}}\, \mathbf{w}_{\text{target}}(t)}_{\text{operator setpoint in base frame}}
+$$
+
+* $\mathbf{w}_{\text{measured}}$ is read from `~/ft_sensor_wrench`
+  (the gravity-compensated wrench this orchestrator forwards onto
+  FZI's RELIABLE input).
+* $T_{\text{ft}\rightarrow\text{ee}}$ is a *static* `KDL::Frame`
+  precomputed once during `on_configure` from
+  $T_{\text{ft}\rightarrow\text{ee}} = T_{\text{base}\rightarrow\text{ee}}^{-1}\, T_{\text{base}\rightarrow\text{ft}}$,
+  evaluated at the joint configuration that happened to be current
+  when the controller configured.  When the kinematic chain is
+  rebuilt live (via `robot_description` updates) this transform is
+  recomputed in `onChainRebuilt`.
+* $R_{\text{base}\leftarrow\cdot}$ is the rotation matrix from the
+  current FK; it is re-evaluated every cycle from the latest joint
+  state, so the error vector tracks the EE's current orientation.
+* $\mathbf{w}_{\text{target}}$ is the latest message received on
+  `~/target_wrench`.  It is interpreted **in the end-effector frame**
+  by default (`hand_frame_control: true`); set
+  `hand_frame_control: false` to interpret the target in `robot_base_link`
+  instead.
+
+**Sign convention.** The two terms are *added*, not subtracted: the
+controller assumes the FT topic publishes the wrench the *load*
+applies to the sensor.  An operator push in +X then appears as
+$+F_x$ on the topic; with $\mathbf{w}_{\text{target}}=0$ the error
+points in +X and the IK below moves the EE in +X to relieve the push
+&mdash; free-drive.  If you ever see the arm *push toward* the operator
+instead of away, the FT publisher is using the opposite sign and the
+fix is to flip it at the source (typically a single sign in
+`ft_sensor_gravity_compensation`), not to fight it from inside the
+controller.
+
+#### 2. Spatial PD on the wrench error
+
+The 6-vector $\mathbf{e}$ is fed through six independent PD
+controllers (one per axis: `trans_x`, `trans_y`, `trans_z`, `rot_x`,
+`rot_y`, `rot_z`).  Each axis computes
+
+$$
+u_i(t) \;=\; P_i\, e_i(t) \;+\; D_i\, \frac{e_i(t) - e_i(t-\Delta t)}{\Delta t}
+$$
+
+with $\Delta t = 0.02$ s (the hard-coded `internal_period` in
+`CartesianForceController::update`), $P_i$ from `pd_gains.<axis>.p`
+and $D_i$ from `pd_gains.<axis>.d`.
+The output is scaled by `solver.error_scale` to form the "virtual
+applied wrench" that drives the forward-dynamics IK:
+
+$$
+\mathbf{F}_{\text{cmd}}(t) \;=\; \text{error\_scale} \cdot \begin{bmatrix} u_{\text{trans\_x}} \\ \vdots \\ u_{\text{rot\_z}} \end{bmatrix}
+$$
+
+Three things worth noting:
+
+* The **D term divides by 0.02 s, not by the real cycle time.** The
+  ratio $D/P$ therefore has units of seconds even though the outer
+  loop runs at 250 Hz.  Rule of thumb on this arm: $D \approx P/40$
+  for translational axes (lightly damps de/dt of FT noise);
+  $D \approx P/10$ for rotational axes (FT moment-arm coupling
+  injects more noise into the rotational channels, so they need more
+  damping per unit P).
+* **`error_scale` multiplies both P and D equally.** Reducing it does
+  not change the closed-loop damping *ratio*; it only slows the response.
+  Use it as a global "make the arm less twitchy" knob, not as a tuning
+  knob in lieu of `pd_gains.*.d`.
+* **`solver.iterations` is IGNORED by the force controller** &mdash; the
+  base class declares it but `CartesianForceController::update` runs
+  the PD + IK pipeline exactly once per cycle.  (The motion and
+  compliance controllers do use it.)
+
+#### 3. Forward-dynamics IK
+
+`Base::computeJointControlCmds(F_cmd, 0.02s)` hands $\mathbf{F}_{\text{cmd}}$
+to the forward-dynamics solver in [`ForwardDynamicsSolver::getJointControlCmds`](../../external/cartesian_controllers/cartesian_controller_base/src/ForwardDynamicsSolver.cpp).
+The solver treats the robot as a fictitious rigid body with a custom
+inertia distribution (last link mass = 1 kg, inertia = 1 kg·m²; all
+other links use `solver.forward_dynamics.link_mass`, default 0.1 kg)
+and integrates one step forward in 0.02 s:
+
+$$
+\ddot{\mathbf{q}} = H(\mathbf{q})^{-1}\, J(\mathbf{q})^{\top}\, \mathbf{F}_{\text{cmd}}, \qquad
+\dot{\mathbf{q}}_{t+\Delta t} = 0.9 \cdot \bigl(\dot{\mathbf{q}}_t + \ddot{\mathbf{q}}\, \Delta t\bigr), \qquad
+\mathbf{q}_{t+\Delta t} = \mathbf{q}_t + \dot{\mathbf{q}}_t\, \Delta t
+$$
+
+* $H(\mathbf{q})$ is the joint-space inertia (recomputed every cycle
+  via `KDL::ChainDynParam`).
+* $J(\mathbf{q})$ is the geometric jacobian of the configured chain.
+* The "$\times 0.9$" on $\dot{\mathbf{q}}_{t+\Delta t}$ is an
+  **implicit per-cycle damping** baked into the solver: each cycle the
+  virtual joint velocities lose 10%.  With $\Delta t = 0.02$ s this
+  damps null-space drift at a $\tau \approx 0.2$ s time constant and
+  also provides a noise floor of damping that's independent of
+  `pd_gains.*.d`.  It is also why the arm comes to rest even when the
+  PD gains are very low: stop pushing, and the EE coasts to a halt in
+  a few hundred milliseconds.
+
+The result is a `JointTrajectoryPoint` of new joint positions and
+velocities; `writeJointControlCmds` writes them onto whichever
+hardware-interface handles `command_interfaces` configured (`position`
+in this repo).
+
+#### 4. Tuning knobs (live, no restart)
+
+All parameters below live on the `/cartesian_force_controller` node
+and accept `SetParameters` writes &mdash; either from the dashboard's
+parameter panel or from a shell:
+
+| parameter | type | default | meaning | live? |
+|---|---|---:|---|:---:|
+| `pd_gains.trans_<x\|y\|z>.p` | double | 5.0  | proportional gain, force → virtual EE acceleration (N → m/s²) | yes |
+| `pd_gains.trans_<x\|y\|z>.d` | double | 0.05 | damping on $de/dt$ of the translational wrench error | yes |
+| `pd_gains.rot_<x\|y\|z>.p`   | double | 50.0 | proportional gain on torque error | yes |
+| `pd_gains.rot_<x\|y\|z>.d`   | double | 5.0  | damping on $de/dt$ of the torque error | yes |
+| `solver.error_scale`         | double | 0.05 | global multiplier on the PD output; the inner loop's "step size" | yes |
+| `solver.iterations`          | int    | 5    | **declared but ignored** for the force controller | n/a |
+| `solver.publish_state_feedback` | bool | true | publish `<ctrl>/current_pose` and `<ctrl>/current_twist` | yes (re-applied at next configure) |
+| `solver.forward_dynamics.link_mass` | double | 0.1 | virtual mass on every link *except* the last (which is hard-coded at 1 kg) | yes |
+| `ik_solver` | string | `forward_dynamics` | IK strategy; alternatives `damped_least_squares`, `selectively_damped_least_squares`, `jacobian_transpose` | reload only |
+| `robot_base_link` / `end_effector_link` / `joints` / `command_interfaces` | (various) | from YAML | KDL chain definition | reload only |
+| `ft_sensor_ref_link` | string | `ft_sensor_link` | the URDF frame the FT topic is published in | reload only |
+| `hand_frame_control` | bool | true | interpret `target_wrench` in EE frame (true) or base frame (false) | yes |
+
+Tuning workflow that has worked on this arm:
+
+1. **Start gentle.** P=5, D=0.05 on translation; P=50, D=5 on
+   rotation; `error_scale = 0.05`.  Engage, push the EE around &mdash; it
+   should follow your hand with no perceptible chatter.
+2. **If the response feels sluggish**, raise `error_scale` by 1.5× at
+   a time (0.05 → 0.075 → 0.1).  This scales both P and D together,
+   so closed-loop *damping ratio* is unchanged &mdash; you only get
+   snappier response, not more overshoot.  Stop when the arm starts
+   to oscillate on hand-release.
+3. **If you see chatter / buzz at contact**, raise the **D** term
+   first, not P.  Translation: try 0.1, 0.2.  Rotation: try 10, 20.
+4. **If the arm drifts in free-drive** (your hand on EE, no contact,
+   FT looks zero on the dashboard but the arm slowly creeps), the FT
+   gravity compensation has a DC bias.  Fix it at the source
+   (`ft_sensor_gravity_compensation` calibration) rather than raising
+   the PD gains &mdash; raising P only makes the controller respond to
+   the bias *faster*; it does not remove it.
+5. **`pd_gains.<axis>.p = 0`** disables that axis entirely (the
+   controller will not move along it under wrench input).  Useful for
+   constraining hand-guiding to a plane, e.g. lock $z$ for a horizontal
+   wipe motion.
+
+Shell recipe (one line at a time &mdash; chaining with `&&` can hang):
+
+```bash
+ros2 param set /cartesian_force_controller pd_gains.trans_x.p 5.0
+ros2 param set /cartesian_force_controller pd_gains.trans_x.d 0.05
+ros2 param set /cartesian_force_controller solver.error_scale 0.05
+ros2 param set /cartesian_force_controller hand_frame_control true
+```
+
+All of these can also be set persistently in
+[`config/fzi_zero_gravity.yaml`](config/fzi_zero_gravity.yaml) under
+the `cartesian_force_controller:` block; live changes via
+`SetParameters` survive only until the controller is unloaded.
+
+#### What the force controller does *not* do
+
+* It has **no spring back to the engage pose**.  Drop your hand on
+  the EE and it stays wherever you let go &mdash; modulo the slow
+  null-space decay from the $\times 0.9$ velocity damping.  If you
+  want spring-back, switch to the compliance controller.
+* It does **not** consume `<ctrl>/target_frame` &mdash; that topic is
+  the motion / compliance controllers' input.
+* `solver.iterations` does nothing here (see table).  Do not
+  re-purpose it as a "stiffness" knob.

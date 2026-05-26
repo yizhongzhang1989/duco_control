@@ -62,9 +62,9 @@ cartesian_force_controller:
       # is an oscillator.  The D term damps de/dt of the wrench error
       # and is what kills the contact bounce.  See header comment for
       # the d ~ p/40 (trans) / p/10 (rot) sizing rule used here.
-      trans_x: {p: 2.0,  d: 0.05}
-      trans_y: {p: 2.0,  d: 0.05}
-      trans_z: {p: 2.0,  d: 0.05}
+      trans_x: {p: 5.0,  d: 0.05}
+      trans_y: {p: 5.0,  d: 0.05}
+      trans_z: {p: 5.0,  d: 0.05}
       rot_x:   {p: 50.0, d: 5.0}
       rot_y:   {p: 50.0, d: 5.0}
       rot_z:   {p: 50.0, d: 5.0}
@@ -91,12 +91,12 @@ cartesian_motion_controller:
       iterations: 5
       publish_state_feedback: true
     pd_gains:
-      trans_x: {p: 1.0}
-      trans_y: {p: 1.0}
-      trans_z: {p: 1.0}
-      rot_x:   {p: 0.5}
-      rot_y:   {p: 0.5}
-      rot_z:   {p: 0.5}
+      trans_x: {p: 5.0}
+      trans_y: {p: 5.0}
+      trans_z: {p: 5.0}
+      rot_x:   {p: 50.0}
+      rot_y:   {p: 50.0}
+      rot_z:   {p: 50.0}
 
 # --- Compliance controller ----------------------------------------------
 # Combination of motion + force.  FZI internally computes
@@ -120,10 +120,29 @@ cartesian_motion_controller:
 # Picking solver.error_scale (governs how fast the inner loop chases
 # the residual net_force):
 #   * Higher = snappier response to push, but risks overshoot / chatter.
-#   * Force controller is tuned at 0.05 for steady pushing.  In
-#     compliance the spring decay shrinks net_force as displacement
-#     grows, so we bump to 0.08 to keep the EE tracking quickly when
-#     the user is actively guiding.
+#   * Force controller is tuned at 0.05 for steady pushing.  We mirror
+#     0.05 here: in the compliance closed-loop, error_scale multiplies
+#     BOTH the effective spring and damping by the same factor, so
+#     reducing it only slows the response without sacrificing damping
+#     ratio -- and a smaller error_scale tames inner-loop overshoot
+#     from the (P*K) position feedback that compliance adds on top of
+#     the wrench loop.
+#
+# *** Damping note (this is the knob that previously caused shaking) ***
+# The compliance controller closes a Cartesian POSITION loop through
+# the spring K * (target - current); the pure force controller does
+# not. Treating the loop as
+#     m_v * x'' + (error_scale*D*K) * x' + (error_scale*P*K) * x = noise
+# (m_v ~ 1 kg / 1 kg.m^2 from FZI's hard-coded EE inertia in
+# ForwardDynamicsSolver::buildGenericModel) gives damping ratio
+#     zeta = error_scale*D*K / (2 * sqrt(error_scale*P*K*m_v))
+# With our prior values (P=2, D=0.05, K=10, scale=0.08) zeta was ~0.016
+# -- effectively undamped -- so FT-sensor noise and gravity-comp
+# residual would walk the EE and ring the spring at ~0.2 Hz (visible
+# as the shaking on engage). The values below target zeta ~ 0.5-0.7
+# on every axis; they are deliberately MUCH larger than the d ~ p/40
+# rule used in the force controller (which sized D against de/dt of a
+# sensor signal -- a different problem).
 #
 # Both ``ft_sensor_ref_link`` and ``compliance_ref_link`` resolve to aux
 # frames declared in ``robot_config.yaml::duco_robot_bringup.aux_frames``
@@ -145,22 +164,27 @@ cartesian_compliance_controller:
     command_interfaces:
       - position
     stiffness:               # virtual spring at compliance_ref_link
-      trans_x: 10.0          # N/m   (was 30 -- 3x softer for hand-guiding)
+      trans_x: 10.0          # N/m -- soft, hand-guidable
       trans_y: 10.0
       trans_z: 10.0
-      rot_x:   0.5           # Nm/rad (was 2.0 -- 4x softer)
+      rot_x:   0.5           # Nm/rad -- soft, hand-guidable
       rot_y:   0.5
       rot_z:   0.5
     solver:
-      error_scale: 0.08      # was 0.05 -- snappier inner loop tracking
+      error_scale: 0.05      # was 0.08 -- mirrors force controller; see header
       iterations: 5
       publish_state_feedback: true
-    pd_gains:                # mirror force controller's working values
-      # D mirrors the force controller so contact dynamics are damped
-      # the same way when the user switches modes mid-task.
-      trans_x: {p: 2.0,  d: 0.05}
-      trans_y: {p: 2.0,  d: 0.05}
-      trans_z: {p: 2.0,  d: 0.05}
-      rot_x:   {p: 50.0, d: 5.0}
-      rot_y:   {p: 50.0, d: 5.0}
-      rot_z:   {p: 50.0, d: 5.0}
+    pd_gains:                # SIZED FOR THE SPRING LOOP, not for FT noise
+      # D needs to fight the (P*K) position loop, not just damp
+      # de(force)/dt as in the force controller. See header math:
+      # zeta = error_scale*D*K / (2*sqrt(error_scale*P*K*m_v))
+      # For trans: m_v=1, K=10, P=2, scale=0.05 -> ω_n=1.0,
+      #            D=2.0 gives zeta ~ 0.5; D=3.0 gives critically damped.
+      # For rot:   I=1, K=0.5, P=50, scale=0.05 -> ω_n=1.12,
+      #            D=30 gives zeta ~ 0.67; D=45 critically damped.
+      trans_x: {p: 2.0,  d: 2.0}
+      trans_y: {p: 2.0,  d: 2.0}
+      trans_z: {p: 2.0,  d: 2.0}
+      rot_x:   {p: 50.0, d: 30.0}
+      rot_y:   {p: 50.0, d: 30.0}
+      rot_z:   {p: 50.0, d: 30.0}

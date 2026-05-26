@@ -197,12 +197,22 @@ class _RateTracker:
 # matrix, which is the main parameter operators want to play with.
 # ---------------------------------------------------------------------------
 _BASE_TUNABLES: List[Tuple[str, str]] = [
+    # P (stiffness of the inner PD on the Cartesian error vector)
     ("pd_gains.trans_x.p", "double"),
     ("pd_gains.trans_y.p", "double"),
     ("pd_gains.trans_z.p", "double"),
     ("pd_gains.rot_x.p",   "double"),
     ("pd_gains.rot_y.p",   "double"),
     ("pd_gains.rot_z.p",   "double"),
+    # D (damping of de/dt; sized against the spring loop for compliance,
+    # against FT-sensor noise for the force controller -- see
+    # src/duco_cartesian_control/config/fzi_zero_gravity.yaml header).
+    ("pd_gains.trans_x.d", "double"),
+    ("pd_gains.trans_y.d", "double"),
+    ("pd_gains.trans_z.d", "double"),
+    ("pd_gains.rot_x.d",   "double"),
+    ("pd_gains.rot_y.d",   "double"),
+    ("pd_gains.rot_z.d",   "double"),
     ("solver.error_scale", "double"),
     ("solver.iterations",  "integer"),
 ]
@@ -604,11 +614,20 @@ class DashboardNode(Node):
         # by ``ft_sensor_gravity_compensation.compensation_node``.
         ("gravity_compensation_node", "/ft_sensor_gravity_compensation"),
         # Frames used for jog / snap-target publishes on motion +
-        # compliance controllers.  Must match the URDF that
-        # controller_manager sees and the FZI YAML's
-        # ``robot_base_link`` / ``end_effector_link``.
+        # compliance controllers AND for the TCP-pose display.  These
+        # are FALLBACK values used only when the active controller's
+        # ``robot_base_link`` / ``end_effector_link`` parameters can't
+        # be read (e.g. the controller node isn't running yet).  At
+        # runtime ``api_jog`` and the TF-rate sampler resolve the
+        # actual frames via ``_resolve_active_frames()`` so they
+        # automatically track whatever the FZI YAML configured.  The
+        # default ``compliance_link`` matches the EE tip declared in
+        # ``config/fzi_zero_gravity.yaml`` and ``aux_frames`` in
+        # ``config/robot_config.yaml``; if the dashboard is launched
+        # before the controllers, jog will use these defaults until
+        # the parameters become available.
         ("base_frame", "base_link"),
-        ("tool_frame", "link_6"),
+        ("tool_frame", "compliance_link"),
         ("service_timeout_sec", 2.0),
         # http -----------------------------------------------------------
         ("host", "0.0.0.0"),
@@ -820,6 +839,15 @@ class DashboardNode(Node):
                 PoseStamped, f"/{ctrl}/target_frame", 10)
             for ctrl in self._available_controllers
         }
+
+        # ---- per-controller jog-frame cache ---------------------------
+        # ``_resolve_active_frames`` fills this lazily on the first jog
+        # against each controller by reading the controller's own
+        # ``robot_base_link`` / ``end_effector_link`` parameters.  The
+        # FZI controllers don't re-load these at runtime, so once
+        # cached the entries stay valid for the controller's lifetime;
+        # we don't need to invalidate on engage/disengage cycles.
+        self._jog_frames_cache: Dict[str, Tuple[str, str]] = {}
 
         # ---- tf2 listener (current EE pose source for jog / snap) -----
         self._tf_buffer = Buffer()
@@ -1853,22 +1881,77 @@ class DashboardNode(Node):
     # ``new_target = current_ee_pose + delta`` (in the base frame) and
     # publishes it.  The force controller has no such input, so its
     # control panel is purely informational.
-    def _lookup_current_pose(self) -> PoseStamped:
+    #
+    # IMPORTANT: the FZI controllers interpret ``target_frame`` as the
+    # target pose for *their own* ``end_effector_link`` parameter, NOT
+    # the dashboard's ``tool_frame``.  If we look up TF for ``link_6``
+    # but publish that as the target for a controller whose end-effector
+    # is ``compliance_link`` (offset ~33 cm along link_6's local Z),
+    # the controller treats the published pose as 33 cm displaced from
+    # where compliance_link currently sits -- the robot tries to close
+    # that gap regardless of which jog button was pressed, producing
+    # the classic "robot moves up whatever button I click" symptom.
+    # We resolve the controller's actual ``end_effector_link`` (and
+    # ``robot_base_link``) at jog time and use those frames for the
+    # current-pose lookup so the delta is applied to the right tip.
+    def _resolve_active_frames(self, controller: str
+                               ) -> Tuple[str, str]:
+        """Return ``(base_frame, tool_frame)`` to use for a jog on
+        ``controller``.  Reads the controller's own
+        ``robot_base_link`` / ``end_effector_link`` parameters
+        (FZI's documented contract) and falls back to the dashboard's
+        ``base_frame`` / ``tool_frame`` parameters when the controller
+        node isn't running or returns empty strings.  Results are
+        cached per-controller because the FZI controllers don't
+        re-read these at runtime; the cache is cleared whenever the
+        active controller changes.
+        """
+        cached = self._jog_frames_cache.get(controller)
+        if cached is not None:
+            return cached
+        base = self._base_frame
+        tool = self._tool_frame
+        try:
+            vals = self._get_param_values(
+                controller, ["robot_base_link", "end_effector_link"])
+            rb = vals.get("robot_base_link")
+            ee = vals.get("end_effector_link")
+            if isinstance(rb, str) and rb.strip():
+                base = rb.strip().strip("/")
+            if isinstance(ee, str) and ee.strip():
+                tool = ee.strip().strip("/")
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(
+                f"could not resolve jog frames for {controller!r}, "
+                f"using dashboard defaults "
+                f"({self._base_frame} -> {self._tool_frame}): {exc}")
+        self._jog_frames_cache[controller] = (base, tool)
+        return base, tool
+
+    def _lookup_current_pose(self, base_frame: Optional[str] = None,
+                             tool_frame: Optional[str] = None
+                             ) -> PoseStamped:
         """Look up ``base_frame -> tool_frame`` from /tf and return
         it as a :class:`PoseStamped`.  Raises RuntimeError on failure
-        so the HTTP layer can surface a clean 409.
+        so the HTTP layer can surface a clean 409.  When ``base_frame``
+        / ``tool_frame`` are ``None``, falls back to the dashboard's
+        configured defaults; jog-style callers pass the active
+        controller's resolved frames so the delta is applied to the
+        correct end-effector tip (see ``_resolve_active_frames``).
         """
+        bf = base_frame if base_frame else self._base_frame
+        tf = tool_frame if tool_frame else self._tool_frame
         try:
             t = self._tf_buffer.lookup_transform(
-                self._base_frame, self._tool_frame,
+                bf, tf,
                 rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.5))
         except TransformException as exc:
             raise RuntimeError(
-                f"tf lookup {self._base_frame!r} -> "
-                f"{self._tool_frame!r} failed: {exc}")
+                f"tf lookup {bf!r} -> "
+                f"{tf!r} failed: {exc}")
         ps = PoseStamped()
-        ps.header.frame_id = self._base_frame
+        ps.header.frame_id = bf
         ps.header.stamp = self.get_clock().now().to_msg()
         ps.pose.position.x = float(t.transform.translation.x)
         ps.pose.position.y = float(t.transform.translation.y)
@@ -1952,7 +2035,13 @@ class DashboardNode(Node):
         if max(abs(drx), abs(dry), abs(drz)) > math.radians(30.0):
             raise RuntimeError("rotation step too large (>30 deg)")
 
-        pose = self._lookup_current_pose()
+        # Use the active controller's OWN robot_base_link /
+        # end_effector_link, not the dashboard's fallback frames -- the
+        # controller treats target_frame as the goal pose for its own
+        # end-effector tip, and a frame mismatch produces a constant
+        # offset that the controller then tries to close on every press.
+        base_frame, tool_frame = self._resolve_active_frames(active)
+        pose = self._lookup_current_pose(base_frame, tool_frame)
         pose.pose.position.x += dx
         pose.pose.position.y += dy
         pose.pose.position.z += dz
