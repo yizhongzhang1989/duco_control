@@ -685,15 +685,35 @@
 
   // Continuous render loop, decoupled from data.  rAF is throttled
   // automatically when the tab is hidden so this is free in the
-  // background.
+  // background.  We additionally pause rAF when the canvas is scrolled
+  // out of view via an IntersectionObserver -- always-on 60 Hz redraws
+  // of a non-visible canvas compete with the scroll compositor and
+  // were a visible cause of page stutter when the 3D / plot row was
+  // about to enter the viewport.
+  let visible = true;
+  let rafScheduled = false;
   function renderLoop() {
+    rafScheduled = false;
+    if (!visible) return;
     draw();
+    scheduleRender();
+  }
+  function scheduleRender() {
+    if (rafScheduled || !visible) return;
+    rafScheduled = true;
     requestAnimationFrame(renderLoop);
   }
+  const _vio = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      if (e.target === canvas) visible = e.isIntersecting;
+    }
+    scheduleRender();
+  }, { rootMargin: "100px" });
+  _vio.observe(canvas);
 
   loadModel();
   startTfStream();
-  requestAnimationFrame(renderLoop);
+  scheduleRender();
   // Re-try model fetch every 5 s while it's still missing.
   setInterval(() => { if (!model) loadModel(); }, 5000);
 })();

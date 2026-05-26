@@ -107,9 +107,12 @@
   .sticky-bar { position: sticky; top: 0; z-index: 100;
                 margin: -14px -14px 12px -14px;
                 padding: 8px 16px 10px;
-                background: rgba(28, 35, 56, 0.96);
-                backdrop-filter: saturate(140%) blur(6px);
-                -webkit-backdrop-filter: saturate(140%) blur(6px);
+                /* Solid (not backdrop-blurred) so scrolling content
+                   underneath doesn't force a per-frame blur-shader
+                   rasterization -- that was the dominant cause of
+                   the 1-2 s scroll stalls.  Bumped from 0.96 to 1.0
+                   alpha to compensate visually for the lost blur. */
+                background: #1c2338;
                 border-bottom: 1px solid #3a4368;
                 box-shadow: 0 4px 12px -8px #000; }
   .sticky-bar .sb-row { display: flex; flex-wrap: wrap;
@@ -187,18 +190,18 @@
                 color: #ef5350; font-size: 0.78rem; pointer-events: none;
                 font-variant-numeric: tabular-nums; max-width: 60%;
                 white-space: pre-wrap; }
-  /* Floating info / controls (top-right) — backdrop-blur frost so
-     the 3D model stays visible through it.  pointer-events default
-     to auto so the buttons / checkboxes are interactive. */
+  /* Floating info / controls (top-right).  Background is
+     near-opaque (no backdrop-filter) so scrolling the page or
+     repainting the 3D canvas behind it doesn't force a per-frame
+     blur-shader pass.  pointer-events default to auto so the
+     buttons / checkboxes are interactive. */
   #urdf-panel .urdf-floating {
                 position: absolute; right: 10px; top: 10px; z-index: 10;
                 min-width: 210px; max-width: 260px;
                 max-height: calc(100% - 20px); overflow: auto;
-                background: rgba(22, 25, 33, 0.78);
+                background: rgba(22, 25, 33, 0.94);
                 border: 1px solid rgba(79, 195, 247, 0.30);
                 border-radius: 8px; padding: 10px 12px 12px;
-                backdrop-filter: blur(8px);
-                -webkit-backdrop-filter: blur(8px);
                 color: #e0e6ef;
                 box-shadow: 0 12px 32px rgba(0, 0, 0, 0.40); }
   .urdf-floating-header { display: flex; align-items: center;

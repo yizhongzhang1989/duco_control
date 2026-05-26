@@ -333,12 +333,38 @@
   }
 
   // ---- Render loop ----------------------------------------------------
+  // Pause rAF when both canvases are scrolled out of view.  An always-on
+  // 60 Hz redraw competes with the browser's scroll compositor and was a
+  // major contributor to the page-stutter the user saw when the plot
+  // panel was about to enter the viewport.  IntersectionObserver fires
+  // off the layout/paint critical path, so flipping the visibility flag
+  // is free.
+  let visibleForce  = true;
+  let visibleTorque = true;
+  let rafScheduled  = false;
   function render() {
-    drawPlot(cvForce,  FORCE_CHS);
-    drawPlot(cvTorque, TORQUE_CHS);
+    rafScheduled = false;
+    if (visibleForce)  drawPlot(cvForce,  FORCE_CHS);
+    if (visibleTorque) drawPlot(cvTorque, TORQUE_CHS);
+    scheduleRender();
+  }
+  function scheduleRender() {
+    if (rafScheduled) return;
+    if (!visibleForce && !visibleTorque) return;
+    rafScheduled = true;
     requestAnimationFrame(render);
   }
-  requestAnimationFrame(render);
+  const _vio = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      if (e.target === cvForce)  visibleForce  = e.isIntersecting;
+      if (e.target === cvTorque) visibleTorque = e.isIntersecting;
+    }
+    // Wake the render loop if we just became visible.
+    scheduleRender();
+  }, { rootMargin: "100px" });
+  _vio.observe(cvForce);
+  _vio.observe(cvTorque);
+  scheduleRender();
 
   // ---- Polling loop ---------------------------------------------------
   // We deliberately don't use setInterval; that can drift and pile up
