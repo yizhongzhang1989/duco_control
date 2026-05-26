@@ -388,8 +388,20 @@
                      <label> <slider> <number> <unit> <zero-btn>
                    See dashboard.js :: renderWrenchSliders(). -->
             </div>
-            <div style="margin-top:8px; display:flex; gap:8px; align-items:center;">
+            <div style="margin-top:8px; display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
               <button id="btn-tw-zero-all" type="button" class="ghost">Zero all</button>
+              <!-- Spring-back mode: when checked, releasing a slider
+                   snaps it back to 0 and re-publishes, so the operator
+                   can "press-and-hold" a force impulse on any axis
+                   without having to manually zero it.  Mirrors a
+                   dead-man-switch joystick.  Persisted to localStorage
+                   (key: ``tw.springToZero``) so the preference survives
+                   page reloads. -->
+              <label class="small" title="release a slider to snap it back to 0"
+                     style="display:flex; gap:6px; align-items:center; cursor:pointer;">
+                <input id="chk-tw-spring" type="checkbox">
+                spring back to 0 on release
+              </label>
               <span class="small" id="tw-msg"></span>
             </div>
           </div>

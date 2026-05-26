@@ -956,6 +956,18 @@
   let twUserEditing = false;   // suppress poll-driven UI clobber while
                                // the user is actively dragging / typing
   let twEditingTimer = null;
+  // Spring-back-to-zero mode: when true, releasing a slider snaps it
+  // back to 0 (and POSTs the zero), making the slider behave like a
+  // dead-man's-switch joystick.  Wired to ``#chk-tw-spring`` and
+  // persisted to localStorage so the preference survives reloads.
+  // Only applies to the slider's ``change`` event -- not to the number
+  // input, the per-axis ``0`` button, or the ``Zero all`` button, all
+  // of which operate on explicit operator intent rather than "release".
+  let twSpringToZero = false;
+  try {
+    twSpringToZero =
+      window.localStorage.getItem("tw.springToZero") === "1";
+  } catch (_) { /* private mode etc. */ }
 
   function twBeginUserEdit() {
     twUserEditing = true;
@@ -1081,9 +1093,22 @@
     if (row) row.classList.toggle("nonzero", Math.abs(v) > 1e-6);
     scheduleTargetWrenchPost();
   }
-  function onSliderChange() {
-    // Final release -- force-flush so the orchestrator sees the
-    // exact final value regardless of throttle phase.
+  function onSliderChange(ev) {
+    // Final release -- either snap back to 0 (spring mode) or just
+    // force-flush the final value the user landed on.
+    if (twSpringToZero) {
+      const name = ev && ev.target && ev.target.dataset
+                   ? ev.target.dataset.name : null;
+      if (name) {
+        // Clear the editing-lockout so the snap-to-zero is reflected
+        // in the UI immediately and the next poll doesn't fight it.
+        twUserEditing = false;
+        clearTimeout(twEditingTimer);
+        setAxisValue(name, 0.0);
+        flushTargetWrench();
+        return;
+      }
+    }
     flushTargetWrench();
   }
   function onNumberInput(ev) {
@@ -1220,6 +1245,25 @@
     for (const ax of TW_AXES) setAxisValue(ax.name, 0.0);
     flushTargetWrench();
   });
+
+  // Spring-back-to-zero checkbox -- mirrors the joystick "dead-man"
+  // pattern: while the slider is held, the orchestrator publishes the
+  // commanded wrench; release the slider and it snaps to 0 so the
+  // commanded force drops to zero.  Stored in localStorage so the
+  // preference survives reloads.  We also reflect the initial state
+  // into the checkbox here in case it was persisted from a prior
+  // session.
+  const chkSpring = $("chk-tw-spring");
+  if (chkSpring) {
+    chkSpring.checked = twSpringToZero;
+    chkSpring.addEventListener("change", () => {
+      twSpringToZero = !!chkSpring.checked;
+      try {
+        window.localStorage.setItem(
+          "tw.springToZero", twSpringToZero ? "1" : "0");
+      } catch (_) { /* private mode etc. */ }
+    });
+  }
 
   // ---- Master publish-enable toggle for the orchestrator ----------------
   // The orchestrator's ``publish_target_wrench`` bool parameter gates BOTH
