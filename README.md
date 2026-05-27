@@ -123,7 +123,7 @@ ros2 topic echo /joint_states --once
 ros2 launch duco_ft_sensor ft_sensor.launch.py
 ```
 
-Publishes raw wrench on `/duco_ft_sensor/wrench` (BEST_EFFORT) at the
+Publishes raw wrench on `/duco_ft_sensor/wrench_raw` (BEST_EFFORT) at the
 sensor's native rate (~960 Hz).
 
 ### 3. Gravity compensation
