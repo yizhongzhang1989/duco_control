@@ -19,6 +19,7 @@ dashboards.
 | package | purpose | runtime port |
 |---|---|---|
 | [`duco_robot_bringup`](src/duco_robot_bringup) | project-owned launch wrapper around the upstream `duco_*` driver (URDF + `controller_manager` + JTC); also ships the per-robot `config/fzi_preset.yaml` consumed by `cartesian_control_manager` | -- |
+| [`ur15_robot_bringup`](src/ur15_robot_bringup) | sibling bringup wrapper around the apt-installed `ur_robot_driver` for the UR15 (Universal Robots) arm; also ships its own `config/fzi_preset.yaml`. Selected via `ROBOT_CONFIG_PATH=$PWD/config/robot_config.ur15.yaml`. See [Multi-robot support](#multi-robot-support). | -- |
 | [`duco_ft_sensor`](src/duco_ft_sensor) | serial driver + ROS publisher for the Duco F/T sensor | -- |
 | [`ft_sensor_dashboard`](external/cartesian_controllers_toolkit/ft_sensor_dashboard) | optional web UI for any `WrenchStamped` topic *(from the toolkit submodule)* | `8080` |
 | [`ft_sensor_gravity_compensation`](external/cartesian_controllers_toolkit/ft_sensor_gravity_compensation) | subscribes to the raw wrench + `/tf`, publishes a gravity-compensated wrench, has its own calibration UI *(from the toolkit submodule)* | `8100` |
@@ -478,13 +479,153 @@ swappable.
 
 ---
 
+## Multi-robot support
+
+This workspace also drives a Universal Robots **UR15** arm without any
+edits inside the `cartesian_controllers_toolkit/` submodule.  The
+toolkit's `common.config_manager.get_config()` already honours an
+explicit `ROBOT_CONFIG_PATH` env override, so we ship a parallel
+per-robot config file and a UR-specific bringup package and let the
+toolkit pick whichever one is currently active.
+
+### What's in the workspace for UR15
+
+| file / package | purpose |
+|---|---|
+| [`src/ur15_robot_bringup`](src/ur15_robot_bringup) | thin wrapper around the apt-installed `ur_robot_driver/ur_control.launch.py`. Reads its defaults from `config/robot_config.yaml::ur15_robot_bringup` (or whichever file `ROBOT_CONFIG_PATH` resolves to). Ships its own `config/fzi_preset.yaml` with `tool0` / `base_link` / `command_interfaces: [position]` for the FZI Cartesian solver. |
+| [`config/robot_config.ur15.example.yaml`](config/robot_config.ur15.example.yaml) | UR15 template. Points `cartesian_control_manager.fzi_jtc_controller_name` at `scaled_joint_trajectory_controller`, `fzi_target_frame` at `tool0`, `fzi_controller_yaml_package` at `ur15_robot_bringup`, etc. |
+| [`config/robot_config.ur15.yaml`](config/robot_config.ur15.yaml) | local UR15 config, copied from the example on first use (gitignored). |
+
+The apt-installed `ros-humble-ur-robot-driver` provides the driver,
+URDF, hardware interface, and the standard UR controller stack
+(`scaled_joint_trajectory_controller`, `force_torque_sensor_broadcaster`,
+`io_and_status_controller`, etc.).  No additional submodule is needed.
+
+### Switching active robot
+
+The toolkit's config loader resolves `ROBOT_CONFIG_PATH` first, so the
+recommended pattern is to set it for the lifetime of your shell:
+
+```bash
+# Duco GCR5-910 (default — no env var needed)
+cd /home/robot/Documents/duco_control
+source install/setup.bash
+ros2 launch duco_robot_bringup gcr5_910_ros2_control.launch.py ...
+
+# UR15
+cd /home/robot/Documents/duco_control
+source install/setup.bash
+export ROBOT_CONFIG_PATH=$PWD/config/robot_config.ur15.yaml
+ros2 launch ur15_robot_bringup ur15_ros2_control.launch.py ...
+```
+
+The toolkit reads `ROBOT_CONFIG_PATH` once per process, so **every**
+terminal you use in the UR15 stack (bringup, gravity compensation,
+cartesian_control_manager, dashboard) must export it before launching.
+
+### UR15 bringup sequence
+
+The flow mirrors the Duco one; only steps 1 and 2 differ.
+
+1.  **UR15 ros2_control bringup**
+    ```bash
+    export ROBOT_CONFIG_PATH=$PWD/config/robot_config.ur15.yaml
+    ros2 launch ur15_robot_bringup ur15_ros2_control.launch.py
+    ```
+    This wraps the upstream `ur_control.launch.py` and brings up the
+    standard UR controller stack including
+    `scaled_joint_trajectory_controller` (active) and
+    `force_torque_sensor_broadcaster` (active, publishing
+    `/force_torque_sensor_broadcaster/wrench` in `tool0`).
+    Smoke-test with `use_fake_hardware:=true` first.
+    > Be careful: the upstream `ur_control.launch.py` arg is
+    > `use_fake_hardware`, NOT `use_mock_hardware` (the latter is
+    > silently ignored and the driver will connect to the real arm
+    > at `robot_ip`).
+
+2.  **Gravity compensation** — same launch as Duco, but the topic the
+    toolkit subscribes to is now
+    `/force_torque_sensor_broadcaster/wrench` (set in
+    `robot_config.ur15.yaml::ft_sensor_gravity_compensation.input_topic`).
+    No `duco_ft_sensor` launch is needed — UR's broadcaster replaces it.
+    ```bash
+    ros2 launch ft_sensor_gravity_compensation compensation.launch.py
+    ```
+
+3.  **Cartesian control manager** — identical command, identical
+    safety supervisor; the manager auto-routes between
+    `scaled_joint_trajectory_controller` and the FZI controllers
+    because `fzi_jtc_controller_name` is set in
+    `robot_config.ur15.yaml`.
+    ```bash
+    ros2 launch cartesian_control_manager cartesian_control_real.launch.py
+    ```
+
+4.  **Dashboards (optional)** — identical commands; the dashboards
+    read from whichever config `ROBOT_CONFIG_PATH` points at.
+
+### Smoke test (no robot)
+
+```bash
+export ROBOT_CONFIG_PATH=$PWD/config/robot_config.ur15.yaml
+
+# Terminal A
+ros2 launch ur15_robot_bringup ur15_ros2_control.launch.py use_fake_hardware:=true
+
+# Terminal B (after A is up)
+ros2 launch cartesian_control_manager cartesian_control.launch.py
+
+# Verify
+ros2 control list_controllers
+#   cartesian_{force,motion,compliance}_controller all "inactive"
+#   plus scaled_joint_trajectory_controller "active" (and the rest of UR's stack)
+
+ros2 service call /cartesian_control_manager/engage std_srvs/srv/Trigger
+#   expect refusal: "no wrench received yet" — mock_components zero-fills
+#   the FT broadcaster's state interfaces, so the manager has not seen
+#   a real wrench message yet.
+```
+
+### Firewall
+
+When connecting to a real UR15, the URScript pushed by the driver
+opens reverse connections back to the host on TCP ports
+`50001`–`50004`.  With UFW + `default deny incoming`, the controllers
+will load `active` but the arm will not move.  Open the ports
+inbound from the robot's IP:
+
+```bash
+ROBOT_IP=192.168.1.15
+for p in 50001 50002 50003 50004; do
+  sudo ufw allow from "$ROBOT_IP" to any port $p proto tcp comment "UR URScript reverse $p"
+done
+sudo ufw reload
+```
+
+### UR-vs-Duco notes
+
+* FZI uses the `position` command interface on UR (same one
+  `scaled_joint_trajectory_controller` writes to), so the manager's
+  atomic JTC<->FZI swap works identically to Duco.
+* UR firmware compensates for gravity internally and FZI does not use
+  joint torques, so there is no double-gravity-compensation concern
+  (unlike the CRISP setup, which uses `effort` and must explicitly
+  disable gravity compensation).
+* The Duco-tuned PD gains in `fzi_preset.yaml` transfer to UR15
+  because they tune the IK solver's *virtual* end-effector mass, not
+  the arm's real dynamics.
+
+---
+
 ## Repository layout
 
 ```
 duco_control/
 ├── config/
-│   ├── robot_config.yaml             # active config (gitignored)
-│   └── robot_config.example.yaml     # template
+│   ├── robot_config.yaml             # active Duco config (gitignored)
+│   ├── robot_config.example.yaml     # Duco template
+│   ├── robot_config.ur15.yaml        # active UR15 config (gitignored)
+│   └── robot_config.ur15.example.yaml  # UR15 template
 ├── external/
 │   ├── duco_ros2_driver/             # submodule (upstream Duco driver)
 │   ├── cartesian_controllers/        # submodule (FZI fork w/ Duco mods)
@@ -495,7 +636,8 @@ duco_control/
 │       ├── ft_sensor_gravity_compensation/  # gravity-compensated wrench
 │       └── ft_sensor_dashboard/      #   sensor-agnostic wrench UI
 ├── src/
-│   ├── duco_robot_bringup/           # per-robot bringup + fzi_preset.yaml
+│   ├── duco_robot_bringup/           # per-robot bringup + fzi_preset.yaml (Duco)
+│   ├── ur15_robot_bringup/           # per-robot bringup + fzi_preset.yaml (UR15)
 │   ├── duco_ft_sensor/
 │   ├── duco_dashboard/
 │   ├── alicia_teleop/                # leader -> follower teleop bridge

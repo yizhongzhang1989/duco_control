@@ -1,0 +1,124 @@
+# ur15_control project configuration template
+#
+# Copy this file to ``config/robot_config.yaml`` and edit with your
+# local values.  ``robot_config.yaml`` is gitignored.
+#
+#   cp config/robot_config.example.yaml config/robot_config.yaml
+#   ${EDITOR:-nano} config/robot_config.yaml
+#
+# Convention: top-level keys are PACKAGE NAMES; second-level keys are
+# the names the package's launch file exposes (i.e. they map 1-to-1 to
+# ``ros2 launch <pkg> <launch_file> <key>:=<value>``).  Values not set
+# here fall back to whatever the consuming launch file defaults to.
+
+version: "1.0"
+
+# ============================================================================
+# ft_sensor_dashboard  (web dashboard for any WrenchStamped topic)
+# Shipped by external/cartesian_controllers_toolkit.
+# ============================================================================
+ft_sensor_dashboard:
+  topic: "/ft_compensated"  # gravity-compensated UR TCP wrench
+  host: "0.0.0.0"
+  port: 8080
+  window_seconds: 10.0
+  push_rate: 30.0
+  reliability: "reliable"   # UR's force_torque_sensor_broadcaster is reliable
+  title: "UR15 TCP F/T"
+
+# ============================================================================
+# ft_sensor_gravity_compensation  (compensated wrench publisher + calibration UI)
+# Shipped by external/cartesian_controllers_toolkit.
+# Subscribes to /force_torque_sensor_broadcaster/wrench (UR's built-in TCP F/T
+# at ~125 Hz, frame tool0) and publishes a gravity-compensated wrench on
+# /ft_compensated.
+# ============================================================================
+ft_sensor_gravity_compensation:
+  input_topic: "/force_torque_sensor_broadcaster/wrench"
+  output_topic: "/ft_compensated"
+  world_frame: "base_link"      # gravity-fixed frame
+  sensor_frame: "tool0"         # sensor mount frame
+  reliability: "reliable"       # match the upstream broadcaster's QoS
+  publish_when_no_tf: false
+  storage_path: "~/.ros/ft_sensor_gravity_compensation/ur15_end_effectors.yaml"
+  enable_dashboard: true
+  host: "0.0.0.0"
+  port: 8100
+  gravity: 9.80665
+  tf_timeout: 0.05
+  tf_max_age: 1.0
+
+# ============================================================================
+# cartesian_control_manager  (FZI orchestrator: engage UX + safety supervisor).
+# Shipped by external/cartesian_controllers_toolkit.
+# ============================================================================
+cartesian_control_manager:
+  # ---- connectivity ----
+  wrench_topic:        "/ft_compensated"
+  joint_states_topic:  "/joint_states"
+  controller_manager_ns: "/controller_manager"
+  engaged_default:     false
+  # ---- FZI controller wiring ----
+  active_controller_name:  "cartesian_force_controller"
+  fzi_jtc_controller_name: "scaled_joint_trajectory_controller"   # UR's JTC
+  fzi_target_frame:        "tool0"
+  fzi_target_rate_hz:      10.0
+  fzi_service_timeout_sec: 2.0
+  fzi_controller_yaml_package: "ur15_robot_bringup"
+  fzi_controller_yaml_relpath: "config/fzi_preset.yaml"
+  # ---- supervisor + state publish ----
+  loop_rate_hz:          50.0
+  state_publish_rate_hz: 5.0
+  # ---- safety ----
+  max_wrench_force:         80.0
+  max_wrench_torque:        10.0
+  engage_max_joint_velocity: 0.05
+  ft_stale_after:           0.25
+  joint_states_stale_after: 0.25
+
+# ============================================================================
+# cartesian_controller_dashboard  (web UI for monitoring + parameter tuning).
+# Shipped by external/cartesian_controllers_toolkit.
+# ============================================================================
+cartesian_controller_dashboard:
+  orchestrator_ns:     "/cartesian_control_manager"
+  controller_name:     "cartesian_force_controller"
+  wrench_topic:        "/ft_compensated"
+  joint_states_topic:  "/joint_states"
+  # Top-level robot_config.yaml key whose aux_frames list the
+  # dashboard's "Tool frames" panel reads / writes.  Stock UR15 has
+  # the chain base_link -> ... -> tool0 with no aux frames needed,
+  # so this is left pointing at our (empty) ur15_robot_bringup section.
+  aux_frames_section:  "ur15_robot_bringup"
+  service_timeout_sec: 2.0
+  host: "0.0.0.0"
+  port: 8120
+
+# ============================================================================
+# ur15_robot_bringup  (this package: thin wrapper around ur_robot_driver)
+# ============================================================================
+ur15_robot_bringup:
+  ur_type: "ur15"
+  robot_ip: "192.168.1.15"
+  use_fake_hardware: false      # true = mock_components, false = real UR
+                                # (this is the upstream arg name; we used
+                                # to call it use_mock_hardware, which the
+                                # upstream ur_control.launch.py silently
+                                # ignores).
+  use_rviz: false               # set true to launch the upstream RViz
+  headless_mode: true           # no URCap required when true
+  reverse_ip: "0.0.0.0"         # auto-detect host IP for URScript
+  initial_joint_controller: "scaled_joint_trajectory_controller"
+  activate_joint_controller: true
+  # Stock UR15 has the chain base_link -> ... -> tool0 directly, so we
+  # do not need any auxiliary frames for the FZI Cartesian solver.
+  # If you ever mount a tool plate, append entries here:
+  #   - name: tool_plate
+  #     parent: tool0
+  #     xyz: [0.0, 0.0, 0.020]
+  #     rpy: [0.0, 0.0, 0.0]
+  # and a static_transform_publisher (or a custom URDF) to make them
+  # actually visible to controller_manager.  This bringup launch
+  # currently does NOT append aux frames to the URDF (unlike Duco) --
+  # add that later if the tool stack grows.
+  aux_frames: []
