@@ -18,17 +18,17 @@ dashboards.
 
 | package | purpose | runtime port |
 |---|---|---|
-| [`duco_robot_bringup`](src/duco_robot_bringup) | project-owned launch wrapper around the upstream `duco_*` driver (URDF + `controller_manager` + JTC) | -- |
+| [`duco_robot_bringup`](src/duco_robot_bringup) | project-owned launch wrapper around the upstream `duco_*` driver (URDF + `controller_manager` + JTC); also ships the per-robot `config/fzi_preset.yaml` consumed by `cartesian_control_manager` | -- |
 | [`duco_ft_sensor`](src/duco_ft_sensor) | serial driver + ROS publisher for the Duco F/T sensor | -- |
-| [`ft_sensor_dashboard`](src/ft_sensor_dashboard) | optional web UI for any `WrenchStamped` topic | `8080` |
-| [`ft_sensor_gravity_compensation`](src/ft_sensor_gravity_compensation) | subscribes to the raw wrench + `/tf`, publishes a gravity-compensated wrench, has its own calibration UI | `8100` |
-| [`cartesian_control_manager`](src/cartesian_control_manager) | spawns FZI's `cartesian_force_controller` / `cartesian_motion_controller` / `cartesian_compliance_controller` (all inactive), relays the wrench, publishes a zero target_wrench heartbeat, runs the engage / disengage Trigger services and a safety supervisor | -- |
-| [`cartesian_controller_dashboard`](src/cartesian_controller_dashboard) | optional web UI for engage / disengage, controller selection (force / motion / compliance), and live-tuning of the active controller's gains | `8120` |
+| [`ft_sensor_dashboard`](external/cartesian_controllers_toolkit/ft_sensor_dashboard) | optional web UI for any `WrenchStamped` topic *(from the toolkit submodule)* | `8080` |
+| [`ft_sensor_gravity_compensation`](external/cartesian_controllers_toolkit/ft_sensor_gravity_compensation) | subscribes to the raw wrench + `/tf`, publishes a gravity-compensated wrench, has its own calibration UI *(from the toolkit submodule)* | `8100` |
+| [`cartesian_control_manager`](external/cartesian_controllers_toolkit/cartesian_control_manager) | spawns FZI's `cartesian_force_controller` / `cartesian_motion_controller` / `cartesian_compliance_controller` (all inactive), relays the wrench, publishes a zero target_wrench heartbeat, runs the engage / disengage Trigger services and a safety supervisor *(from the toolkit submodule)* | -- |
+| [`cartesian_controller_dashboard`](external/cartesian_controllers_toolkit/cartesian_controller_dashboard) | optional web UI for engage / disengage, controller selection (force / motion / compliance), and live-tuning of the active controller's gains *(from the toolkit submodule)* | `8120` |
 | [`duco_dashboard`](src/duco_dashboard) | optional web UI for joint / controller / TCP state | `8090` |
 | [`alicia_teleop`](src/alicia_teleop) | leader-follower teleop bridge: maps Alicia-D joint angles to the Duco follower with a per-joint velocity- and acceleration-limited interpolator; auto-switches `arm_1_controller` ↔ `forward_position_controller` at launch / shutdown | -- |
 | [`alicia_duo_leader_driver`](src/alicia_leader/alicia_duo_leader_driver) | serial driver for the Alicia-D 6-DoF leader arm (publishes `/arm_joint_state`) | -- |
 | [`alicia_duo_leader_dashboard`](src/alicia_leader/alicia_duo_leader_dashboard) | optional web UI for the leader arm (button / joint state) | `8130` |
-| [`common`](src/common) | centralised config loader (reads `config/robot_config.yaml`) |
+| [`common`](external/cartesian_controllers_toolkit/common) | centralised config loader (reads `config/robot_config.yaml`) + shared URDF/XML helpers *(from the toolkit submodule)* |
 
 The official Duco ROS 2 driver is tracked as a git submodule at
 `external/duco_ros2_driver`.  Its packages provide
@@ -487,19 +487,28 @@ duco_control/
 │   └── robot_config.example.yaml     # template
 ├── external/
 │   ├── duco_ros2_driver/             # submodule (upstream Duco driver)
-│   └── cartesian_controllers/        # submodule (FZI fork w/ Duco mods)
+│   ├── cartesian_controllers/        # submodule (FZI fork w/ Duco mods)
+│   └── cartesian_controllers_toolkit/  # submodule: robot-agnostic Cartesian stack
+│       ├── common/                   #   shared config loader + URDF helpers
+│       ├── cartesian_control_manager/  # FZI orchestrator + safety supervisor
+│       ├── cartesian_controller_dashboard/  # optional web UI
+│       ├── ft_sensor_gravity_compensation/  # gravity-compensated wrench
+│       └── ft_sensor_dashboard/      #   sensor-agnostic wrench UI
 ├── src/
-│   ├── common/
-│   ├── duco_robot_bringup/
+│   ├── duco_robot_bringup/           # per-robot bringup + fzi_preset.yaml
 │   ├── duco_ft_sensor/
-│   ├── ft_sensor_dashboard/
-│   ├── ft_sensor_gravity_compensation/
-│   ├── cartesian_control_manager/
-│   ├── cartesian_controller_dashboard/
 │   ├── duco_dashboard/
 │   ├── alicia_teleop/                # leader -> follower teleop bridge
 │   └── alicia_leader/                # Alicia-D leader driver + dashboard
 └── tools/
+```
+
+To clone with all submodules:
+
+```bash
+git clone --recurse-submodules https://github.com/yizhongzhang1989/duco_control.git
+# or, after a flat clone:
+git submodule update --init --recursive
 ```
 
 ---

@@ -9,3 +9,6 @@
 	path = src/alicia_leader
 	url = https://github.com/yizhongzhang1989/Alicia-D-Leader-ROS.git
 	shallow = true
+[submodule "external/cartesian_controllers_toolkit"]
+	path = external/cartesian_controllers_toolkit
+	url = https://github.com/yizhongzhang1989/cartesian_controllers_toolkit.git
