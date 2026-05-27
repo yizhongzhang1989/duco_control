@@ -85,6 +85,11 @@ cartesian_controller_dashboard:
   controller_name:     "cartesian_force_controller"
   wrench_topic:        "/ft_compensated"
   joint_states_topic:  "/joint_states"
+  # TCP pose display: dashboard looks up base_frame -> tool_frame via TF.
+  # Default upstream values are base_link / compliance_link (Duco names);
+  # for UR15 the end-effector frame is tool0 (or wrist_3_link / flange).
+  base_frame:          "base_link"
+  tool_frame:          "tool0"
   # Top-level robot_config.yaml key whose aux_frames list the
   # dashboard's "Tool frames" panel reads / writes.  Stock UR15 has
   # the chain base_link -> ... -> tool0 with no aux frames needed,

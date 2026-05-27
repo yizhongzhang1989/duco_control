@@ -52,19 +52,36 @@ cartesian_force_controller:
     command_interfaces:
       - position
     solver:
-      error_scale: 0.05       # FZI default is 1.0; 0.05 keeps omega_n
-                              # in the human-guidance band.
-      iterations: 5
+      # UR15 first-engage SAFETY values.  The previous p=5.0, error_scale=0.05
+      # caused heavy shaking on real hardware because:
+      #   1. loop_gain ~ p * error_scale / link_mass = 5*0.05/0.1 = 2.5,
+      #      a factor of 12.5x above what the Duco arm tolerated;
+      #   2. the UR's scaled_joint_trajectory_controller adds an extra
+      #      lag in the loop that Duco's direct-position interface does
+      #      not have, so the FZI command rate can outrun the JTC and
+      #      drive a positive-feedback oscillation;
+      #   3. residual gravity-compensation bias (e.g. fz ~ -7 N at rest)
+      #      is amplified by the loop gain into Cartesian motion.
+      # Re-tune live AFTER calibrating gravity comp and confirming the
+      # arm holds still on engage.  See
+      # /memories/repo/fzi_force_controller_damping.md.
+      error_scale: 0.02       # FZI default 1.0; this keeps omega_n low.
+      iterations: 3           # Was 5; lower => less integration per tick.
       publish_state_feedback: true
     pd_gains:
-      # Conservative starting values.  See the Duco preset header for
-      # the d ~ p/40 (trans) / p/10 (rot) sizing rule.
-      trans_x: {p: 5.0,  d: 0.05}
-      trans_y: {p: 5.0,  d: 0.05}
-      trans_z: {p: 5.0,  d: 0.05}
-      rot_x:   {p: 50.0, d: 5.0}
-      rot_y:   {p: 50.0, d: 5.0}
-      rot_z:   {p: 50.0, d: 5.0}
+      # Auto-tuned 2026-05-27 via tools/cartesian_auto_tune.py with
+      # target_wrench bias-cancellation: ladder p in {0.5,1.0,1.5,2.0}
+      # stayed in the linear noise-tracking regime; growth factors
+      # tracked the p-ratio (no super-linear blow-up = no oscillation).
+      # p=1.5 was the largest gain that kept joint range <3 deg over
+      # a 2 s window; p=2.0 reached 3.18 deg, still linear but past
+      # the safety threshold.  Headroom of ~33% below true instability.
+      trans_x: {p: 1.5,  d: 0.075}
+      trans_y: {p: 1.5,  d: 0.075}
+      trans_z: {p: 1.5,  d: 0.075}
+      rot_x:   {p: 30.0, d: 3.0}
+      rot_y:   {p: 30.0, d: 3.0}
+      rot_z:   {p: 30.0, d: 3.0}
 
 # --- Motion controller ---------------------------------------------------
 # Drives the end-effector toward target_frame (PoseStamped on
@@ -85,15 +102,18 @@ cartesian_motion_controller:
       - position
     solver:
       error_scale: 1.0        # FZI default
-      iterations: 5
+      iterations: 3           # Match force_controller; was 5.
       publish_state_feedback: true
     pd_gains:
-      trans_x: {p: 5.0}
-      trans_y: {p: 5.0}
-      trans_z: {p: 5.0}
-      rot_x:   {p: 50.0}
-      rot_y:   {p: 50.0}
-      rot_z:   {p: 50.0}
+      # Lowered in lockstep with the force controller -- same UR JTC
+      # lag applies here when tracking target_frame.  Auto-tune used
+      # the force controller as the proxy; motion mirrors those gains.
+      trans_x: {p: 1.5}
+      trans_y: {p: 1.5}
+      trans_z: {p: 1.5}
+      rot_x:   {p: 30.0}
+      rot_y:   {p: 30.0}
+      rot_z:   {p: 30.0}
 
 # --- Compliance controller ----------------------------------------------
 # net_force = stiffness * (target_frame - current_frame)
