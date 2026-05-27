@@ -54,6 +54,13 @@ Key knobs:
 * `duco_ft_sensor.port`, `baud` -- serial device for the F/T sensor.
 * `duco_cartesian_control.max_wrench_force`, `max_wrench_torque`,
   `engage_max_joint_velocity` -- safety supervisor trip thresholds.
+* `duco_robot_bringup.aux_frames` -- list of fixed-joint TF frames the
+  bringup appends to the URDF (default chain
+  `link_6 -> ft_sensor_link -> compliance_link`). `ft_sensor_link` is
+  the gravity-compensation sensor frame; `compliance_link` is the FZI
+  `end_effector_link`. Edit xyz/rpy by hand or via the cartesian
+  dashboard's "Tool frames" panel; changes take effect on the next
+  `duco_robot_bringup` launch.
 
 Anything declared in a launch file's `_FALLBACKS` block can be overridden
 on the CLI as well, e.g. `port:=9120`.
@@ -194,9 +201,16 @@ Open <http://localhost:8120/>.  The dashboard:
 * shows engaged / tripped / idle status, live wrench, freshness pills,
 * has big **Engage** / **Disengage** buttons (call the orchestrator's
   Trigger services),
+* renders a live 3D skeleton of `/robot_description` with the URDF's
+  TF tree (drag to orbit, wheel to zoom),
 * lets you live-tune the FZI controller's gains
   (`pd_gains.trans_*.p`, `pd_gains.rot_*.p`, `solver.error_scale`,
-  `solver.iterations`) without restarting anything.
+  `solver.iterations`) without restarting anything,
+* has a **Tool frames** panel for editing the xyz / rpy of each
+  `duco_robot_bringup.aux_frames` entry (e.g. `ft_sensor_link`,
+  `compliance_link`).  Saving writes back to `config/robot_config.yaml`
+  preserving comments; the new values take effect on the next
+  `duco_robot_bringup` launch.
 
 The dashboard is purely a UI; closing it does **not** stop the
 orchestrator, the controller, or the safety supervisor.
@@ -227,6 +241,100 @@ Auto-disengage trips: stale wrench, stale joint_states,
 `|F| > max_wrench_force`, `|T| > max_wrench_torque`.  The supervisor
 reverses the controller switch so the JTC takes over and the arm holds
 its current pose.
+
+### Setting the target wrench
+
+While engaged on the `cartesian_force_controller` (or
+`cartesian_compliance_controller`), the FZI plugin minimises
+`target_wrench − measured_wrench`.  An all-zero target gives **pure
+free-drive** (the robot yields to operator pushes); a non-zero target
+makes the robot **actively apply that wrench** to its environment.
+
+By default the wrench is interpreted in the **end-effector frame**
+(`hand_frame_control:=true`).  Set
+`ros2 param set /cartesian_force_controller hand_frame_control false`
+to interpret it in the robot base frame instead.
+
+The orchestrator owns the publisher to
+`/<active_controller>/target_wrench` and gives you two ways to drive
+it -- both **safety-clamped** to `max_wrench_force` /
+`max_wrench_torque` before being forwarded to FZI.
+
+#### 1. Static setpoint via parameters (one-shot, low rate)
+
+For fixed-direction tasks (constant push, weight assist, ...).  The
+orchestrator publishes these six values at `fzi_target_rate_hz`
+(default 10 Hz) whenever no external publisher is fresh:
+
+```bash
+# Apply +10 N along the EE +Z axis (e.g. press into a surface).
+ros2 param set /duco_cartesian_control target_wrench_force_z 10.0
+
+# Zero everything (pure free-drive again).
+for ax in x y z; do
+  ros2 param set /duco_cartesian_control target_wrench_force_$ax  0.0
+  ros2 param set /duco_cartesian_control target_wrench_torque_$ax 0.0
+done
+```
+
+These six params can also be set as launch overrides:
+
+```bash
+ros2 launch duco_cartesian_control cartesian_control_real.launch.py \
+    target_wrench_force_z:=10.0
+```
+
+#### 2. External topic (high rate, e.g. SpaceMouse / scripts)
+
+Set `external_target_wrench_topic` to any `geometry_msgs/WrenchStamped`
+topic.  The orchestrator subscribes **BEST_EFFORT**, clamps each
+message, and forwards it to FZI immediately (no rate limiting):
+
+```bash
+# Launch with the SpaceMouse topic wired in:
+ros2 launch duco_cartesian_control cartesian_control_real.launch.py \
+    external_target_wrench_topic:=/spacemouse/target_wrench \
+    external_target_wrench_timeout_sec:=0.2
+
+# Drive it from anywhere -- here a constant 10 N along EE +Z at 100 Hz:
+ros2 topic pub -r 100 /spacemouse/target_wrench geometry_msgs/WrenchStamped \
+    '{header: {frame_id: ""}, wrench: {force: {z: 10.0}}}'
+```
+
+If no message arrives for `external_target_wrench_timeout_sec`
+(default 0.2 s) the heartbeat falls back to the parameter setpoint, so
+losing the external publisher disengages the active wrench gracefully
+rather than freezing the last value.
+
+#### 3. Direct to FZI (bypasses the safety clamp)
+
+You can also publish straight to `/<controller>/target_wrench`, but
+the orchestrator's clamp and the 10 Hz heartbeat will keep overwriting
+you unless you publish at >10 Hz **and** keep
+`external_target_wrench_topic` empty.  Use only for debugging.
+
+#### Verifying
+
+```bash
+# What the active controller actually sees:
+ros2 topic echo /cartesian_force_controller/target_wrench
+
+# Orchestrator status (engaged, active controller, last external age):
+ros2 topic echo /duco_cartesian_control/state --once
+```
+
+Sign conventions on the GCR5_910 with the default URDF: EE +Z points
+along the tool away from the wrist, so `target_wrench_force_z = +10`
+means "press the tool tip into the surface in front of it".
+
+> Tuning note: holding a steady non-zero wrench against a **rigid**
+> surface is governed by the force-control loop gain
+> (`pd_gains.*.p × solver.error_scale`).  The packaged defaults in
+> [`config/fzi_zero_gravity.yaml`](src/duco_cartesian_control/config/fzi_zero_gravity.yaml)
+> are tuned for stable rigid contact.  See
+> [Live tuning of the FZI controller](#live-tuning-of-the-fzi-controller)
+> if you need to trade some contact stability for snappier free-drive
+> response, or vice versa.
 
 ---
 

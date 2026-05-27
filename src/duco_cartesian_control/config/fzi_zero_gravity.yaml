@@ -10,9 +10,22 @@
 #   * end_effector_link / robot_base_link / ft_sensor_ref_link / joints
 #     are identical across the three controllers and should match the
 #     URDF that controller_manager sees.
+#   * The KDL chain runs base_link -> link_1..link_6 -> ft_sensor_link
+#     -> compliance_link (the latter two are aux frames declared in
+#     ``robot_config.yaml::duco_robot_bringup.aux_frames`` and appended
+#     to the URDF by ``duco_robot_bringup`` at bringup). With zero
+#     offsets the tip pose is identical to link_6 -- so JTC behaviour
+#     is unchanged -- but FZI's ``robotChainContains`` now accepts both
+#     ``ft_sensor_link`` and ``compliance_link`` as ref links.
 #   * pd_gains are deliberately conservative for first contact; tune
 #     them at runtime via the dashboard or
 #     ``ros2 param set /<controller_name> pd_gains.trans_x.p ...``.
+#   * Each pd_gains axis carries BOTH a ``p`` and a ``d`` term -- the
+#     D term damps the rate of change of the wrench error and is what
+#     prevents limit-cycle bouncing when the EE makes contact with a
+#     rigid surface under force control.  Rule of thumb on this arm:
+#     start at d ~= p / 40 for trans_*, d ~= p / 10 for rot_*; both
+#     can be live-tuned via ``ros2 param set /<ctl> pd_gains.<ax>.d``.
 #   * The compliance controller adds ``stiffness.*`` -- this is the
 #     impedance the arm projects on its environment when an external
 #     wrench is applied (units: N/m for trans_*, Nm/rad for rot_*).
@@ -20,11 +33,16 @@
 # --- Force controller ----------------------------------------------------
 # Minimises (target_wrench - ft_sensor_wrench).  With our orchestrator
 # publishing target_wrench=0, this is pure free-drive (hand guidance).
+#
+# ``ft_sensor_ref_link`` is the URDF frame in which the FT measurement is
+# expressed.  It must exist in the KDL chain seen by controller_manager;
+# the ``ft_sensor_link`` aux frame is appended at bringup by
+# ``duco_robot_bringup`` from ``robot_config.yaml::duco_robot_bringup.aux_frames``.
 cartesian_force_controller:
   ros__parameters:
-    end_effector_link: "link_6"
+    end_effector_link: "compliance_link"
     robot_base_link: "base_link"
-    ft_sensor_ref_link: "link_6"
+    ft_sensor_ref_link: "ft_sensor_link"
     joints:
       - arm_1_joint_1
       - arm_1_joint_2
@@ -39,12 +57,17 @@ cartesian_force_controller:
       iterations: 5
       publish_state_feedback: true
     pd_gains:
-      trans_x: {p: 0.2}
-      trans_y: {p: 0.2}
-      trans_z: {p: 0.2}
-      rot_x:   {p: 0.5}
-      rot_y:   {p: 0.5}
-      rot_z:   {p: 0.5}
+      # P alone is undamped against a rigid environment -- pure P force
+      # control + light virtual mass (solver.forward_dynamics.link_mass)
+      # is an oscillator.  The D term damps de/dt of the wrench error
+      # and is what kills the contact bounce.  See header comment for
+      # the d ~ p/40 (trans) / p/10 (rot) sizing rule used here.
+      trans_x: {p: 5.0,  d: 0.05}
+      trans_y: {p: 5.0,  d: 0.05}
+      trans_z: {p: 5.0,  d: 0.05}
+      rot_x:   {p: 50.0, d: 5.0}
+      rot_y:   {p: 50.0, d: 5.0}
+      rot_z:   {p: 50.0, d: 5.0}
 
 # --- Motion controller ---------------------------------------------------
 # Drives the end-effector toward target_frame (PoseStamped on
@@ -52,7 +75,7 @@ cartesian_force_controller:
 # pose, so without an external publisher it simply holds pose.
 cartesian_motion_controller:
   ros__parameters:
-    end_effector_link: "link_6"
+    end_effector_link: "compliance_link"
     robot_base_link: "base_link"
     joints:
       - arm_1_joint_1
@@ -68,25 +91,205 @@ cartesian_motion_controller:
       iterations: 5
       publish_state_feedback: true
     pd_gains:
-      trans_x: {p: 1.0}
-      trans_y: {p: 1.0}
-      trans_z: {p: 1.0}
-      rot_x:   {p: 0.5}
-      rot_y:   {p: 0.5}
-      rot_z:   {p: 0.5}
+      trans_x: {p: 5.0}
+      trans_y: {p: 5.0}
+      trans_z: {p: 5.0}
+      rot_x:   {p: 50.0}
+      rot_y:   {p: 50.0}
+      rot_z:   {p: 50.0}
 
 # --- Compliance controller ----------------------------------------------
-# Combination of motion + force: drives toward target_frame while
-# yielding to target_wrench.  ``stiffness`` is the apparent impedance of
-# the end-effector in the compliance_ref_link frame (here = end-effector
-# link, so a downward push in tool-Z yields in tool-Z).  Conservative
-# stiffness numbers; raise for stiffer "stay on the path" behaviour.
+# Combination of motion + force.  FZI internally computes
+#   net_force = stiffness * (target_frame - current_frame)
+#               + (target_wrench - measured_wrench)
+# and feeds that 6D wrench through the SAME Base::computeJointControlCmds
+# pipeline that the force controller uses.  Consequence: ``pd_gains.*``
+# and ``solver.error_scale`` act on identical-units inputs in both
+# controllers, so we mirror the working force-controller values here and
+# only ``stiffness.*`` is genuinely "compliance-specific".
+#
+# Picking stiffness (this is the dominant "rigid vs flexible" knob):
+#   * trans: hand push of 1 N at K=30 N/m yields ~33 mm static
+#     displacement -- still soft enough for hand guidance, but firm
+#     enough that small FT-bias residuals don't walk the EE far.
+#     Lower K (e.g. 5-10 N/m) for closer-to-free-drive feel (but
+#     gravity-comp residuals will then walk the EE noticeably).
+#     Higher K (e.g. 100 N/m) for stiffer "stay on path" behaviour.
+#   * rot:   torque of 0.1 Nm at K=2 Nm/rad yields ~2.9 deg static
+#     rotation.  Same scaling logic.
+#
+# Picking pd_gains.*.p (this is the "tracking bandwidth" knob, NOT
+# a stiffness knob -- the spring K is what the user feels):
+#   * P*K*error_scale sets the closed-loop spring forward gain
+#     k_eff, so the natural frequency is
+#         omega_n = sqrt(k_eff / m_v)
+#     where m_v is the IK solver's virtual end-effector mass, set by
+#     ``solver.forward_dynamics.link_mass`` (default 0.1 kg in the
+#     upstream FZI controller).  THIS DEFAULT IS THE DOMINANT
+#     STABILITY KNOB and the easiest one to forget: keeping the
+#     default makes the loop ~3x stiffer than typical "1 kg"
+#     textbook analyses suggest.
+#   * Current trans (P=1, K=30, scale=0.05) at m_v=0.1:
+#         omega_n = sqrt(1*30*0.05/0.1) = sqrt(15) = 3.87 rad/s
+#         period  = 2pi/omega_n        = 1.62 s
+#     -> tracking recovery from a 1-cm displacement in ~250 ms.
+#   * Raising P linearly raises k_eff without changing the operator
+#     feel (which is set by K alone, via the static balance equation
+#     K*x = F_operator).  Cap P where ringing starts (zeta_global
+#     drops below 0.5).
+#
+# Picking solver.error_scale + solver.iterations:
+#   * The IK solver runs ``iterations`` substeps per outer cycle.
+#     Each substep integrates velocity for 0.02 simulated seconds
+#     (HARD-CODED inside cartesian_compliance_controller.cpp,
+#     independent of error_scale and of the outer 50-Hz period),
+#     then multiplies velocity by 0.9 (the IK damping; see below).
+#   * ``error_scale`` is a unitless multiplier on the Cartesian
+#     forward gain entering the IK solver (it scales the input net
+#     force).  Lowering it directly lowers omega_n.
+#   * ``iterations`` sets only the damping ratio: with N substeps,
+#     velocity decays by 0.9^N per outer cycle, i.e.
+#         c_global = -ln(0.9^N) / 0.02 = N * 5.27 s^-1
+#     With N=1: c_global = 5.27 s^-1 -> zeta = 5.27/(2*omega_n).
+#
+# *** Damping note: where the damping ACTUALLY comes from ***
+# The compliance controller closes a Cartesian POSITION loop through
+# the spring K * (target - current); the pure force controller does
+# not.  An earlier revision of this file sized D against that spring
+# loop using a continuous-time model
+#     m_v * x'' + (error_scale*D*K) * x' + (error_scale*P*K) * x = 0
+# but that model is WRONG for this controller: it omits the dominant
+# damping term, which is the IK solver's per-inner-iteration velocity
+# contraction
+#     v_new = 0.9 * (v_old + a * 0.02 s)
+# baked into ForwardDynamicsSolver::getJointControlCmds.  With
+# iterations=N substeps per outer cycle, velocity decays by 0.9^N
+# per outer cycle, equivalent to a continuous-time decay rate
+#     c_global = -ln(0.9^N) / 0.02 s = N * 5.27 s^-1
+# At the current settings (K=30, P=1, scale=0.05, iters=1, m_v=0.1):
+#     omega_n     = sqrt(P*K*scale / m_v) = sqrt(15) = 3.87 rad/s
+#     c_global    = 1 * 5.27 = 5.27 s^-1
+#     zeta_global = c_global / (2 * omega_n) = 0.68  (well-damped)
+# Raising the D gain does NOT improve stability of the spring loop;
+# it only injects FT-sensor noise into the position command, because
+# the discrete PDController computes
+#     D_term = D * (error_t - error_{t-1}) / 0.02
+# and the FT measurement changes by roughly its noise level between
+# outer cycles.  We zero D entirely (verified live: no measurable
+# shake increase over D=0.1).  All meaningful damping comes from the
+# IK solver's 0.9 multiplier.
+#
+# *** History: the painful lesson on m_v ***
+# An earlier revision of this file ran with P=10, K=30, scale=0.05,
+# iters=1, D=0.  The accompanying comments asserted m_v ~ 1 kg and
+# computed omega_n = 3.87 rad/s, zeta = 0.68 -- right at the ideal
+# damping.  In a 2-second offline probe (tools/compliance_tune.py)
+# this config returned shake = 5.5 mrad/s = noise floor, so we
+# shipped it.  When the operator clicked engage from a settled
+# (NOT-just-homed) state, a slow FT bias of ~1 N drove the loop
+# into a limit cycle of 200-300 mrad/s joint velocity and the arm
+# walked 50 deg off home over a few seconds.  The off-home pose
+# then changed the Jacobian conditioning and the controller would
+# not recover.
+#
+# Root cause: ``solver.forward_dynamics.link_mass`` defaults to
+# 0.1 kg, not 1 kg, so the true omega_n was sqrt(10) higher and
+# zeta was sqrt(10) lower than calculated; the system was severely
+# under-damped (zeta ~ 0.21).  A clean P-sweep from home (with JTC
+# re-home between configs to remove pose contamination) measured:
+#     P=10  -> 205 mrad/s shake, 114 mrad drift (limit-cycle)
+#     P=5   ->  12 mrad/s shake,  25 mrad drift
+#     P=3   -> 5.5 mrad/s shake,  15 mrad drift
+#     P=2   -> 4.9 mrad/s shake,  11 mrad drift
+#     P=1   -> 3.8 mrad/s shake, 6.6 mrad drift  (stable / iters=1)
+# (rot.P was scaled in proportion: 50, 25, 15, 10, 5.)  P=1 brings
+# omega_n down to 3.87 rad/s and zeta up to 0.68 at the actual
+# m_v=0.1.  The earlier 5.5-mrad/s probe reading at P=10 was a
+# fluke: a 2-second window before the limit cycle had built up.
+# Two takeaways:
+#   (a) Always print live ``solver.forward_dynamics.link_mass``
+#       before deriving omega_n.
+#   (b) Probe for at least 4 seconds and watch for GROWING shake,
+#       not just average shake.  ``tools/compliance_tune.py`` now
+#       homes between configs and bins shake over time.
+#
+# *** Tracking-speed vs. stability: where the iters lever helps ***
+# Target-following bandwidth and contact-compliance bandwidth are the
+# SAME omega_n (both are driven through F_net = K*(target-current)
+# + sensor_wrench).  Stability requires zeta = c_global/(2*omega_n)
+# to stay above ~0.5.  With iters=1, c_global = 5.27 s^-1, which
+# caps stable omega_n at ~5 rad/s -- giving slow 1-second settling
+# on a step target.  Raising iters multiplies c_global, allowing
+# proportionally higher omega_n (= higher P) with the same zeta.
+#
+# *** Caution: solver.iterations was NOT originally live-tunable ***
+# Upstream FZI reads ``solver.iterations`` exactly once in
+# on_configure() and caches it into Base::m_iterations.  This file
+# previously documented that consequence ("DROPPED to 1 ... requires
+# controller reload").  This repo now ships a small patch in
+# external/cartesian_controllers/cartesian_{motion,compliance}_
+# controller/src/*.cpp that re-reads solver.iterations every outer
+# cycle (mirroring the existing live read of solver.error_scale),
+# so iters is now a live parameter set via:
+#     ros2 param set /cartesian_compliance_controller solver.iterations 3
+# This requires having loaded the patched .so at controller-manager
+# startup (i.e. one bringup restart after building this repo).
+#
+# *** Chosen "fast tracking" preset (iters=3, P_t=7, P_r=35) ***
+# At m_v=0.1, K=30, scale=0.05, iters=3:
+#     c_global    = 3 * 5.27 = 15.81 s^-1
+#     omega_n_t   = sqrt(7*30*0.05 / 0.1) = sqrt(105) = 10.25 rad/s
+#     zeta_t      = 15.81 / (2*10.25) = 0.77  (well-damped)
+#     rise_10-90% = 1.8 / 10.25 = 175 ms
+#     settle_4%   = 4 / (0.77*10.25) = 510 ms
+# Roughly 4x faster step settling than the previous (P=1, iters=1)
+# stable preset, with no overshoot.  Operator feel is unchanged
+# because K stays at 30 N/m -- a 1 N hand push still yields ~33 mm.
+#
+# Race-ahead caveat: with iters=N substeps of 0.02 s each per 0.02 s
+# outer cycle, the IK simulator advances N*20 ms of simulated time
+# per real outer cycle, so the commanded joint position is roughly
+# (N-1)*20 ms ahead of where the real arm starts the cycle.  For
+# iters=3 that is ~40 ms.  At step-input peak velocity 0.2 m/s, the
+# commanded position is ~8 mm ahead of the real arm -- well within
+# what the downstream position interface can chase.  Push iters
+# higher only if you have measured that the joint controller is
+# still tracking; otherwise the arm will permanently lag the
+# simulator and an integrator-windup-like effect builds.
+#
+# *** Rollback to the conservative stable preset (no restart needed) ***
+# If the fast preset starts shaking (e.g. when contacting a rigid
+# surface in compliance mode where the spring loop tightens), drop
+# P and iters live with:
+#     ros2 param set /cartesian_compliance_controller pd_gains.trans_x.p 1.0
+#     ros2 param set /cartesian_compliance_controller pd_gains.trans_y.p 1.0
+#     ros2 param set /cartesian_compliance_controller pd_gains.trans_z.p 1.0
+#     ros2 param set /cartesian_compliance_controller pd_gains.rot_x.p   5.0
+#     ros2 param set /cartesian_compliance_controller pd_gains.rot_y.p   5.0
+#     ros2 param set /cartesian_compliance_controller pd_gains.rot_z.p   5.0
+#     ros2 param set /cartesian_compliance_controller solver.iterations 1
+#
+# *** What still matters: stiffness sizing vs. FT bias ***
+# At steady state with FT bias dF and no operator force, the spring
+# balances the bias as
+#     K * x = dF   ->   x = dF / K
+# (the bias enters BEFORE the P gain: F_net = K*(target-current) + dF,
+# so P just scales how fast the controller chases the residual, not
+# the residual itself).  For K=30 N/m and a 1 N gravity-comp residual,
+# that's 3.3 cm of steady drift -- noticeable but tolerable.  Either
+# keep gravity comp tight (|dF| < 0.3 N -> x < 1 cm) or raise K
+# (e.g. 50-100 N/m) at the cost of stiffer "feel".
+#
+# Both ``ft_sensor_ref_link`` and ``compliance_ref_link`` resolve to aux
+# frames declared in ``robot_config.yaml::duco_robot_bringup.aux_frames``
+# and appended to the canonical URDF by ``duco_robot_bringup`` at
+# bringup time.
 cartesian_compliance_controller:
   ros__parameters:
-    end_effector_link: "link_6"
+    end_effector_link: "compliance_link"
     robot_base_link: "base_link"
-    ft_sensor_ref_link: "link_6"
-    compliance_ref_link: "link_6"
+    ft_sensor_ref_link: "ft_sensor_link"
+    compliance_ref_link: "compliance_link"
     joints:
       - arm_1_joint_1
       - arm_1_joint_2
@@ -96,21 +299,77 @@ cartesian_compliance_controller:
       - arm_1_joint_6
     command_interfaces:
       - position
-    stiffness:               # w.r.t. compliance_ref_link
-      trans_x: 200.0         # N/m
-      trans_y: 200.0
-      trans_z: 200.0
-      rot_x:   10.0          # Nm/rad
-      rot_y:   10.0
-      rot_z:   10.0
+    stiffness:               # virtual spring at compliance_ref_link
+      trans_x: 30.0          # N/m  -- 1 N push gives ~33 mm displacement;
+      trans_y: 30.0          #         soft enough for hand guidance, firm
+      trans_z: 30.0          #         enough that 1 N FT bias gives 3.3 cm
+      rot_x:   2.0           # Nm/rad -- 0.1 Nm gives ~2.9 deg; 0.05 Nm bias
+      rot_y:   2.0           #           gives 1.4 deg
+      rot_z:   2.0
     solver:
-      error_scale: 0.1
-      iterations: 5
+      error_scale: 0.05      # Sized with P, K to put omega_n in
+                             # the human-guidance band (a few Hz).
+                             # See "painful lesson on m_v" in the
+                             # header for the empirical sweep.
+      iterations: 3          # FAST-TRACKING preset.  iters=N multiplies
+                             # the IK solver's velocity-contraction
+                             # damping by N (c_global = N*5.27 s^-1),
+                             # which buys headroom for higher P (faster
+                             # tracking) without giving up zeta.
+                             # iters=3 lifts c_global to 15.81 s^-1,
+                             # allowing omega_n ~10 rad/s at zeta ~0.77.
+                             # Requires the live-iterations patch in
+                             # external/cartesian_controllers; see the
+                             # header comment "Caution: solver.iterations
+                             # was NOT originally live-tunable" for
+                             # details.  Lower iters to 1 for the
+                             # conservative preset; both work LIVE via
+                             # ros2 param set thanks to the patch.
+      forward_dynamics:
+        link_mass: 0.1       # FZI default; included EXPLICITLY here
+                             # so the value is grep-able.  This sets
+                             # the IK solver's virtual end-effector
+                             # mass (more precisely the mass of every
+                             # non-tip moving segment; the tip is
+                             # hard-coded to 1 kg in buildGenericModel).
+                             # It is the dominant stability knob:
+                             # omega_n = sqrt(P*K*scale / link_mass).
+                             # Read once at on_configure -- changing
+                             # it requires controller reload, NOT just
+                             # a parameter set.
       publish_state_feedback: true
-    pd_gains:
-      trans_x: {p: 0.05, d: 0.005}
-      trans_y: {p: 0.05, d: 0.005}
-      trans_z: {p: 0.05, d: 0.005}
-      rot_x:   {p: 0.5}
-      rot_y:   {p: 0.5}
-      rot_z:   {p: 0.5}
+    pd_gains:                # FAST-TRACKING preset.  Sized for omega_n
+                             # ~ 10.25 rad/s and zeta ~ 0.77 (well-
+                             # damped, no overshoot, 175 ms rise time
+                             # and ~510 ms 4% settle on a step input)
+                             # at the live link_mass=0.1 kg with
+                             # iters=3.  See header "Chosen fast
+                             # tracking preset" for the math.
+                             #
+                             # P=7 trans / P=35 rot preserves the
+                             # 1:5 trans:rot ratio from the previous
+                             # stable preset.  The earlier P=10 cap
+                             # was the empirical instability boundary
+                             # at iters=1 -- at iters=3 the same P=10
+                             # would give zeta ~ 0.65, still stable,
+                             # so P=7 leaves margin.
+                             #
+                             # D=0: at this omega_n the IK solver's
+                             # 0.9-per-iteration velocity contraction
+                             # (now applied 3x per outer cycle) is
+                             # the dominant damping.  D would only
+                             # inject FT-sensor noise into the position
+                             # command (verified live in the previous
+                             # iters=1 sweep; no measurable difference
+                             # between D=0 and D=0.1).
+                             #
+                             # Rollback: see header "Rollback to the
+                             # conservative stable preset (no restart
+                             # needed)" for the live-param command
+                             # block that drops back to (P=1, iters=1).
+      trans_x: {p: 7.0,  d: 0.0}
+      trans_y: {p: 7.0,  d: 0.0}
+      trans_z: {p: 7.0,  d: 0.0}
+      rot_x:   {p: 35.0, d: 0.0}
+      rot_y:   {p: 35.0, d: 0.0}
+      rot_z:   {p: 35.0, d: 0.0}

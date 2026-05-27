@@ -29,9 +29,10 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import yaml
 
@@ -267,3 +268,210 @@ class ConfigManager:
 def get_config() -> ConfigManager:
     """Return the (lazily initialised) :class:`ConfigManager` singleton."""
     return ConfigManager()
+
+
+# ---------------------------------------------------------------------------
+# write-back: aux_frames offsets
+# ---------------------------------------------------------------------------
+#
+# ConfigManager itself is intentionally read-only; persisting back to
+# the YAML while preserving the operator's comments and field order is
+# out of scope for the singleton.  But the dashboard's "Tool frames"
+# editor needs to update the xyz / rpy of named aux_frames entries on
+# disk so the next bringup picks them up.  ``save_aux_frames`` performs
+# a targeted, line-based rewrite that touches ONLY the matched ``xyz:``
+# / ``rpy:`` lines of existing entries -- comments, blank lines, key
+# order, and unrelated sections are preserved byte-for-byte.
+#
+# Adding, renaming, or removing aux_frames entries via this helper is
+# explicitly out of scope (the dashboard does not expose those edits
+# either): such changes are infrequent and operators edit the YAML by
+# hand.
+_AUX_TOP_KEY = "duco_robot_bringup"
+_AUX_LIST_KEY = "aux_frames"
+_AUX_TRIPLE_RE = re.compile(
+    r"^(?P<indent>\s+)(?P<key>xyz|rpy):\s*\[[^\]]*\]\s*(?P<trail>#.*)?$"
+)
+_AUX_ENTRY_RE = re.compile(
+    r"^(?P<indent>\s*)-\s*name:\s*(?P<name>\S+)\s*(#.*)?$"
+)
+_AUX_SECTION_RE = re.compile(rf"^{re.escape(_AUX_TOP_KEY)}:\s*$")
+_AUX_LIST_RE = re.compile(rf"^\s+{re.escape(_AUX_LIST_KEY)}:\s*$")
+# A top-level YAML key (non-indented, ends with ':').  We use this as
+# the terminator for both the duco_robot_bringup section and the
+# aux_frames list within it.
+_TOP_LEVEL_KEY_RE = re.compile(r"^[A-Za-z_][\w.-]*:\s*(#.*)?$")
+
+
+def _fmt_triple(values: Iterable[float]) -> str:
+    """Render a 3-tuple of floats as ``[a, b, c]`` with canonical YAML
+    floats (always has a decimal point).
+    """
+    parts = []
+    for v in values:
+        fv = float(v)
+        # ``repr`` keeps the shortest round-trippable representation
+        # AND always emits a decimal point for floats; 0 -> '0.0',
+        # 0.1 -> '0.1', 1.5e-08 -> '1.5e-08'.  PyYAML accepts both
+        # '0.0' and scientific form, so this is safe.
+        parts.append(repr(fv))
+    return "[" + ", ".join(parts) + "]"
+
+
+def save_aux_frames(file_path: str,
+                    frames: Dict[str, Dict[str, List[float]]]) -> int:
+    """Update ``xyz`` / ``rpy`` of named entries under
+    ``duco_robot_bringup.aux_frames`` in ``file_path``.
+
+    Parameters
+    ----------
+    file_path:
+        Absolute path to the YAML file to rewrite.  Must already contain
+        the ``duco_robot_bringup`` section and an ``aux_frames`` list.
+    frames:
+        Mapping of ``name -> {"xyz": [x, y, z], "rpy": [r, p, y]}``.
+        Keys not present in the file are skipped (and counted toward the
+        return value as 0 updates).  Entries in the file whose name is
+        not in this dict are left untouched.
+
+    Returns
+    -------
+    int
+        Number of entries that had at least one of ``xyz`` / ``rpy``
+        rewritten.
+
+    Raises
+    ------
+    ConfigError
+        If the file cannot be read, the ``duco_robot_bringup`` /
+        ``aux_frames`` block is missing, or the write fails.
+
+    Notes
+    -----
+    The rewrite is **atomic**: the new content is written to a temp
+    file in the same directory and ``os.replace``\ d into place, so a
+    concurrent reader either sees the old or new file but never a
+    half-written one.
+    """
+    p = Path(file_path)
+    try:
+        text = p.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"failed to read {p}: {exc}") from exc
+
+    lines = text.splitlines(keepends=True)
+
+    # Locate the duco_robot_bringup: line, then aux_frames: within it.
+    section_start = next(
+        (i for i, ln in enumerate(lines) if _AUX_SECTION_RE.match(ln)),
+        None,
+    )
+    if section_start is None:
+        raise ConfigError(
+            f"{p}: no top-level '{_AUX_TOP_KEY}:' section to update")
+
+    section_end = len(lines)
+    for j in range(section_start + 1, len(lines)):
+        if _TOP_LEVEL_KEY_RE.match(lines[j]):
+            section_end = j
+            break
+
+    aux_start = None
+    for j in range(section_start + 1, section_end):
+        if _AUX_LIST_RE.match(lines[j]):
+            aux_start = j
+            break
+    if aux_start is None:
+        raise ConfigError(
+            f"{p}: no '{_AUX_LIST_KEY}:' list under '{_AUX_TOP_KEY}:'")
+
+    # Walk entries from aux_start+1 until the section ends or a
+    # sibling key at the same indent as aux_frames: is hit.
+    # We track which entry we're currently in by its name.
+    aux_indent_match = re.match(r"^(\s+)", lines[aux_start])
+    aux_indent = aux_indent_match.group(1) if aux_indent_match else "  "
+
+    updated_per_name: Dict[str, int] = {n: 0 for n in frames.keys()}
+    current_name: Optional[str] = None
+    out_lines = list(lines)
+
+    i = aux_start + 1
+    while i < section_end:
+        ln = out_lines[i]
+        # Sibling key at the aux_frames indent terminates the list.
+        sib = re.match(rf"^{aux_indent}([A-Za-z_][\w.-]*):", ln)
+        if sib and not ln.lstrip().startswith("-"):
+            break
+        entry = _AUX_ENTRY_RE.match(ln)
+        if entry:
+            current_name = entry.group("name").strip()
+            i += 1
+            continue
+        if current_name and current_name in frames:
+            m = _AUX_TRIPLE_RE.match(ln)
+            if m:
+                key = m.group("key")
+                target = frames[current_name].get(key)
+                if target is not None and len(list(target)) == 3:
+                    indent = m.group("indent")
+                    trail = m.group("trail") or ""
+                    trail_sep = "  " + trail if trail else ""
+                    new_line = (f"{indent}{key}: "
+                                f"{_fmt_triple(target)}"
+                                f"{trail_sep}\n")
+                    if out_lines[i] != new_line:
+                        out_lines[i] = new_line
+                        updated_per_name[current_name] = (
+                            updated_per_name[current_name] | 1
+                            if key == "xyz"
+                            else updated_per_name[current_name] | 2)
+        i += 1
+
+    updated_count = sum(1 for v in updated_per_name.values() if v)
+
+    new_text = "".join(out_lines)
+    if new_text == text:
+        return 0  # nothing changed; skip the write
+
+    # Atomic write: temp file in same directory, then rename.
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=p.name + ".", suffix=".tmp", dir=str(p.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(new_text)
+        os.replace(tmp_path, p)
+    except OSError as exc:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise ConfigError(f"failed to write {p}: {exc}") from exc
+
+    return updated_count
+
+
+def read_aux_frames(file_path: str) -> List[Dict[str, Any]]:
+    """Read aux_frames entries directly from ``file_path`` via PyYAML.
+
+    Returns the raw list as currently on disk (each entry is the dict
+    YAML parsed from the file).  Returns ``[]`` if the section is
+    missing.  Unlike :func:`get_config`, this does NOT go through the
+    singleton's cache, so it reflects pending on-disk edits.
+    """
+    p = Path(file_path)
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"failed to parse YAML in {p}: {exc}") from exc
+    except OSError as exc:
+        raise ConfigError(f"failed to read {p}: {exc}") from exc
+    if not isinstance(data, dict):
+        return []
+    section = data.get(_AUX_TOP_KEY)
+    if not isinstance(section, dict):
+        return []
+    frames = section.get(_AUX_LIST_KEY)
+    if not isinstance(frames, list):
+        return []
+    return [f for f in frames if isinstance(f, dict)]

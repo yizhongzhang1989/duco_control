@@ -127,6 +127,30 @@ duco_robot_bringup:
   db: false                 # mongo warehouse DB (off by default; can be huge)
   debug: false              # extra ros2_control / MoveIt verbosity
   publish_frequency: 15.0   # robot_state_publisher TF rate (Hz)
+  # Auxiliary frames appended to the robot URDF as fixed-joint children
+  # of an existing link. Used to give the FZI cartesian controllers and
+  # the F/T pipeline real, named TF frames to work with (the controllers
+  # require these frames to be in the URDF's KDL chain). Edit xyz/rpy to
+  # match the physical mount; defaults are zero offsets at the flange.
+  # xyz are meters, rpy are radians.
+  #
+  # IMPORTANT: FZI's robotChainContains(link) only walks the KDL chain
+  # from robot_base_link to end_effector_link. Aux frames are visible to
+  # the cartesian controllers ONLY IF they are chained in series from
+  # link_6 up to whatever fzi_zero_gravity.yaml declares as
+  # end_effector_link. The default chain is
+  #   link_6 -> ft_sensor_link -> compliance_link
+  # with compliance_link as the end-effector tip; do not insert siblings
+  # of these two without also updating fzi_zero_gravity.yaml.
+  aux_frames:
+    - name: ft_sensor_link
+      parent: link_6
+      xyz: [0.0, 0.0, 0.0]
+      rpy: [0.0, 0.0, 0.0]
+    - name: compliance_link
+      parent: ft_sensor_link
+      xyz: [0.0, 0.0, 0.0]
+      rpy: [0.0, 0.0, 0.0]
 
 # ============================================================================
 # alicia_teleop (Alicia-D leader arm -> Duco GCR5_910 follower bridge)

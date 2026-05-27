@@ -30,13 +30,17 @@ from __future__ import annotations
 
 import json
 import math
+import mimetypes
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
+from collections import deque
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from pathlib import Path
+from typing import Any, Deque, Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 
 import rclpy
 from geometry_msgs.msg import (PoseStamped, WrenchStamped)
@@ -52,6 +56,133 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 
+# `common.config_manager` exposes the project's robot_config.yaml.  The
+# dashboard's "Tool frames" editor reads `duco_robot_bringup.aux_frames`
+# from the resolved config and writes back via the line-based
+# `save_aux_frames` helper (which preserves comments).  Imported with a
+# soft fallback so the dashboard still starts in environments where
+# `common` is not on the PYTHONPATH (the API simply returns a clear
+# error in that case).
+try:
+    from common.config_manager import (  # type: ignore
+        get_config as _get_config,
+        read_aux_frames as _read_aux_frames,
+        save_aux_frames as _save_aux_frames,
+    )
+    _COMMON_IMPORT_ERROR: Optional[str] = None
+except Exception as _exc:  # noqa: BLE001
+    _get_config = None  # type: ignore
+    _read_aux_frames = None  # type: ignore
+    _save_aux_frames = None  # type: ignore
+    _COMMON_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
+
+# ``duco_robot_bringup.urdf_loader.update_aux_frames`` rewrites the
+# ``<origin>`` of existing aux-frame joints in a URDF string, returning
+# a new URDF that can be pushed to ``robot_state_publisher`` via
+# SetParameters for live tool-frame updates.  Soft-imported for the
+# same reason as ``common.config_manager`` above.
+try:
+    from duco_robot_bringup.urdf_loader import (  # type: ignore
+        update_aux_frames as _update_aux_frames,
+    )
+    _URDF_LOADER_IMPORT_ERROR: Optional[str] = None
+except Exception as _exc:  # noqa: BLE001
+    _update_aux_frames = None  # type: ignore
+    _URDF_LOADER_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
+
+
+# ---------------------------------------------------------------------------
+# Time-windowed publish-rate estimator.
+#
+# Each subscriber callback (or TF sampler timer) calls ``tick()`` once per
+# message; ``hz()`` returns the rate computed over the last
+# ``window_s`` seconds of arrivals.  Using a *time* window (rather than
+# a fixed sample count) means the computed Hz itself is stable at
+# whatever the publisher's rate happens to be -- a 250 Hz wrench
+# integrates over ~250 samples, a 5 Hz orchestrator over ~5, but both
+# produce a once-per-second number that varies by at most a couple of
+# counts.
+#
+# ``hz()`` returns ``None`` when fewer than two samples are inside the
+# current window *or* the most recent arrival is older than
+# ``stale_after`` seconds (so the displayed Hz drops to "no data" as
+# soon as a publisher stops, instead of decaying through a long false
+# history).
+#
+# A short cache (``update_period``, default 1 s) keeps the value
+# returned to the HTTP poller constant within each integration window
+# even when /api/live is polled at 5 Hz: each poll reuses the last
+# computation instead of re-counting the deque.  The stale check runs
+# on every call regardless, so a stopped publisher still shows
+# "no data" within ``stale_after`` seconds.
+#
+# Reads are intentionally lock-free: the underlying ``deque`` is only
+# mutated on the rclpy spin thread, and ``hz()`` snapshots ``len`` +
+# endpoints atomically enough for a UI readout.
+# ---------------------------------------------------------------------------
+class _RateTracker:
+    __slots__ = ("_buf", "_window_s", "_stale_after", "_update_period",
+                 "_cached_hz", "_cached_mono")
+
+    def __init__(self, window_s: float = 1.0,
+                 stale_after: float = 1.0,
+                 update_period: float = 1.0) -> None:
+        self._buf: Deque[float] = deque()
+        self._window_s = float(window_s)
+        self._stale_after = float(stale_after)
+        self._update_period = float(update_period)
+        self._cached_hz: Optional[float] = None
+        self._cached_mono: Optional[float] = None
+
+    def tick(self, t: Optional[float] = None) -> None:
+        ts = time.monotonic() if t is None else t
+        buf = self._buf
+        buf.append(ts)
+        # Evict samples older than the integration window so the
+        # deque size stays bounded by the publish rate, not by
+        # uptime.
+        cutoff = ts - self._window_s
+        while buf and buf[0] < cutoff:
+            buf.popleft()
+
+    def hz(self) -> Optional[float]:
+        now = time.monotonic()
+        buf = self._buf
+        # Re-evict here too so a stopped publisher's old samples
+        # don't keep the rate artificially high until the next tick
+        # (and so the stale check below sees the most recent state).
+        cutoff = now - self._window_s
+        while buf and buf[0] < cutoff:
+            buf.popleft()
+        n = len(buf)
+        if n < 2:
+            return None
+        last = buf[-1]
+        if now - last > self._stale_after:
+            # Publisher stopped: invalidate the cache so the next
+            # ``tick()`` doesn't briefly resurrect an old value.
+            self._cached_hz = None
+            self._cached_mono = None
+            return None
+        # Return the cached value if recent enough.  This is what
+        # gives the sticky-bar pills a stable once-per-second
+        # readout -- the value changes only when a new integration
+        # is performed, not on every HTTP poll.
+        if (self._cached_hz is not None
+                and self._cached_mono is not None
+                and now - self._cached_mono < self._update_period):
+            return self._cached_hz
+        first = buf[0]
+        span = last - first
+        if span <= 0.0:
+            # Single instant: keep the previous reading rather than
+            # report a spurious infinity.
+            return self._cached_hz
+        val = (n - 1) / span
+        self._cached_hz = val
+        self._cached_mono = now
+        return val
+
 
 # ---------------------------------------------------------------------------
 # tunable parameter catalogue (curated, keyed by controller "kind").
@@ -66,12 +197,22 @@ from tf2_ros import Buffer, TransformException, TransformListener
 # matrix, which is the main parameter operators want to play with.
 # ---------------------------------------------------------------------------
 _BASE_TUNABLES: List[Tuple[str, str]] = [
+    # P (stiffness of the inner PD on the Cartesian error vector)
     ("pd_gains.trans_x.p", "double"),
     ("pd_gains.trans_y.p", "double"),
     ("pd_gains.trans_z.p", "double"),
     ("pd_gains.rot_x.p",   "double"),
     ("pd_gains.rot_y.p",   "double"),
     ("pd_gains.rot_z.p",   "double"),
+    # D (damping of de/dt; sized against the spring loop for compliance,
+    # against FT-sensor noise for the force controller -- see
+    # src/duco_cartesian_control/config/fzi_zero_gravity.yaml header).
+    ("pd_gains.trans_x.d", "double"),
+    ("pd_gains.trans_y.d", "double"),
+    ("pd_gains.trans_z.d", "double"),
+    ("pd_gains.rot_x.d",   "double"),
+    ("pd_gains.rot_y.d",   "double"),
+    ("pd_gains.rot_z.d",   "double"),
     ("solver.error_scale", "double"),
     ("solver.iterations",  "integer"),
 ]
@@ -91,625 +232,126 @@ _TUNABLES_BY_KIND: Dict[str, List[Tuple[str, str]]] = {
 
 
 # ---------------------------------------------------------------------------
-# embedded HTML / JS / CSS
+# orchestrator safety thresholds editable from the dashboard.
+#
+# These parameters live on the ``/duco_cartesian_control`` node (see
+# :class:`duco_cartesian_control.control_node.CartesianControlNode`) and
+# already accept live parameter updates -- the orchestrator validates
+# they are non-negative and refuses changes that would interrupt the
+# safety supervisor's invariants.  The dashboard simply forwards a
+# typed SetParameters request and reports per-parameter results.
+#
+# Order is the display order in the UI.
+_SAFETY_THRESHOLDS: List[Tuple[str, str, str]] = [
+    # (param_name, kind, unit_label_for_ui)
+    ("max_wrench_force",          "double", "N"),
+    ("max_wrench_torque",         "double", "Nm"),
+    ("engage_max_joint_velocity", "double", "rad/s"),
+    ("ft_stale_after",            "double", "s"),
+    ("joint_states_stale_after",  "double", "s"),
+]
+_SAFETY_THRESHOLD_NAMES = {n for (n, _k, _u) in _SAFETY_THRESHOLDS}
+
+
 # ---------------------------------------------------------------------------
-_HTML_PAGE = r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Cartesian controller dashboard</title>
-<style>
-  :root { color-scheme: light dark; }
-  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-         margin: 0; padding: 14px; background: #0f1115; color: #e6e6e6; }
-  h1 { margin: 0 0 4px; font-size: 1.05rem; font-weight: 600; }
-  h2 { margin: 14px 0 8px; font-size: 0.95rem; font-weight: 600; color: #cfd3dc; }
-  .sub { color: #8a93a6; font-size: 0.82rem; margin-bottom: 12px; }
-  code { background: #11141a; padding: 1px 5px; border-radius: 3px; }
-  .row { display: flex; gap: 16px; flex-wrap: wrap; }
-  .col { flex: 1 1 380px; min-width: 320px; }
-  .panel { background: #181b22; border: 1px solid #262a33; border-radius: 8px;
-           padding: 10px 12px 12px; margin-bottom: 12px; }
-  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
-  th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #232730;
-           font-variant-numeric: tabular-nums; }
-  th { color: #8a93a6; font-weight: 500; }
-  button { background: #2563eb; color: white; border: 0; border-radius: 4px;
-           padding: 4px 10px; font: inherit; cursor: pointer; font-size: 0.82rem; }
-  button:hover { background: #1d4ed8; }
-  button.danger  { background: #b91c1c; }
-  button.danger:hover  { background: #991b1b; }
-  button.success { background: #15803d; }
-  button.success:hover { background: #166534; }
-  button.big { padding: 8px 14px; font-size: 0.9rem; }
-  button.ghost { background: #2b3140; }
-  button.ghost:hover { background: #3a4150; }
-  button:disabled { opacity: 0.5; cursor: not-allowed; }
-  input[type="number"] { background: #0f1218; color: #e6e6e6;
-           border: 1px solid #2b3140; border-radius: 4px; padding: 3px 6px;
-           font: inherit; font-size: 0.82rem; width: 7em;
-           font-variant-numeric: tabular-nums; }
-  select { background: #0f1218; color: #e6e6e6;
-           border: 1px solid #2b3140; border-radius: 4px; padding: 3px 6px;
-           font: inherit; font-size: 0.82rem; }
-  select:disabled { opacity: 0.5; cursor: not-allowed; }
-  .status { display: inline-block; padding: 2px 7px; border-radius: 999px;
-            background: #1f2937; color: #cfd3dc; font-variant-numeric: tabular-nums; }
-  .status.ok  { background: #14532d; color: #c6f7d6; }
-  .status.bad { background: #5a1d1d; color: #ffb4b4; }
-  .status.warn { background: #553e1a; color: #ffe6a8; }
-  .pill { display: inline-block; padding: 1px 6px; border-radius: 999px;
-          background: #11141a; border: 1px solid #2b3140; font-size: 0.75rem;
-          color: #cfd3dc; margin-right: 4px; }
-  .pill.active { background: #14532d; color: #c6f7d6; border-color: #14532d; }
-  .small { font-size: 0.78rem; color: #8a93a6; }
-  .num { font-variant-numeric: tabular-nums; }
-  .engage-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-  .cmd-grid { display: flex; gap: 24px; flex-wrap: wrap; margin-top: 8px; }
-  .cmd-col  { display: flex; flex-direction: column; gap: 6px; min-width: 180px; }
-  .cmd-row  { display: flex; gap: 8px; align-items: center; }
-  .cmd-row label { color: #8a93a6; font-size: 0.78rem; min-width: 5em; }
-  .jog-grid { display: grid; grid-template-columns: repeat(2, 60px);
-              grid-auto-rows: 32px; gap: 6px; }
-  button.jog { background: #2a3142; color: #e6e6e6; border: 1px solid #3a4258;
-               border-radius: 4px; cursor: pointer; font: inherit;
-               font-size: 0.85rem; padding: 4px 0; }
-  button.jog:hover:not(:disabled) { background: #3a4258; }
-  button.jog:disabled { opacity: 0.4; cursor: not-allowed; }
-  .cmd-section[hidden] { display: none; }
-  .toast { position: fixed; right: 14px; bottom: 14px; max-width: 400px;
-           background: #181b22; border: 1px solid #262a33; border-radius: 8px;
-           padding: 8px 12px; font-size: 0.82rem; color: #cfd3dc;
-           opacity: 0; transition: opacity .15s; pointer-events: none; }
-  .toast.show { opacity: 1; }
-  .toast.bad { border-color: #b91c1c; color: #ffb4b4; }
-  .toast.ok  { border-color: #15803d; color: #c6f7d6; }
-</style>
-</head>
-<body>
-  <h1>Cartesian controller dashboard</h1>
-  <div class="sub">
-    active controller <code id="controller-name">--</code>
-    &nbsp; orchestrator state <span id="orch-status" class="status">--</span>
-    &nbsp; <span id="conn" class="status">connecting...</span>
-  </div>
+# target_wrench setpoint editable from the dashboard (force-controller UI).
+#
+# These six parameters live on the ``/duco_cartesian_control`` node (see
+# :class:`duco_cartesian_control.control_node.CartesianControlNode`) --
+# the orchestrator publishes them at a configurable heartbeat rate to
+# every FZI controller's ``/<ctrl>/target_wrench`` topic.  With all six
+# set to 0 the force controller gives pure free-drive (hand-guidance);
+# non-zero values let the operator command a constant wrench on top of
+# the FT-sensor feedback (push the arm in a chosen direction).
+#
+# Each entry is ``(param_name, axis_label, kind)`` where ``kind`` is
+# ``"force"`` (limited by ``max_wrench_force``) or ``"torque"`` (limited
+# by ``max_wrench_torque``).  The orchestrator validates |value| against
+# the matching safety limit on every SetParameters call and rejects
+# setpoints that would immediately trip the safety supervisor.
+_TARGET_WRENCH_PARAMS: List[Tuple[str, str, str]] = [
+    # (param_name,              axis_label, kind)
+    ("target_wrench_force_x",   "Fx",       "force"),
+    ("target_wrench_force_y",   "Fy",       "force"),
+    ("target_wrench_force_z",   "Fz",       "force"),
+    ("target_wrench_torque_x",  "Tx",       "torque"),
+    ("target_wrench_torque_y",  "Ty",       "torque"),
+    ("target_wrench_torque_z",  "Tz",       "torque"),
+]
+_TARGET_WRENCH_NAMES = {n for (n, _l, _k) in _TARGET_WRENCH_PARAMS}
 
-  <div class="panel">
-    <div class="engage-bar">
-      <span id="engaged" class="status">--</span>
-      <span class="small">controller:</span>
-      <select id="sel-controller" title="select which FZI controller engage will activate"></select>
-      <span class="pill" id="kind-pill">kind: --</span>
-      <span class="small">trip:</span>
-      <span id="trip" class="status">--</span>
-      <button id="btn-engage"    type="button" class="big success">Engage</button>
-      <button id="btn-disengage" type="button" class="big danger">Disengage</button>
-    </div>
-    <div class="small" style="margin-top:6px;">
-      Use the dropdown to select a controller; click Engage to activate
-      it (only allowed while idle).  Force = pure free-drive
-      (target_wrench=0); Motion = pose-hold (snapshots current pose);
-      Compliance = pose-hold + yields to wrench.
-    </div>
-  </div>
 
-  <div class="panel" id="control-panel">
-    <h2>Controller commands <span class="pill" id="cmd-kind-pill">kind: --</span></h2>
+# ---------------------------------------------------------------------------
+# wrench dead-zone editable from the dashboard.
+#
+# These parameters live on the ``ft_sensor_gravity_compensation`` node
+# (see :module:`ft_sensor_gravity_compensation.compensation_node`) and
+# are applied to the *compensated* wrench (after gravity + bias
+# subtraction, before publishing).  Per-axis soft (continuous) shrinkage
+# so the downstream cartesian-force / compliance controller does not
+# see a step change at the dead-zone boundary.
+#
+# Each entry is ``(param_name, ui_label, unit_label)``.  All four are
+# 3-element ``double[]`` arrays of N (force) or Nm (torque); validation
+# (length 3, finite, >= 0) is done both here and in the gravity-comp
+# node's on-set-parameters callback.
+_WRENCH_DEADBAND_PARAMS: List[Tuple[str, str, str]] = [
+    # (param_name, ui_label, unit_label)
+    ("force_deadband",  "force",  "N"),
+    ("torque_deadband", "torque", "Nm"),
+]
+_WRENCH_DEADBAND_NAMES = {n for (n, _l, _u) in _WRENCH_DEADBAND_PARAMS}
 
-    <div id="cmd-force" class="cmd-section" hidden>
-      <div class="small">
-        The <b>force controller</b> consumes <code>target_wrench</code> and
-        minimises <code>(target - measured)</code>.  The orchestrator
-        publishes <code>target_wrench=0</code> at 10 Hz on
-        <code>/cartesian_force_controller/target_wrench</code>, so engage
-        gives you <b>pure free-drive</b> (hand-guidance) -- push the arm
-        and it yields.  No per-press commands are needed; just engage and
-        guide.
-      </div>
-    </div>
 
-    <div id="cmd-motion-compliance" class="cmd-section" hidden>
-      <div class="small" id="cmd-help">
-        Each press computes <code>new_target = current_EE_pose + delta</code>
-        in <b>base_link</b> and publishes it on
-        <code>/&lt;controller&gt;/target_frame</code>.  Active only while
-        engaged.  <b>Snap</b> resets target to the current pose.
-      </div>
-      <div class="cmd-grid">
-        <div class="cmd-col">
-          <div class="cmd-row">
-            <label>trans step</label>
-            <input id="jog-trans-step" type="number" min="0.001"
-                   max="0.10" step="0.005" value="0.010"> m
-          </div>
-          <div class="jog-grid">
-            <button data-axis="x" data-sign="-1" class="jog">-X</button>
-            <button data-axis="x" data-sign="+1" class="jog">+X</button>
-            <button data-axis="y" data-sign="-1" class="jog">-Y</button>
-            <button data-axis="y" data-sign="+1" class="jog">+Y</button>
-            <button data-axis="z" data-sign="-1" class="jog">-Z</button>
-            <button data-axis="z" data-sign="+1" class="jog">+Z</button>
-          </div>
-        </div>
-        <div class="cmd-col">
-          <div class="cmd-row">
-            <label>rot step</label>
-            <input id="jog-rot-step" type="number" min="0.5" max="30"
-                   step="0.5" value="5"> deg
-          </div>
-          <div class="jog-grid">
-            <button data-raxis="rx" data-sign="-1" class="jog">-Rx</button>
-            <button data-raxis="rx" data-sign="+1" class="jog">+Rx</button>
-            <button data-raxis="ry" data-sign="-1" class="jog">-Ry</button>
-            <button data-raxis="ry" data-sign="+1" class="jog">+Ry</button>
-            <button data-raxis="rz" data-sign="-1" class="jog">-Rz</button>
-            <button data-raxis="rz" data-sign="+1" class="jog">+Rz</button>
-          </div>
-        </div>
-        <div class="cmd-col">
-          <button id="btn-snap-target" type="button" class="big">
-            Snap target to current pose
-          </button>
-          <div class="small" style="margin-top:6px;">
-            Last published target:
-          </div>
-          <div class="num small" id="last-target-pos">--</div>
-        </div>
-      </div>
-    </div>
-  </div>
+# ---------------------------------------------------------------------------
+# static web assets
+# ---------------------------------------------------------------------------
+# The dashboard's HTML, CSS, and JS live as separate files in the
+# package's ``static/`` directory (next to this module).  They're
+# served by the HTTP handler at ``/static/<filename>``; the root URL
+# ``/`` serves ``static/index.html``.
+#
+# Files are read from disk on every request through an mtime-keyed
+# cache, so ``colcon build --symlink-install`` makes the static
+# assets live-editable -- save the file, reload the browser, no
+# node restart required.
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-  <div class="row">
-    <div class="col">
-      <div class="panel">
-        <h2>Live wrench (sensor frame)</h2>
-        <table>
-          <thead><tr><th></th><th>force [N]</th><th>torque [Nm]</th></tr></thead>
-          <tbody>
-            <tr><td>x</td><td class="num" id="wfx">--</td><td class="num" id="wmx">--</td></tr>
-            <tr><td>y</td><td class="num" id="wfy">--</td><td class="num" id="wmy">--</td></tr>
-            <tr><td>z</td><td class="num" id="wfz">--</td><td class="num" id="wmz">--</td></tr>
-          </tbody>
-        </table>
-        <div class="small" style="margin-top:8px;">
-          |F| <span id="fmag" class="status">-- N</span>
-          &nbsp; |T| <span id="tmag" class="status">-- Nm</span>
-          &nbsp; ft <span id="ft-status" class="status">--</span>
-          &nbsp; q <span id="q-status" class="status">--</span>
-        </div>
-      </div>
+_static_cache: Dict[str, Tuple[float, bytes]] = {}
+_static_cache_lock = threading.Lock()
 
-      <div class="panel">
-        <h2>Safety thresholds (orchestrator)</h2>
-        <table>
-          <tbody>
-            <tr><td>max |F|</td><td class="num" id="lim-f">--</td><td>N</td></tr>
-            <tr><td>max |T|</td><td class="num" id="lim-t">--</td><td>Nm</td></tr>
-            <tr><td>engage max |qdot|</td><td class="num" id="lim-qe">--</td><td>rad/s</td></tr>
-            <tr><td>FT stale after</td><td class="num" id="lim-ftstale">--</td><td>s</td></tr>
-            <tr><td>joint_states stale after</td><td class="num" id="lim-qstale">--</td><td>s</td></tr>
-          </tbody>
-        </table>
-        <div class="small" style="margin-top:8px;">
-          These are read-only here; tune them via parameters on
-          <code>/duco_cartesian_control</code>.
-        </div>
-      </div>
-    </div>
 
-    <div class="col">
-      <div class="panel">
-        <h2>Controller parameters</h2>
-        <div class="small" style="margin-bottom:6px;">
-          Live tuning of <code id="param-target">--</code>.  Changes apply
-          immediately to the running controller.
-        </div>
-        <table id="param-table">
-          <thead>
-            <tr><th>name</th><th>current</th><th>new</th><th></th></tr>
-          </thead>
-          <tbody id="param-body"></tbody>
-        </table>
-        <div style="margin-top:8px; display:flex; gap:8px;">
-          <button id="btn-refresh-params" class="ghost">Refresh</button>
-        </div>
-      </div>
-    </div>
-  </div>
+def _load_static(rel_path: str) -> Tuple[bytes, str]:
+    """Load ``static/<rel_path>``, returning ``(bytes, mime)``.
 
-  <div id="toast" class="toast"></div>
-
-<script>
-(function () {
-  const $  = (id) => document.getElementById(id);
-  const fmt = (v, d) => (v == null || isNaN(v)) ? "--" : Number(v).toFixed(d ?? 2);
-  const fmtAge = (a) => a == null ? "--" : (a < 1 ? (a*1000).toFixed(0) + " ms" : a.toFixed(2) + " s");
-
-  let snapshot = null;
-
-  async function api(path, opts) {
-    const r = await fetch(path, opts || {});
-    let data = {};
-    try { data = await r.json(); } catch (_) { }
-    if (!r.ok) throw new Error(data.error || (r.status + " " + r.statusText));
-    return data;
-  }
-
-  function toast(msg, kind) {
-    const el = $("toast");
-    el.textContent = msg;
-    el.classList.remove("ok", "bad", "show");
-    if (kind) el.classList.add(kind);
-    el.classList.add("show");
-    clearTimeout(toast._t);
-    toast._t = setTimeout(() => el.classList.remove("show"), 3000);
-  }
-
-  function setEngagedPill(s) {
-    const el = $("engaged");
-    el.classList.remove("ok", "bad", "warn");
-    if (s.trip_reason) {
-      el.textContent = "TRIPPED";
-      el.classList.add("bad");
-    } else if (s.engaged) {
-      el.textContent = "ENGAGED";
-      el.classList.add("ok");
-    } else {
-      el.textContent = "idle";
-      el.classList.add("warn");
-    }
-    $("trip").textContent = s.trip_reason || "(none)";
-    $("trip").classList.toggle("bad", !!s.trip_reason);
-  }
-
-  // Cache of last (active_controller, available_controllers) we rendered
-  // into the <select> so we don't blow away an in-progress selection on
-  // every 200 ms tick.
-  let renderedSelectSig = null;
-
-  function setControllerSelect(ctl) {
-    const sel = $("sel-controller");
-    const avail = ctl.available_controllers || [];
-    const sig = JSON.stringify(avail);
-    if (sig !== renderedSelectSig) {
-      sel.innerHTML = "";
-      for (const c of avail) {
-        const opt = document.createElement("option");
-        opt.value = c.name;
-        opt.textContent = c.name + " (" + c.kind + ")";
-        sel.appendChild(opt);
-      }
-      renderedSelectSig = sig;
-    }
-    // Sync select to current active unless the user is editing the
-    // dropdown right now (handled by document.activeElement guard).
-    if (document.activeElement !== sel) {
-      sel.value = ctl.active_controller || "";
-    }
-    // Lock the dropdown while engaged -- the orchestrator refuses the
-    // param change anyway, but disabling makes intent obvious.
-    sel.disabled = !!ctl.engaged;
-    // Show kind pill for whatever is currently *selected* in the
-    // dropdown, or the active one if no selection.
-    const chosen = sel.value || ctl.active_controller || "";
-    const entry = avail.find((c) => c.name === chosen);
-    const kind = entry ? entry.kind : "--";
-    $("kind-pill").textContent = "kind: " + kind;
-    setCommandPanel(kind, !!ctl.engaged);
-  }
-
-  function setCommandPanel(kind, engaged) {
-    $("cmd-kind-pill").textContent = "kind: " + kind;
-    const showForce = (kind === "force");
-    const showJog   = (kind === "motion" || kind === "compliance");
-    $("cmd-force").hidden               = !showForce;
-    $("cmd-motion-compliance").hidden   = !showJog;
-    // Jog buttons act on the *engaged* controller -- if not engaged,
-    // disable them to make intent obvious.  (Pre-engage targets get
-    // clobbered by FZI's on_activate snapshot anyway.)
-    const dis = !engaged;
-    document.querySelectorAll("#cmd-motion-compliance button.jog")
-      .forEach((b) => { b.disabled = dis; });
-    $("btn-snap-target").disabled = dis;
-  }
-
-  function setStaleness(elId, ok, age) {
-    const el = $(elId);
-    el.classList.remove("ok", "bad", "warn");
-    if (age == null) {
-      el.textContent = "no data";
-      el.classList.add("warn");
-    } else {
-      el.textContent = fmtAge(age);
-      el.classList.add(ok ? "ok" : "bad");
-    }
-  }
-
-  function setOrchPill(s) {
-    const el = $("orch-status");
-    el.classList.remove("ok", "bad", "warn");
-    if (!s || !s.control_state_age || s.control_state_age == null) {
-      el.textContent = "no orchestrator";
-      el.classList.add("bad");
-      return;
-    }
-    if (s.control_state_age > 5.0) {
-      el.textContent = "stale (" + fmtAge(s.control_state_age) + ")";
-      el.classList.add("warn");
-    } else {
-      el.textContent = "live (" + fmtAge(s.control_state_age) + ")";
-      el.classList.add("ok");
-    }
-  }
-
-  function applyLive(s) {
-    if (!s) return;
-    const ctl = s.control || {};
-    setEngagedPill(ctl);
-    setControllerSelect(ctl);
-    setOrchPill(s);
-
-    const w = s.wrench;
-    $("wfx").textContent = w ? fmt(w.fx) : "--";
-    $("wfy").textContent = w ? fmt(w.fy) : "--";
-    $("wfz").textContent = w ? fmt(w.fz) : "--";
-    $("wmx").textContent = w ? fmt(w.tx, 3) : "--";
-    $("wmy").textContent = w ? fmt(w.ty, 3) : "--";
-    $("wmz").textContent = w ? fmt(w.tz, 3) : "--";
-    if (w) {
-      const fm = Math.hypot(w.fx, w.fy, w.fz);
-      const tm = Math.hypot(w.tx, w.ty, w.tz);
-      $("fmag").textContent = fmt(fm) + " N";
-      $("tmag").textContent = fmt(tm, 3) + " Nm";
-    } else {
-      $("fmag").textContent = "-- N";
-      $("tmag").textContent = "-- Nm";
-    }
-
-    setStaleness("ft-status", !!s.ft_ok, w ? w.age : null);
-    setStaleness("q-status",  !!s.joint_states_ok, s.joint_states_age);
-
-    $("conn").textContent = "live";
-    $("conn").classList.remove("warn", "bad");
-    $("conn").classList.add("ok");
-
-    // Engage button enabled only if the orchestrator is alive AND not engaged.
-    const orchAlive = (s.control_state_age != null && s.control_state_age <= 5.0);
-    $("btn-engage").disabled    = ctl.engaged || !orchAlive;
-    $("btn-disengage").disabled = !ctl.engaged || !orchAlive;
-  }
-
-  // Track which parameter names we've already rendered so we can avoid
-  // rebuilding the rows on every refresh (which would clobber whatever
-  // the operator is typing into the "new" <input>).
-  let renderedParamSig = null;
-
-  function buildParamRows(params) {
-    const body = $("param-body");
-    body.innerHTML = "";
-    renderedParamSig = null;
-    if (!params || params.length === 0) {
-      body.innerHTML = '<tr><td colspan="4" class="small">no parameters available (controller not running?)</td></tr>';
-      return;
-    }
-    for (const p of params) {
-      const tr = document.createElement("tr");
-      const td1 = document.createElement("td");
-      td1.innerHTML = '<code>' + p.name + '</code>';
-      const td2 = document.createElement("td");
-      td2.className = "num";
-      td2.id = "cur-" + p.name;
-      td2.textContent = (p.value == null) ? "--" :
-        (p.kind === "integer") ? String(p.value) : fmt(p.value, 4);
-      const td3 = document.createElement("td");
-      const inp = document.createElement("input");
-      inp.type = "number";
-      inp.step = (p.kind === "integer") ? "1" : "0.001";
-      inp.value = (p.value == null) ? "" : p.value;
-      inp.dataset.name = p.name;
-      inp.dataset.kind = p.kind;
-      // Submit on Enter so users don't have to reach for the mouse.
-      inp.addEventListener("keydown", (ev) => {
-        if (ev.key === "Enter") {
-          ev.preventDefault();
-          setParam(p.name, p.kind, inp.value);
-        }
-      });
-      td3.appendChild(inp);
-      const td4 = document.createElement("td");
-      const btn = document.createElement("button");
-      btn.textContent = "Set";
-      btn.addEventListener("click", () => setParam(p.name, p.kind, inp.value));
-      td4.appendChild(btn);
-      tr.append(td1, td2, td3, td4);
-      body.appendChild(tr);
-    }
-    renderedParamSig = params.map((p) => p.name + ":" + p.kind).join("|");
-  }
-
-  function syncParamRows(params) {
-    // Re-build only if the list of (name, kind) tuples changed; otherwise
-    // just update the "current" cells via applyParams() so we don't wipe
-    // out whatever the operator is typing into a "new" <input>.
-    const sig = (params || []).map((p) => p.name + ":" + p.kind).join("|");
-    if (sig !== renderedParamSig) {
-      buildParamRows(params || []);
-    } else {
-      applyParams(params);
-    }
-  }
-
-  function applyParams(params) {
-    if (!params) return;
-    for (const p of params) {
-      const el = document.getElementById("cur-" + p.name);
-      if (!el) continue;
-      el.textContent = (p.value == null) ? "--" :
-        (p.kind === "integer") ? String(p.value) : fmt(p.value, 4);
-    }
-  }
-
-  async function setParam(name, kind, raw) {
-    if (raw === "" || raw === null) {
-      toast("enter a value first", "bad"); return;
-    }
-    const value = (kind === "integer") ? parseInt(raw, 10) : parseFloat(raw);
-    if (isNaN(value)) { toast("not a number", "bad"); return; }
-    try {
-      const r = await api("/api/param", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, kind, value })
-      });
-      toast("set " + name + " = " + value, "ok");
-      // Re-fetch params to reflect what the controller actually applied.
-      await refreshParams();
-    } catch (e) {
-      toast("set " + name + " failed: " + e.message, "bad");
-    }
-  }
-
-  async function refresh() {
-    try {
-      snapshot = await api("/api/state");
-      $("controller-name").textContent = snapshot.controller_name || "--";
-      $("param-target").textContent    = snapshot.controller_name || "--";
-      const ctl = snapshot.control || {};
-      const lim = ctl.limits || {};
-      $("lim-f").textContent       = fmt(lim.max_wrench_force);
-      $("lim-t").textContent       = fmt(lim.max_wrench_torque, 3);
-      $("lim-qe").textContent      = fmt(lim.engage_max_joint_velocity, 3);
-      $("lim-ftstale").textContent = fmt(lim.ft_stale_after, 2);
-      $("lim-qstale").textContent  = fmt(lim.joint_states_stale_after, 2);
-      syncParamRows(snapshot.params || []);
-      applyLive(snapshot);
-    } catch (e) {
-      $("conn").textContent = "offline";
-      $("conn").classList.remove("ok");
-      $("conn").classList.add("bad");
-    }
-  }
-
-  async function tick() {
-    try {
-      const s = await api("/api/live");
-      applyLive(s);
-    } catch (e) {
-      $("conn").textContent = "offline";
-      $("conn").classList.remove("ok");
-      $("conn").classList.add("bad");
-    }
-  }
-
-  async function refreshParams() {
-    try {
-      const r = await api("/api/params");
-      applyParams(r.params || []);
-    } catch (e) {
-      toast("refresh params failed: " + e.message, "bad");
-    }
-  }
-
-  $("btn-engage").addEventListener("click", async () => {
-    try { await api("/api/engage", { method: "POST" }); await refresh(); }
-    catch (e) { toast("engage failed: " + e.message, "bad"); }
-  });
-
-  $("btn-disengage").addEventListener("click", async () => {
-    try { await api("/api/disengage", { method: "POST" }); await refresh(); }
-    catch (e) { toast("disengage failed: " + e.message, "bad"); }
-  });
-
-  $("btn-refresh-params").addEventListener("click", refreshParams);
-
-  // ---- jog / snap-target handlers ----
-  function fmtPos(p) {
-    if (!p) return "--";
-    return "x=" + fmt(p.x, 4) + "  y=" + fmt(p.y, 4) + "  z=" + fmt(p.z, 4);
-  }
-
-  async function postJog(body) {
-    try {
-      const r = await api("/api/jog", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body)
-      });
-      $("last-target-pos").textContent = fmtPos(r.target && r.target.position);
-    } catch (e) {
-      toast("jog failed: " + e.message, "bad");
-    }
-  }
-
-  // Translation jog buttons.
-  document.querySelectorAll("#cmd-motion-compliance button.jog[data-axis]")
-    .forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const step = parseFloat($("jog-trans-step").value);
-        if (isNaN(step) || step <= 0) {
-          toast("trans step must be > 0", "bad"); return;
-        }
-        const sign = parseInt(btn.dataset.sign, 10);
-        const body = { dx: 0, dy: 0, dz: 0 };
-        body["d" + btn.dataset.axis] = sign * step;
-        postJog(body);
-      });
-    });
-
-  // Rotation jog buttons.
-  document.querySelectorAll("#cmd-motion-compliance button.jog[data-raxis]")
-    .forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const stepDeg = parseFloat($("jog-rot-step").value);
-        if (isNaN(stepDeg) || stepDeg <= 0) {
-          toast("rot step must be > 0", "bad"); return;
-        }
-        const rad = stepDeg * Math.PI / 180.0;
-        const sign = parseInt(btn.dataset.sign, 10);
-        const body = { drx: 0, dry: 0, drz: 0 };
-        body["d" + btn.dataset.raxis] = sign * rad;
-        postJog(body);
-      });
-    });
-
-  $("btn-snap-target").addEventListener("click", async () => {
-    try {
-      const r = await api("/api/snap_target", { method: "POST" });
-      $("last-target-pos").textContent = fmtPos(r.target && r.target.position);
-      toast("target snapped to current pose", "ok");
-    } catch (e) {
-      toast("snap failed: " + e.message, "bad");
-    }
-  });
-
-  // Switch the orchestrator's ``active_controller_name`` parameter on
-  // dropdown change.  The orchestrator refuses if currently engaged --
-  // surface that as a toast and snap the dropdown back.
-  $("sel-controller").addEventListener("change", async (ev) => {
-    const name = ev.target.value;
-    if (!name) return;
-    try {
-      await api("/api/active_controller", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name })
-      });
-      toast("active controller -> " + name, "ok");
-      await refresh();
-    } catch (e) {
-      toast("switch failed: " + e.message, "bad");
-      // Re-sync to whatever the orchestrator actually thinks is active.
-      await refresh();
-    }
-  });
-
-  refresh().then(() => setInterval(tick, 200));
-  setInterval(refresh, 3000);
-})();
-</script>
-</body>
-</html>
-"""
+    The MIME type is guessed from the filename and forced to UTF-8 for
+    text payloads.  Raises :class:`FileNotFoundError` for missing
+    files or paths that escape the static dir (e.g. ``..`` traversal).
+    """
+    # Resolve and reject any path that escapes the static dir.
+    target = (_STATIC_DIR / rel_path).resolve()
+    try:
+        target.relative_to(_STATIC_DIR)
+    except ValueError as exc:
+        raise FileNotFoundError(rel_path) from exc
+    if not target.is_file():
+        raise FileNotFoundError(rel_path)
+    mtime = target.stat().st_mtime
+    key = str(target)
+    with _static_cache_lock:
+        cached = _static_cache.get(key)
+        if cached is None or cached[0] != mtime:
+            data = target.read_bytes()
+            _static_cache[key] = (mtime, data)
+        else:
+            data = cached[1]
+    mime, _enc = mimetypes.guess_type(target.name)
+    if mime is None:
+        mime = "application/octet-stream"
+    if mime.startswith("text/") or mime in (
+            "application/javascript", "application/json"):
+        mime += "; charset=utf-8"
+    return data, mime
 
 
 # ---------------------------------------------------------------------------
@@ -736,10 +378,14 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_html(self, body: bytes) -> None:
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+    def _send_static(self, body: bytes, mime: str,
+                     status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(body)))
+        # Disable caching so live edits with --symlink-install show up
+        # immediately on the next page load.  The static payload is
+        # only a few tens of KB so re-fetching costs nothing.
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
@@ -754,12 +400,73 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"invalid JSON body: {exc}") from None
 
+    # ---- Server-Sent Events: live URDF transforms -----------------------
+    # ``/api/urdf_tf_stream`` opens a long-lived SSE connection that
+    # pushes the latest tf snapshot at ~30 Hz.  This is much smoother
+    # than per-frame polling (no HTTP round-trip per update) and a
+    # single connection per browser tab is plenty -- the
+    # ThreadingHTTPServer spawns one thread per open connection, so
+    # the ``time.sleep`` cadence here doesn't block anything else.
+    _URDF_STREAM_HZ = 30.0
+
+    def _serve_urdf_tf_stream(self) -> None:
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("Connection", "keep-alive")
+            # Some reverse-proxies buffer responses by default; this
+            # header disables that for nginx/etc. while being a no-op
+            # for direct browser connections.
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+        period = 1.0 / self._URDF_STREAM_HZ
+        next_t = time.monotonic()
+        while True:
+            try:
+                payload = self._dashboard.api_urdf_tf()
+            except Exception as exc:  # noqa: BLE001
+                payload = {
+                    "ok": False,
+                    "message": f"{type(exc).__name__}: {exc}",
+                }
+            body = (b"data: "
+                    + json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                    + b"\n\n")
+            try:
+                self.wfile.write(body)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+            next_t += period
+            sleep_for = next_t - time.monotonic()
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            else:
+                # We're behind schedule (e.g. system load).  Reset the
+                # deadline so we don't busy-loop trying to catch up.
+                next_t = time.monotonic()
+
     # ---- routes -----------------------------------------------------------
     def do_GET(self):  # noqa: N802
         path = urlparse(self.path).path
         try:
             if path in ("/", "/index.html"):
-                self._send_html(_HTML_PAGE.encode("utf-8"))
+                body, mime = _load_static("index.html")
+                self._send_static(body, mime)
+                return
+            if path.startswith("/static/"):
+                rel = path[len("/static/"):]
+                try:
+                    body, mime = _load_static(rel)
+                except FileNotFoundError:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self._send_static(body, mime)
                 return
             if path == "/api/state":
                 self._send_json(200, self._dashboard.api_state_full())
@@ -767,8 +474,48 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             if path == "/api/live":
                 self._send_json(200, self._dashboard.api_state_live())
                 return
+            if path == "/api/wrench_samples":
+                # Optional ?since=<mono_sec> cursor.  Anything that
+                # doesn't parse as a float is treated as "no cursor"
+                # (which then returns up to max_window_s of history).
+                params = parse_qs(urlparse(self.path).query)
+                since: Optional[float] = None
+                if "since" in params and params["since"]:
+                    try:
+                        since = float(params["since"][0])
+                    except ValueError:
+                        since = None
+                self._send_json(
+                    200, self._dashboard.api_wrench_samples(since=since))
+                return
             if path == "/api/params":
                 self._send_json(200, self._dashboard.api_params())
+                return
+            if path == "/api/urdf_model":
+                self._send_json(200, self._dashboard.api_urdf_model())
+                return
+            if path == "/api/urdf_tf":
+                self._send_json(200, self._dashboard.api_urdf_tf())
+                return
+            if path == "/api/urdf_tf_stream":
+                # Long-lived SSE connection -- handled inline and does
+                # not return until the client drops.
+                self._serve_urdf_tf_stream()
+                return
+            if path == "/api/aux_frames":
+                self._send_json(200, self._dashboard.api_get_aux_frames())
+                return
+            if path == "/api/safety_thresholds":
+                self._send_json(
+                    200, self._dashboard.api_get_safety_thresholds())
+                return
+            if path == "/api/target_wrench":
+                self._send_json(
+                    200, self._dashboard.api_get_target_wrench())
+                return
+            if path == "/api/wrench_deadband":
+                self._send_json(
+                    200, self._dashboard.api_get_wrench_deadband())
                 return
             self.send_response(404)
             self.end_headers()
@@ -801,6 +548,34 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 body = self._read_json_body() or {}
                 self._send_json(200, self._dashboard.api_snap_target(body))
                 return
+            if path == "/api/aux_frames":
+                body = self._read_json_body() or {}
+                self._send_json(200, self._dashboard.api_set_aux_frames(body))
+                return
+            if path == "/api/safety_thresholds":
+                body = self._read_json_body() or {}
+                self._send_json(
+                    200,
+                    self._dashboard.api_set_safety_thresholds(body))
+                return
+            if path == "/api/target_wrench":
+                body = self._read_json_body() or {}
+                self._send_json(
+                    200,
+                    self._dashboard.api_set_target_wrench(body))
+                return
+            if path == "/api/target_wrench_publish":
+                body = self._read_json_body() or {}
+                self._send_json(
+                    200,
+                    self._dashboard.api_set_target_wrench_publish(body))
+                return
+            if path == "/api/wrench_deadband":
+                body = self._read_json_body() or {}
+                self._send_json(
+                    200,
+                    self._dashboard.api_set_wrench_deadband(body))
+                return
             self.send_response(404)
             self.end_headers()
         except RuntimeError as exc:
@@ -832,12 +607,27 @@ class DashboardNode(Node):
         ("default_controller_name",  "cartesian_force_controller"),
         ("wrench_topic",     "/duco_ft_sensor/wrench_compensated"),
         ("joint_states_topic", "/joint_states"),
+        # Fully-qualified name (relative to root, with leading slash) of
+        # the gravity-compensation node whose ``force_deadband`` /
+        # ``torque_deadband`` parameters the dashboard's "Wrench
+        # deadband" editor targets.  Default matches the node name used
+        # by ``ft_sensor_gravity_compensation.compensation_node``.
+        ("gravity_compensation_node", "/ft_sensor_gravity_compensation"),
         # Frames used for jog / snap-target publishes on motion +
-        # compliance controllers.  Must match the URDF that
-        # controller_manager sees and the FZI YAML's
-        # ``robot_base_link`` / ``end_effector_link``.
+        # compliance controllers AND for the TCP-pose display.  These
+        # are FALLBACK values used only when the active controller's
+        # ``robot_base_link`` / ``end_effector_link`` parameters can't
+        # be read (e.g. the controller node isn't running yet).  At
+        # runtime ``api_jog`` and the TF-rate sampler resolve the
+        # actual frames via ``_resolve_active_frames()`` so they
+        # automatically track whatever the FZI YAML configured.  The
+        # default ``compliance_link`` matches the EE tip declared in
+        # ``config/fzi_zero_gravity.yaml`` and ``aux_frames`` in
+        # ``config/robot_config.yaml``; if the dashboard is launched
+        # before the controllers, jog will use these defaults until
+        # the parameters become available.
         ("base_frame", "base_link"),
-        ("tool_frame", "link_6"),
+        ("tool_frame", "compliance_link"),
         ("service_timeout_sec", 2.0),
         # http -----------------------------------------------------------
         ("host", "0.0.0.0"),
@@ -866,6 +656,9 @@ class DashboardNode(Node):
             self._default_controller_name = self._available_controllers[0]
         self._wrench_topic = str(gp("wrench_topic"))
         self._joint_states_topic = str(gp("joint_states_topic"))
+        self._gravcomp_ns = str(gp("gravity_compensation_node")).rstrip("/")
+        if not self._gravcomp_ns.startswith("/"):
+            self._gravcomp_ns = "/" + self._gravcomp_ns
         self._base_frame = str(gp("base_frame")).strip("/")
         self._tool_frame = str(gp("tool_frame")).strip("/")
         self._service_timeout = float(gp("service_timeout_sec"))
@@ -879,6 +672,51 @@ class DashboardNode(Node):
         self._wrench: Optional[Dict[str, float]] = None
         self._wrench_mono: Optional[float] = None
         self._js_mono: Optional[float] = None
+        # Latest joint positions, keyed by joint name (rad for
+        # revolute / continuous, metres for prismatic).  Updated on
+        # every /joint_states message and surfaced to the dashboard
+        # via the URDF SSE stream so the floating panel's per-joint
+        # bars stay in sync with the live robot pose.
+        self._joint_positions: Dict[str, float] = {}
+
+        # Per-source publish-rate trackers.  All four integrate over a
+        # 1 s window and recompute (and refresh the cached readout)
+        # at most once per second, so the sticky-bar Hz numbers are
+        # stable to within ±1 count regardless of underlying publish
+        # rate.  ``stale_after`` is per-source: the orchestrator is
+        # slow (~5 Hz), so a 5 s silence is still considered alive;
+        # wrench / joint_states / tf are fast (~250 Hz) and we treat
+        # >1 s gaps as a stopped publisher.  Reads are lock-free (the
+        # deques are only mutated on the rclpy spin thread, and
+        # ``hz()`` only inspects head + tail snapshots).
+        self._state_rate  = _RateTracker(window_s=1.0, stale_after=5.0)
+        self._wrench_rate = _RateTracker(window_s=1.0, stale_after=1.0)
+        self._js_rate     = _RateTracker(window_s=1.0, stale_after=1.0)
+        self._tf_rate     = _RateTracker(window_s=1.0, stale_after=1.0)
+
+        # Wrench plot ring buffer.  Sized for ~30 s @ 300 Hz; the
+        # front-end's force/torque plot polls /api/wrench_samples with
+        # a ``since`` cursor and only fetches new tuples.  We store
+        # (mono_sec, fx, fy, fz, tx, ty, tz) so the client can lay out
+        # the x-axis in relative seconds without depending on a
+        # particular ROS clock domain.  Append happens on the spin
+        # thread under ``_lock``; reads happen on the HTTP thread,
+        # also under ``_lock``.
+        self._wrench_log: Deque[Tuple[float, float, float, float,
+                                       float, float, float]] = deque(maxlen=10000)
+        # Cached TF stamp (nanoseconds) used by ``_tick_tf_rate`` to
+        # detect *new* TF samples and bump ``_tf_rate``.  Polled at
+        # 50 Hz, so the displayed TF rate is capped at ~50 Hz -- enough
+        # to confirm "data flowing", not a precise measurement of the
+        # underlying publish rate.
+        self._last_tf_stamp_ns: Optional[int] = None
+        # Cached URDF skeleton parsed from /robot_description.  The
+        # 3D-model panel polls /api/urdf_model once on load (and on
+        # request) to seed its renderer; live joint motion comes from
+        # /api/urdf_tf which uses the existing tf2 buffer.
+        self._urdf_xml: Optional[str] = None        # raw XML payload
+        self._urdf_model: Optional[Dict[str, Any]] = None  # parsed skeleton
+        self._urdf_mono: Optional[float] = None     # when URDF arrived
 
         # ---- callback group (reentrant for HTTP-thread service calls) --
         self._cbgroup = ReentrantCallbackGroup()
@@ -899,6 +737,18 @@ class DashboardNode(Node):
             WrenchStamped, self._wrench_topic, self._on_wrench, wrench_qos)
         self._sub_js = self.create_subscription(
             JointState, self._joint_states_topic, self._on_joint_states, 50)
+
+        # ``/robot_description`` is published by ``robot_state_publisher``
+        # exactly once with TRANSIENT_LOCAL durability -- new subscribers
+        # get the latched value on connection.  We re-parse it each time
+        # in case ``robot_state_publisher`` ever republishes (e.g. after
+        # a controller reload that swaps the URDF).
+        urdf_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST, depth=1)
+        self._sub_urdf = self.create_subscription(
+            String, "/robot_description", self._on_urdf, urdf_qos)
 
         # ---- service clients ------------------------------------------
         self._cli_engage = self.create_client(
@@ -931,6 +781,52 @@ class DashboardNode(Node):
             SetParameters,
             f"{self._orchestrator_ns}/set_parameters",
             callback_group=self._cbgroup)
+        # GetParameters counterpart -- used by the target_wrench editor
+        # to fetch the orchestrator's current setpoint on page load (so
+        # the sliders start in the right position even after a restart).
+        self._cli_orchestrator_get_params = self.create_client(
+            GetParameters,
+            f"{self._orchestrator_ns}/get_parameters",
+            callback_group=self._cbgroup)
+
+        # Service clients for the gravity-compensation node's parameters.
+        # Used by the "Wrench deadband" editor to read the current
+        # per-axis force / torque dead-zone (GetParameters) and to push
+        # operator edits (SetParameters).  If the node is not running
+        # the dashboard surfaces a clear timeout on both paths.
+        self._cli_gravcomp_get_params = self.create_client(
+            GetParameters,
+            f"{self._gravcomp_ns}/get_parameters",
+            callback_group=self._cbgroup)
+        self._cli_gravcomp_set_params = self.create_client(
+            SetParameters,
+            f"{self._gravcomp_ns}/set_parameters",
+            callback_group=self._cbgroup)
+
+        # Service client for ``robot_state_publisher``'s parameters.
+        # Used by the "Tool frames" editor to push an updated
+        # ``robot_description`` URDF when the operator saves aux-frame
+        # offsets, so the static TF tree refreshes live without
+        # restarting ``duco_robot_bringup`` (rsp re-parses the URDF and
+        # re-publishes ``/tf_static`` with the new offsets).  The name
+        # ``/robot_state_publisher`` is the standard one for
+        # ROS 2 Humble; if a remap is ever introduced this client will
+        # simply time out and the API surfaces a clear error.
+        self._cli_rsp_set_params = self.create_client(
+            SetParameters,
+            "/robot_state_publisher/set_parameters",
+            callback_group=self._cbgroup)
+
+        # The FZI cartesian controllers fork has been patched to react
+        # to ``robot_description`` parameter updates on their own node
+        # (not on /controller_manager): each controller rebuilds the
+        # KDL chain at runtime and swaps it in atomically from the RT
+        # update() thread, so saving new aux-frame offsets takes effect
+        # inside the engaged controller without an unload/load.  We
+        # already have ``self._param_clients[ctrl]['set']`` for each
+        # available controller; the Tool-frames editor reuses those
+        # clients.  See cartesian_controller_base.cpp::
+        # ``onParameterUpdate`` for the receiving side.
 
         # ---- target_frame publishers (one per controller) -------------
         # The motion + compliance controllers consume PoseStamped on
@@ -944,9 +840,25 @@ class DashboardNode(Node):
             for ctrl in self._available_controllers
         }
 
+        # ---- per-controller jog-frame cache ---------------------------
+        # ``_resolve_active_frames`` fills this lazily on the first jog
+        # against each controller by reading the controller's own
+        # ``robot_base_link`` / ``end_effector_link`` parameters.  The
+        # FZI controllers don't re-load these at runtime, so once
+        # cached the entries stay valid for the controller's lifetime;
+        # we don't need to invalidate on engage/disengage cycles.
+        self._jog_frames_cache: Dict[str, Tuple[str, str]] = {}
+
         # ---- tf2 listener (current EE pose source for jog / snap) -----
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
+
+        # Periodic TF-rate sampler.  tf2's C++ listener doesn't surface
+        # a per-message Python callback, so we instead poll the buffer
+        # at 50 Hz and count *new* stamps -- enough to confirm the TF
+        # tree is updating at controller rate.
+        self._tf_rate_timer = self.create_timer(
+            0.02, self._tick_tf_rate, callback_group=self._cbgroup)
 
         # ---- HTTP server ----------------------------------------------
         self._httpd: Optional[ThreadingHTTPServer] = None
@@ -964,22 +876,89 @@ class DashboardNode(Node):
         with self._lock:
             self._control_state = payload
             self._control_state_mono = time.monotonic()
+        self._state_rate.tick()
 
     def _on_wrench(self, msg: WrenchStamped) -> None:
+        mono = time.monotonic()
+        fx = float(msg.wrench.force.x)
+        fy = float(msg.wrench.force.y)
+        fz = float(msg.wrench.force.z)
+        tx = float(msg.wrench.torque.x)
+        ty = float(msg.wrench.torque.y)
+        tz = float(msg.wrench.torque.z)
         with self._lock:
             self._wrench = {
-                "fx": float(msg.wrench.force.x),
-                "fy": float(msg.wrench.force.y),
-                "fz": float(msg.wrench.force.z),
-                "tx": float(msg.wrench.torque.x),
-                "ty": float(msg.wrench.torque.y),
-                "tz": float(msg.wrench.torque.z),
+                "fx": fx, "fy": fy, "fz": fz,
+                "tx": tx, "ty": ty, "tz": tz,
             }
-            self._wrench_mono = time.monotonic()
+            self._wrench_mono = mono
+            # Append to the plot ring buffer.  The deque has maxlen
+            # so old samples are evicted automatically when the buffer
+            # is full -- no compaction needed.
+            self._wrench_log.append((mono, fx, fy, fz, tx, ty, tz))
+        self._wrench_rate.tick(mono)
 
-    def _on_joint_states(self, msg: JointState) -> None:  # noqa: ARG002
+    def _on_joint_states(self, msg: JointState) -> None:
         with self._lock:
             self._js_mono = time.monotonic()
+            # Record the latest position of every named joint.  We
+            # merge into the existing dict rather than replacing it
+            # because some publishers (e.g. dual-arm setups) split
+            # joint_states across multiple topics / messages.
+            names = list(msg.name) if msg.name else []
+            positions = list(msg.position) if msg.position else []
+            for i, name in enumerate(names):
+                if i < len(positions):
+                    self._joint_positions[name] = float(positions[i])
+        self._js_rate.tick()
+
+    def _tick_tf_rate(self) -> None:
+        """50 Hz sampler that bumps ``_tf_rate`` on each new TF stamp.
+
+        ``tf2`` doesn't expose a per-message Python callback, so we
+        peek at the latest available ``base_frame -> tool_frame`` and
+        record a tick only when the stamp differs from the one seen
+        last cycle.  This caps the *displayed* TF rate at the timer's
+        50 Hz, which is plenty for a freshness indicator.
+        """
+        try:
+            t = self._tf_buffer.lookup_transform(
+                self._base_frame, self._tool_frame,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.0))
+        except TransformException:
+            return
+        stamp_ns = int(t.header.stamp.sec) * 1_000_000_000 \
+                 + int(t.header.stamp.nanosec)
+        if stamp_ns <= 0:
+            return  # static / unstamped TF -- no rate to compute
+        if self._last_tf_stamp_ns is None \
+           or stamp_ns != self._last_tf_stamp_ns:
+            self._last_tf_stamp_ns = stamp_ns
+            self._tf_rate.tick()
+
+    def _on_urdf(self, msg: String) -> None:
+        """Cache and parse the latched ``/robot_description`` payload.
+
+        Re-parsed on every message in case ``robot_state_publisher``
+        ever republishes (e.g. a controller switch that swaps the
+        URDF).  Parsing failures are logged but don't crash the node.
+        """
+        xml_text = msg.data or ""
+        model = _parse_urdf(xml_text)
+        with self._lock:
+            self._urdf_xml = xml_text
+            self._urdf_model = model
+            self._urdf_mono = time.monotonic()
+        if model is None:
+            self.get_logger().warn(
+                "received /robot_description but could not parse URDF "
+                f"({len(xml_text)} bytes)")
+        else:
+            self.get_logger().info(
+                f"URDF received: {len(model.get('links', []))} links, "
+                f"{len(model.get('joints', []))} joints, "
+                f"root={model.get('root_link')!r}")
 
     # ------------------------------------------------------------------
     # HTTP server lifecycle
@@ -1141,6 +1120,116 @@ class DashboardNode(Node):
             return False, why or "set_parameters failed"
         return True, "ok"
 
+    def _set_orchestrator_doubles(self, updates: Dict[str, float]
+                                  ) -> Tuple[bool, List[Dict[str, Any]]]:
+        """Push a batch of ``double`` parameters to the orchestrator.
+
+        Returns ``(ok, per_param_results)`` where ``ok`` is True iff
+        the service responded AND every parameter was accepted, and
+        ``per_param_results`` is a list of dicts
+        ``{"name": str, "successful": bool, "reason": str}`` matching
+        the order of ``updates``.  Used by the safety-threshold editor.
+        """
+        if not updates:
+            return True, []
+        if not self._cli_orchestrator_set_params.wait_for_service(
+                timeout_sec=0.2):
+            return False, [{
+                "name": n, "successful": False,
+                "reason": (f"orchestrator set_parameters service "
+                           f"unavailable at {self._orchestrator_ns!r}"),
+            } for n in updates]
+        params: List[Parameter] = []
+        ordered_names: List[str] = []
+        for name, value in updates.items():
+            p = Parameter()
+            p.name = name
+            pv = ParameterValue()
+            pv.type = ParameterType.PARAMETER_DOUBLE
+            pv.double_value = float(value)
+            p.value = pv
+            params.append(p)
+            ordered_names.append(name)
+        req = SetParameters.Request()
+        req.parameters = params
+        resp = self._service_call_sync(
+            self._cli_orchestrator_set_params, req, self._service_timeout)
+        if resp is None:
+            return False, [{
+                "name": n, "successful": False,
+                "reason": (f"no response within "
+                           f"{self._service_timeout:.1f}s"),
+            } for n in ordered_names]
+        results: List[Dict[str, Any]] = []
+        for name, r in zip(ordered_names, resp.results):
+            results.append({
+                "name":       name,
+                "successful": bool(r.successful),
+                "reason":     str(r.reason or ""),
+            })
+        all_ok = all(r["successful"] for r in results)
+        return all_ok, results
+
+    def _get_orchestrator_doubles(self, names: List[str]
+                                  ) -> Dict[str, Optional[float]]:
+        """Read ``double`` parameters from the orchestrator.
+
+        Returns ``{name: float_or_None}``.  ``None`` means the parameter
+        is not declared on the remote node OR the service is not
+        reachable inside ``_service_timeout``.  Used by the
+        target-wrench editor to seed the sliders on page load.
+        """
+        result: Dict[str, Optional[float]] = {n: None for n in names}
+        if not names:
+            return result
+        if not self._cli_orchestrator_get_params.wait_for_service(
+                timeout_sec=0.2):
+            return result
+        req = GetParameters.Request()
+        req.names = list(names)
+        resp = self._service_call_sync(
+            self._cli_orchestrator_get_params, req, self._service_timeout)
+        if resp is None:
+            return result
+        for name, pv in zip(names, resp.values):
+            decoded = _decode_param_value(pv)
+            if isinstance(decoded, (int, float)):
+                result[name] = float(decoded)
+            else:
+                result[name] = None
+        return result
+
+    def _set_orchestrator_bool(self, name: str, value: bool
+                               ) -> Tuple[bool, str]:
+        """Push a single ``bool`` parameter to the orchestrator.
+
+        Returns ``(ok, reason)`` -- ``ok`` is True iff the service
+        responded AND the parameter was accepted; ``reason`` is the
+        orchestrator's verbatim rejection reason (empty on success).
+        Used by the dashboard's "Send target_wrench" toggle.
+        """
+        if not self._cli_orchestrator_set_params.wait_for_service(
+                timeout_sec=0.2):
+            return False, (f"orchestrator set_parameters service "
+                           f"unavailable at {self._orchestrator_ns!r}")
+        p = Parameter()
+        p.name = name
+        pv = ParameterValue()
+        pv.type = ParameterType.PARAMETER_BOOL
+        pv.bool_value = bool(value)
+        p.value = pv
+        req = SetParameters.Request()
+        req.parameters = [p]
+        resp = self._service_call_sync(
+            self._cli_orchestrator_set_params, req, self._service_timeout)
+        if resp is None:
+            return False, (f"no response within "
+                           f"{self._service_timeout:.1f}s")
+        if not resp.results:
+            return False, "set_parameters: empty results"
+        r = resp.results[0]
+        return bool(r.successful), str(r.reason or "")
+
     # ------------------------------------------------------------------
     # active-controller helpers (cached from orchestrator state topic)
     # ------------------------------------------------------------------
@@ -1197,6 +1286,53 @@ class DashboardNode(Node):
 
     def api_state_live(self) -> Dict[str, Any]:
         return self._snapshot_live_locked()
+
+    def api_wrench_samples(self, since: Optional[float] = None,
+                           max_window_s: float = 30.0) -> Dict[str, Any]:
+        """Return wrench samples newer than ``since`` (monotonic).
+
+        The dashboard's force/torque plot polls this endpoint at
+        ~30 Hz with the timestamp of its last received sample as
+        ``since``; the backend returns only new tuples since then,
+        keeping the network payload proportional to the publish rate
+        rather than the entire history.  On the first poll (or after
+        a buffer flush) ``since`` is ``None`` and the response is
+        capped at ``max_window_s`` seconds of trailing history so the
+        client doesn't have to load a multi-megabyte JSON blob to
+        bootstrap.
+
+        The returned ``samples`` are a list of
+        ``[mono_sec, fx, fy, fz, tx, ty, tz]`` tuples (lists in JSON);
+        the client maintains its own typed-array buffer keyed off
+        ``mono_sec``.  ``now`` is the server's current monotonic time
+        so the client can sync its x-axis without round-trip drift.
+        """
+        now = time.monotonic()
+        with self._lock:
+            # Defensive copy; the deque is mutated on the spin thread
+            # but we're already holding ``_lock`` so the snapshot is
+            # consistent.  Cast to a list so we can JSON-encode without
+            # touching the deque again outside the lock.
+            buf = list(self._wrench_log)
+            hz = self._wrench_rate.hz()
+        if not buf:
+            return {"samples": [], "now": now, "hz": hz}
+        # Determine cutoff time for new samples.
+        if since is None:
+            cutoff = now - max_window_s
+        else:
+            cutoff = float(since)
+        # Linear walk from the *end* of the buffer (newest first)
+        # until we hit a sample <= cutoff.  Almost all polls land in
+        # the last few hundred samples, so this is effectively O(K)
+        # where K is the number of new samples since the last poll.
+        out: List[List[float]] = []
+        for t, fx, fy, fz, tx, ty, tz in reversed(buf):
+            if t <= cutoff:
+                break
+            out.append([t, fx, fy, fz, tx, ty, tz])
+        out.reverse()
+        return {"samples": out, "now": now, "hz": hz}
 
     def api_params(self) -> Dict[str, Any]:
         active = self._active_controller()
@@ -1262,6 +1398,479 @@ class DashboardNode(Node):
         return {"ok": True, "name": name, "message": why}
 
     # ------------------------------------------------------------------
+    # safety thresholds editor
+    # ------------------------------------------------------------------
+    # The orchestrator owns the safety supervisor's limits and exposes
+    # them as live-tunable parameters on its own node (see
+    # ``CartesianControlNode._SAFETY_KNOBS``).  The dashboard provides a
+    # typed editor for them so operators don't need to remember the
+    # ``ros2 param set`` syntax.  The orchestrator itself validates
+    # non-negativity and unknown names; we add a thin whitelist here so
+    # an obvious typo from the browser does not blindly become a
+    # SetParameters call on an unrelated parameter.
+    def api_get_safety_thresholds(self) -> Dict[str, Any]:
+        """Return the orchestrator's currently-known safety thresholds.
+
+        We read directly from the cached ``control_state`` (which the
+        orchestrator publishes ~5 Hz) rather than calling GetParameters
+        again; this keeps the GET fast and avoids serialising every
+        save round-trip through an extra RPC.
+        """
+        with self._lock:
+            ctl = dict(self._control_state) if self._control_state else {}
+            ctl_age = (time.monotonic() - self._control_state_mono
+                       if self._control_state_mono is not None else None)
+        limits = (ctl.get("limits") or {}) if isinstance(ctl, dict) else {}
+        items: List[Dict[str, Any]] = []
+        for name, kind, unit in _SAFETY_THRESHOLDS:
+            value = limits.get(name)
+            try:
+                value = float(value) if value is not None else None
+            except (TypeError, ValueError):
+                value = None
+            items.append({
+                "name":  name,
+                "kind":  kind,
+                "unit":  unit,
+                "value": value,
+            })
+        return {
+            "ok":              True,
+            "orchestrator_ns": self._orchestrator_ns,
+            "orchestrator_live": (ctl_age is not None and ctl_age <= 5.0),
+            "control_state_age": ctl_age,
+            "thresholds":      items,
+            "message": ("orchestrator-owned safety limits "
+                        "(/duco_cartesian_control); live-tunable; "
+                        "trips disengage the FZI controller"),
+        }
+
+    def api_set_safety_thresholds(self, body: Dict[str, Any]
+                                  ) -> Dict[str, Any]:
+        """Push edits to the orchestrator's safety thresholds.
+
+        Body shape::
+
+            {"thresholds": [{"name": str, "value": float}, ...]}
+
+        Unknown names are rejected (the dashboard restricts the editor
+        to ``_SAFETY_THRESHOLDS``); non-finite or negative values are
+        rejected here before the round-trip.  The orchestrator does
+        its own validation too, which we surface verbatim.
+        """
+        if not isinstance(body, dict):
+            raise RuntimeError("body must be a JSON object")
+        items = body.get("thresholds")
+        if not isinstance(items, list):
+            raise RuntimeError("body.thresholds must be a list")
+
+        updates: Dict[str, float] = {}
+        for idx, entry in enumerate(items):
+            if not isinstance(entry, dict):
+                raise RuntimeError(
+                    f"thresholds[{idx}] must be an object")
+            name = entry.get("name")
+            if not isinstance(name, str) or not name:
+                raise RuntimeError(
+                    f"thresholds[{idx}].name must be a non-empty string")
+            if name not in _SAFETY_THRESHOLD_NAMES:
+                raise RuntimeError(
+                    f"thresholds[{idx}].name={name!r} is not editable "
+                    f"({sorted(_SAFETY_THRESHOLD_NAMES)})")
+            raw = entry.get("value")
+            try:
+                value = float(raw)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"thresholds[{idx}].value not numeric: {exc}"
+                ) from exc
+            if not math.isfinite(value):
+                raise RuntimeError(
+                    f"thresholds[{idx}].value must be finite "
+                    f"(got {raw!r})")
+            if value < 0.0:
+                raise RuntimeError(
+                    f"thresholds[{idx}].name={name!r} must be >= 0 "
+                    f"(got {value})")
+            updates[name] = value
+
+        if not updates:
+            return {"ok": True, "updated": 0, "results": [],
+                    "message": "no thresholds supplied"}
+
+        ok, results = self._set_orchestrator_doubles(updates)
+        successful = sum(1 for r in results if r["successful"])
+        return {
+            "ok":      ok,
+            "updated": successful,
+            "results": results,
+            "message": (
+                f"applied {successful}/{len(results)} threshold(s) "
+                "to /duco_cartesian_control" if ok else
+                f"orchestrator rejected {len(results) - successful}/"
+                f"{len(results)} threshold(s)"
+            ),
+        }
+
+    # ------------------------------------------------------------------
+    # target_wrench editor (orchestrator parameters)
+    # ------------------------------------------------------------------
+    # Six ``double`` parameters (``target_wrench_force_x/y/z``,
+    # ``target_wrench_torque_x/y/z``) live on the orchestrator and are
+    # republished at the heartbeat rate to every FZI controller's
+    # ``target_wrench`` topic.  With all six set to 0 the force /
+    # compliance controllers give pure free-drive / spring-hold; the
+    # dashboard's slider widget lets the operator command a constant
+    # additive wrench on top of the FT-sensor feedback.
+    #
+    # GET reads the current values via GetParameters; POST forwards the
+    # 6-value JSON body via the existing ``_set_orchestrator_doubles``
+    # helper (per-parameter results bubble up so the JS can surface a
+    # rejection reason -- e.g. |value| > max_wrench_force).
+    def api_get_target_wrench(self) -> Dict[str, Any]:
+        """Return the orchestrator's current target_wrench setpoint.
+
+        Also returns the matching safety limits (``max_wrench_force`` /
+        ``max_wrench_torque``) read from the cached ``control_state``,
+        so the JS can use them as slider bounds.  When the orchestrator
+        is unreachable, ``values`` slots come back as ``None``.
+        """
+        names = [n for (n, _l, _k) in _TARGET_WRENCH_PARAMS]
+        fetched = self._get_orchestrator_doubles(names)
+        with self._lock:
+            ctl = dict(self._control_state) if self._control_state else {}
+            ctl_age = (time.monotonic() - self._control_state_mono
+                       if self._control_state_mono is not None else None)
+        limits = (ctl.get("limits") or {}) if isinstance(ctl, dict) else {}
+        try:
+            max_f = float(limits.get("max_wrench_force"))
+        except (TypeError, ValueError):
+            max_f = None
+        try:
+            max_t = float(limits.get("max_wrench_torque"))
+        except (TypeError, ValueError):
+            max_t = None
+        items: List[Dict[str, Any]] = []
+        for name, label, kind in _TARGET_WRENCH_PARAMS:
+            items.append({
+                "name":  name,
+                "label": label,
+                "kind":  kind,
+                "value": fetched.get(name),
+            })
+        return {
+            "ok":              True,
+            "orchestrator_ns": self._orchestrator_ns,
+            "orchestrator_live": (ctl_age is not None and ctl_age <= 5.0),
+            "max_wrench_force":  max_f,
+            "max_wrench_torque": max_t,
+            "axes":            items,
+            "message": ("orchestrator-owned target_wrench setpoint "
+                        "(/duco_cartesian_control); republished to every "
+                        "FZI controller's target_wrench topic at the "
+                        "heartbeat rate"),
+        }
+
+    def api_set_target_wrench(self, body: Dict[str, Any]
+                              ) -> Dict[str, Any]:
+        """Push edits to the orchestrator's target_wrench setpoint.
+
+        Body shape::
+
+            {"axes": [{"name": str, "value": float}, ...]}
+
+        Unknown names are rejected (the dashboard restricts the editor
+        to ``_TARGET_WRENCH_PARAMS``); non-finite values are rejected
+        here before the round-trip.  The orchestrator enforces
+        ``|value| <= max_wrench_{force,torque}`` and surfaces its
+        rejection reason verbatim through the per-parameter results.
+        """
+        if not isinstance(body, dict):
+            raise RuntimeError("body must be a JSON object")
+        items = body.get("axes")
+        if not isinstance(items, list):
+            raise RuntimeError("body.axes must be a list")
+
+        updates: Dict[str, float] = {}
+        for idx, entry in enumerate(items):
+            if not isinstance(entry, dict):
+                raise RuntimeError(
+                    f"axes[{idx}] must be an object")
+            name = entry.get("name")
+            if not isinstance(name, str) or not name:
+                raise RuntimeError(
+                    f"axes[{idx}].name must be a non-empty string")
+            if name not in _TARGET_WRENCH_NAMES:
+                raise RuntimeError(
+                    f"axes[{idx}].name={name!r} is not editable "
+                    f"({sorted(_TARGET_WRENCH_NAMES)})")
+            raw = entry.get("value")
+            try:
+                value = float(raw)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"axes[{idx}].value not numeric: {exc}"
+                ) from exc
+            if not math.isfinite(value):
+                raise RuntimeError(
+                    f"axes[{idx}].value must be finite "
+                    f"(got {raw!r})")
+            updates[name] = value
+
+        if not updates:
+            return {"ok": True, "updated": 0, "results": [],
+                    "message": "no axes supplied"}
+
+        ok, results = self._set_orchestrator_doubles(updates)
+        successful = sum(1 for r in results if r["successful"])
+        return {
+            "ok":      ok,
+            "updated": successful,
+            "results": results,
+            "message": (
+                f"applied {successful}/{len(results)} axis(es) "
+                "to /duco_cartesian_control" if ok else
+                f"orchestrator rejected {len(results) - successful}/"
+                f"{len(results)} axis(es)"
+            ),
+        }
+
+    def api_set_target_wrench_publish(self, body: Dict[str, Any]
+                                      ) -> Dict[str, Any]:
+        """Toggle the orchestrator's master target_wrench publish enable.
+
+        Body shape::
+
+            {"enabled": bool}
+
+        When ``False`` the orchestrator suppresses both the heartbeat
+        and the external-topic forwarding, leaving every FZI
+        controller's ``target_wrench`` topic silent so a third-party
+        publisher (teleop, scripts, RViz marker) can drive them
+        directly without contention.  Default on the orchestrator is
+        ``True`` (legacy heartbeat-on behaviour).
+        """
+        if not isinstance(body, dict):
+            raise RuntimeError("body must be a JSON object")
+        if "enabled" not in body:
+            raise RuntimeError("body.enabled is required (bool)")
+        raw = body["enabled"]
+        if not isinstance(raw, bool):
+            raise RuntimeError(
+                f"body.enabled must be a boolean (got {type(raw).__name__})")
+        ok, reason = self._set_orchestrator_bool(
+            "publish_target_wrench", raw)
+        return {
+            "ok":      ok,
+            "enabled": raw if ok else None,
+            "reason":  reason,
+            "message": (
+                f"orchestrator publish_target_wrench -> {raw}" if ok else
+                f"orchestrator rejected publish_target_wrench={raw}: "
+                f"{reason or '(no reason)'}"
+            ),
+        }
+
+    # ------------------------------------------------------------------
+    # wrench dead-zone editor (gravity-compensation node parameters)
+    # ------------------------------------------------------------------
+    # The dead-zone is per-axis soft (continuous) shrinkage applied to
+    # the compensated wrench just before it is published.  It lives on
+    # the gravity-compensation node so that every downstream consumer
+    # (the force / compliance controllers, the dashboard's live wrench
+    # display, rosbag recorders) sees the same clean signal.  See
+    # ``ft_sensor_gravity_compensation.compensation_node`` for the
+    # validation rules: 3 doubles per parameter, non-negative, finite.
+    def _get_gravcomp_double_arrays(self, names: List[str]
+                                    ) -> Dict[str, Optional[List[float]]]:
+        """Read ``double[]`` parameters from the gravity-comp node.
+
+        Returns ``{name: list_or_None}``.  ``None`` means the parameter
+        is not declared on the remote node OR the service is not
+        reachable inside ``_service_timeout``.  Callers are responsible
+        for distinguishing those two cases via ``service_available``
+        in the caller's response payload if needed.
+        """
+        result: Dict[str, Optional[List[float]]] = {n: None for n in names}
+        if not names:
+            return result
+        if not self._cli_gravcomp_get_params.wait_for_service(
+                timeout_sec=0.2):
+            return result
+        req = GetParameters.Request()
+        req.names = list(names)
+        resp = self._service_call_sync(
+            self._cli_gravcomp_get_params, req, self._service_timeout)
+        if resp is None:
+            return result
+        for name, pv in zip(names, resp.values):
+            decoded = _decode_param_value(pv)
+            # We only accept double-array values for these parameters
+            # (anything else means the node has a name collision with a
+            # differently-typed parameter -- treat as "not available").
+            if isinstance(decoded, list) and all(
+                    isinstance(v, (int, float)) for v in decoded):
+                result[name] = [float(v) for v in decoded]
+            else:
+                result[name] = None
+        return result
+
+    def _set_gravcomp_double_arrays(self, updates: Dict[str, List[float]]
+                                    ) -> Tuple[bool, List[Dict[str, Any]]]:
+        """Push a batch of ``double[]`` parameters to the gravity-comp node.
+
+        Returns ``(ok, per_param_results)`` matching
+        ``_set_orchestrator_doubles`` in shape.  Used by the
+        wrench-deadband editor.
+        """
+        if not updates:
+            return True, []
+        if not self._cli_gravcomp_set_params.wait_for_service(
+                timeout_sec=0.2):
+            return False, [{
+                "name": n, "successful": False,
+                "reason": (f"gravity-compensation set_parameters "
+                           f"service unavailable at {self._gravcomp_ns!r}"),
+            } for n in updates]
+        params: List[Parameter] = []
+        ordered_names: List[str] = []
+        for name, vec in updates.items():
+            p = Parameter()
+            p.name = name
+            pv = ParameterValue()
+            pv.type = ParameterType.PARAMETER_DOUBLE_ARRAY
+            pv.double_array_value = [float(v) for v in vec]
+            p.value = pv
+            params.append(p)
+            ordered_names.append(name)
+        req = SetParameters.Request()
+        req.parameters = params
+        resp = self._service_call_sync(
+            self._cli_gravcomp_set_params, req, self._service_timeout)
+        if resp is None:
+            return False, [{
+                "name": n, "successful": False,
+                "reason": (f"no response within "
+                           f"{self._service_timeout:.1f}s"),
+            } for n in ordered_names]
+        results: List[Dict[str, Any]] = []
+        for name, r in zip(ordered_names, resp.results):
+            results.append({
+                "name":       name,
+                "successful": bool(r.successful),
+                "reason":     str(r.reason or ""),
+            })
+        all_ok = all(r["successful"] for r in results)
+        return all_ok, results
+
+    def api_get_wrench_deadband(self) -> Dict[str, Any]:
+        """Return the current per-axis force / torque dead-zone vectors.
+
+        Each entry's ``value`` is a 3-element list (xyz) or ``None`` if
+        the gravity-compensation node is not reachable.
+        """
+        names = [n for (n, _l, _u) in _WRENCH_DEADBAND_PARAMS]
+        values = self._get_gravcomp_double_arrays(names)
+        items: List[Dict[str, Any]] = []
+        any_missing = False
+        for name, label, unit in _WRENCH_DEADBAND_PARAMS:
+            v = values.get(name)
+            if v is None:
+                any_missing = True
+            items.append({
+                "name":  name,
+                "label": label,
+                "unit":  unit,
+                "value": v,
+            })
+        return {
+            "ok":                True,
+            "node":              self._gravcomp_ns,
+            "available":         not any_missing,
+            "deadbands":         items,
+            "message": (
+                "per-axis soft deadband applied to the compensated "
+                "wrench just before publishing; live-tunable on "
+                f"{self._gravcomp_ns}"
+            ),
+        }
+
+    def api_set_wrench_deadband(self, body: Dict[str, Any]
+                                ) -> Dict[str, Any]:
+        """Push edits to the gravity-comp node's dead-zone parameters.
+
+        Body shape::
+
+            {"deadbands": [{"name": str, "value": [x, y, z]}, ...]}
+
+        Unknown names are rejected (the dashboard restricts the editor
+        to ``_WRENCH_DEADBAND_PARAMS``); non-finite, non-3-vector, and
+        negative values are rejected here before the round-trip.  The
+        gravity-compensation node does its own validation too, which
+        we surface verbatim.
+        """
+        if not isinstance(body, dict):
+            raise RuntimeError("body must be a JSON object")
+        items = body.get("deadbands")
+        if not isinstance(items, list):
+            raise RuntimeError("body.deadbands must be a list")
+
+        updates: Dict[str, List[float]] = {}
+        for idx, entry in enumerate(items):
+            if not isinstance(entry, dict):
+                raise RuntimeError(
+                    f"deadbands[{idx}] must be an object")
+            name = entry.get("name")
+            if not isinstance(name, str) or not name:
+                raise RuntimeError(
+                    f"deadbands[{idx}].name must be a non-empty string")
+            if name not in _WRENCH_DEADBAND_NAMES:
+                raise RuntimeError(
+                    f"deadbands[{idx}].name={name!r} is not editable "
+                    f"({sorted(_WRENCH_DEADBAND_NAMES)})")
+            raw = entry.get("value")
+            if not isinstance(raw, list) or len(raw) != 3:
+                raise RuntimeError(
+                    f"deadbands[{idx}].value must be a 3-element list "
+                    f"(got {raw!r})")
+            vec: List[float] = []
+            for j, v in enumerate(raw):
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"deadbands[{idx}].value[{j}] not numeric: {exc}"
+                    ) from exc
+                if not math.isfinite(fv):
+                    raise RuntimeError(
+                        f"deadbands[{idx}].value[{j}] must be finite "
+                        f"(got {v!r})")
+                if fv < 0.0:
+                    raise RuntimeError(
+                        f"deadbands[{idx}].value[{j}] must be >= 0 "
+                        f"(got {fv})")
+                vec.append(fv)
+            updates[name] = vec
+
+        if not updates:
+            return {"ok": True, "updated": 0, "results": [],
+                    "message": "no deadbands supplied"}
+
+        ok, results = self._set_gravcomp_double_arrays(updates)
+        successful = sum(1 for r in results if r["successful"])
+        return {
+            "ok":      ok,
+            "updated": successful,
+            "results": results,
+            "message": (
+                f"applied {successful}/{len(results)} deadband(s) "
+                f"to {self._gravcomp_ns}" if ok else
+                f"gravity-compensation rejected "
+                f"{len(results) - successful}/{len(results)} deadband(s)"
+            ),
+        }
+
+    # ------------------------------------------------------------------
     # jog / snap-target -- per-controller motion-style command surface
     # ------------------------------------------------------------------
     # Both ``cartesian_motion_controller`` and
@@ -1272,22 +1881,77 @@ class DashboardNode(Node):
     # ``new_target = current_ee_pose + delta`` (in the base frame) and
     # publishes it.  The force controller has no such input, so its
     # control panel is purely informational.
-    def _lookup_current_pose(self) -> PoseStamped:
+    #
+    # IMPORTANT: the FZI controllers interpret ``target_frame`` as the
+    # target pose for *their own* ``end_effector_link`` parameter, NOT
+    # the dashboard's ``tool_frame``.  If we look up TF for ``link_6``
+    # but publish that as the target for a controller whose end-effector
+    # is ``compliance_link`` (offset ~33 cm along link_6's local Z),
+    # the controller treats the published pose as 33 cm displaced from
+    # where compliance_link currently sits -- the robot tries to close
+    # that gap regardless of which jog button was pressed, producing
+    # the classic "robot moves up whatever button I click" symptom.
+    # We resolve the controller's actual ``end_effector_link`` (and
+    # ``robot_base_link``) at jog time and use those frames for the
+    # current-pose lookup so the delta is applied to the right tip.
+    def _resolve_active_frames(self, controller: str
+                               ) -> Tuple[str, str]:
+        """Return ``(base_frame, tool_frame)`` to use for a jog on
+        ``controller``.  Reads the controller's own
+        ``robot_base_link`` / ``end_effector_link`` parameters
+        (FZI's documented contract) and falls back to the dashboard's
+        ``base_frame`` / ``tool_frame`` parameters when the controller
+        node isn't running or returns empty strings.  Results are
+        cached per-controller because the FZI controllers don't
+        re-read these at runtime; the cache is cleared whenever the
+        active controller changes.
+        """
+        cached = self._jog_frames_cache.get(controller)
+        if cached is not None:
+            return cached
+        base = self._base_frame
+        tool = self._tool_frame
+        try:
+            vals = self._get_param_values(
+                controller, ["robot_base_link", "end_effector_link"])
+            rb = vals.get("robot_base_link")
+            ee = vals.get("end_effector_link")
+            if isinstance(rb, str) and rb.strip():
+                base = rb.strip().strip("/")
+            if isinstance(ee, str) and ee.strip():
+                tool = ee.strip().strip("/")
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(
+                f"could not resolve jog frames for {controller!r}, "
+                f"using dashboard defaults "
+                f"({self._base_frame} -> {self._tool_frame}): {exc}")
+        self._jog_frames_cache[controller] = (base, tool)
+        return base, tool
+
+    def _lookup_current_pose(self, base_frame: Optional[str] = None,
+                             tool_frame: Optional[str] = None
+                             ) -> PoseStamped:
         """Look up ``base_frame -> tool_frame`` from /tf and return
         it as a :class:`PoseStamped`.  Raises RuntimeError on failure
-        so the HTTP layer can surface a clean 409.
+        so the HTTP layer can surface a clean 409.  When ``base_frame``
+        / ``tool_frame`` are ``None``, falls back to the dashboard's
+        configured defaults; jog-style callers pass the active
+        controller's resolved frames so the delta is applied to the
+        correct end-effector tip (see ``_resolve_active_frames``).
         """
+        bf = base_frame if base_frame else self._base_frame
+        tf = tool_frame if tool_frame else self._tool_frame
         try:
             t = self._tf_buffer.lookup_transform(
-                self._base_frame, self._tool_frame,
+                bf, tf,
                 rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.5))
         except TransformException as exc:
             raise RuntimeError(
-                f"tf lookup {self._base_frame!r} -> "
-                f"{self._tool_frame!r} failed: {exc}")
+                f"tf lookup {bf!r} -> "
+                f"{tf!r} failed: {exc}")
         ps = PoseStamped()
-        ps.header.frame_id = self._base_frame
+        ps.header.frame_id = bf
         ps.header.stamp = self.get_clock().now().to_msg()
         ps.pose.position.x = float(t.transform.translation.x)
         ps.pose.position.y = float(t.transform.translation.y)
@@ -1371,7 +2035,13 @@ class DashboardNode(Node):
         if max(abs(drx), abs(dry), abs(drz)) > math.radians(30.0):
             raise RuntimeError("rotation step too large (>30 deg)")
 
-        pose = self._lookup_current_pose()
+        # Use the active controller's OWN robot_base_link /
+        # end_effector_link, not the dashboard's fallback frames -- the
+        # controller treats target_frame as the goal pose for its own
+        # end-effector tip, and a frame mismatch produces a constant
+        # offset that the controller then tries to close on every press.
+        base_frame, tool_frame = self._resolve_active_frames(active)
+        pose = self._lookup_current_pose(base_frame, tool_frame)
         pose.pose.position.x += dx
         pose.pose.position.y += dy
         pose.pose.position.z += dz
@@ -1417,6 +2087,430 @@ class DashboardNode(Node):
         return self.api_jog({})  # zero delta == snap to current pose
 
     # ------------------------------------------------------------------
+    # tool-frame offsets (aux_frames in robot_config.yaml)
+    # ------------------------------------------------------------------
+    # The dashboard's "Tool frames" panel lets the operator tweak the
+    # xyz / rpy of each aux_frame (e.g. ft_sensor_link, compliance_link)
+    # without editing YAML by hand.  Changes are persisted to
+    # ``config/robot_config.yaml`` via the line-targeted
+    # ``common.config_manager.save_aux_frames`` helper which preserves
+    # comments and unrelated keys; they take effect on the next
+    # ``duco_robot_bringup`` launch.
+    #
+    # Adding, renaming, or removing aux_frames is intentionally NOT
+    # exposed -- those edits ripple into ``fzi_zero_gravity.yaml``
+    # (which names a specific end-effector link in the KDL chain), so
+    # operators do them by hand.
+    def api_get_aux_frames(self) -> Dict[str, Any]:
+        """Return the current aux_frames list as on disk."""
+        if _get_config is None or _read_aux_frames is None:
+            raise RuntimeError(
+                "common.config_manager not importable: "
+                f"{_COMMON_IMPORT_ERROR}")
+        cfg = _get_config()
+        config_path = cfg.config_path
+        if not config_path:
+            raise RuntimeError("config_manager has not resolved a path")
+        frames = _read_aux_frames(config_path)
+        return {
+            "ok":            True,
+            "config_path":   config_path,
+            "frames":        frames,
+            "editable_keys": ["xyz", "rpy"],
+            "message": ("changes apply live: "
+                        "/robot_state_publisher refreshes TF / RViz / "
+                        "the dashboard viewer immediately, and the FZI "
+                        "cartesian controllers (forked) rebuild their "
+                        "KDL chain at runtime via an on-set-parameters "
+                        "callback, so engaged controllers pick up the "
+                        "new tool TCP without unload/load"),
+        }
+
+    def api_set_aux_frames(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist xyz / rpy edits to robot_config.yaml.
+
+        Body shape:
+          ``{"frames": [{"name": str, "xyz": [3 floats], "rpy": [3 floats]}, ...]}``
+
+        Only entries whose ``name`` matches an existing aux_frame on
+        disk are updated; unknown names are ignored (and the response
+        reports the actual count).  Adding / renaming / removing is
+        not supported via this endpoint.
+        """
+        if _save_aux_frames is None or _get_config is None:
+            raise RuntimeError(
+                "common.config_manager not importable: "
+                f"{_COMMON_IMPORT_ERROR}")
+        if not isinstance(body, dict):
+            raise RuntimeError("body must be a JSON object")
+        frames_in = body.get("frames")
+        if not isinstance(frames_in, list):
+            raise RuntimeError("body.frames must be a list")
+
+        # Validate and normalise -> { name: { xyz: [...], rpy: [...] } }
+        updates: Dict[str, Dict[str, List[float]]] = {}
+        for idx, entry in enumerate(frames_in):
+            if not isinstance(entry, dict):
+                raise RuntimeError(
+                    f"frames[{idx}] must be an object")
+            name = entry.get("name")
+            if not isinstance(name, str) or not name:
+                raise RuntimeError(
+                    f"frames[{idx}].name must be a non-empty string")
+            triples: Dict[str, List[float]] = {}
+            for key in ("xyz", "rpy"):
+                if key not in entry:
+                    continue
+                vec = entry[key]
+                if (not isinstance(vec, (list, tuple))
+                        or len(vec) != 3):
+                    raise RuntimeError(
+                        f"frames[{idx}].{key} must be a length-3 list")
+                try:
+                    triples[key] = [float(v) for v in vec]
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"frames[{idx}].{key} not numeric: {exc}"
+                    ) from exc
+            if not triples:
+                continue  # nothing to update for this entry
+            updates[name] = triples
+
+        if not updates:
+            return {"ok": True, "updated": 0,
+                    "message": "no editable fields supplied"}
+
+        cfg = _get_config()
+        config_path = cfg.config_path
+        if not config_path:
+            raise RuntimeError("config_manager has not resolved a path")
+
+        try:
+            updated = _save_aux_frames(config_path, updates)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"failed to save aux_frames: {exc}") from exc
+
+        # ---- Live update: push the rebuilt URDF to rsp so /tf_static
+        # refreshes without restarting duco_robot_bringup.  Best-effort:
+        # any failure here is reported in the response but does not
+        # roll back the yaml save (the file edit is the source of truth
+        # for the next launch).
+        live = self._apply_aux_frames_live()
+
+        if live["ok"]:
+            message = ("saved; static TF updated live via "
+                       "robot_state_publisher")
+            if live.get("missing"):
+                message += (f" (URDF missing: "
+                            f"{', '.join(live['missing'])} -- restart "
+                            f"bringup to materialise them)")
+            warnings = live.get("controller_warnings") or []
+            if warnings:
+                message += (". FZI controllers: "
+                            + "; ".join(warnings))
+            else:
+                message += (". FZI cartesian controllers picked up "
+                            "the new chain at runtime (no reload "
+                            "needed).")
+        else:
+            message = (f"saved to yaml, but live URDF push failed: "
+                       f"{live['error']}. Restart duco_robot_bringup "
+                       f"to apply the change.")
+
+        return {
+            "ok":          True,
+            "config_path": config_path,
+            "updated":     updated,
+            "live":        live,
+            "message":     message,
+        }
+
+    # ------------------------------------------------------------------
+    # Live URDF push to robot_state_publisher
+    # ------------------------------------------------------------------
+    def _apply_aux_frames_live(self) -> Dict[str, Any]:
+        """Rebuild ``robot_description`` from the on-disk aux_frames and
+        push it to ``/robot_state_publisher`` via SetParameters.
+
+        Returns a dict ``{"ok": bool, "error": Optional[str], ...}``
+        suitable to embed in the api_set_aux_frames response.  All
+        failure modes (missing imports, no cached URDF, service
+        unavailable, rsp rejection) come back as ``ok=False`` with a
+        human-readable ``error`` so the operator can decide whether to
+        fall back to a launch restart.
+        """
+        if _update_aux_frames is None or _read_aux_frames is None:
+            return {
+                "ok":    False,
+                "error": ("duco_robot_bringup.urdf_loader not "
+                          f"importable: {_URDF_LOADER_IMPORT_ERROR}"),
+            }
+
+        # Snapshot the current URDF the rsp is publishing.  We rebuild
+        # from THIS string (rather than from xacro) because we do not
+        # know the original xacro args (robot_ip, robot_port,
+        # use_fake_hardware) at dashboard launch time and re-running
+        # xacro with the wrong args would silently drift.
+        with self._lock:
+            urdf_xml = self._urdf_xml
+        if not urdf_xml:
+            return {
+                "ok":    False,
+                "error": ("no cached /robot_description yet -- is "
+                          "robot_state_publisher running?"),
+            }
+
+        # Read the full aux_frames list back from disk (post-save) so
+        # every entry's xyz/rpy is up-to-date.
+        cfg = _get_config()
+        config_path = cfg.config_path if cfg else None
+        if not config_path:
+            return {"ok": False, "error": "config path not resolved"}
+        try:
+            frames = _read_aux_frames(config_path)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False,
+                    "error": f"could not re-read aux_frames: {exc}"}
+
+        try:
+            result = _update_aux_frames(urdf_xml, frames)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False,
+                    "error": f"URDF rewrite failed: {exc}"}
+
+        # Push the rewritten URDF to robot_state_publisher.
+        if not self._cli_rsp_set_params.wait_for_service(timeout_sec=0.5):
+            return {
+                "ok":      False,
+                "updated": result.updated,
+                "missing": result.missing,
+                "error":   ("/robot_state_publisher/set_parameters "
+                            "service unavailable -- is rsp running and "
+                            "reachable on this DDS domain?"),
+            }
+        param = Parameter()
+        param.name = "robot_description"
+        pv = ParameterValue()
+        pv.type = ParameterType.PARAMETER_STRING
+        pv.string_value = result.urdf_xml
+        param.value = pv
+        req = SetParameters.Request()
+        req.parameters = [param]
+        resp = self._service_call_sync(
+            self._cli_rsp_set_params, req, self._service_timeout)
+        if resp is None:
+            return {
+                "ok":      False,
+                "updated": result.updated,
+                "missing": result.missing,
+                "error":   ("no response from rsp set_parameters within "
+                            f"{self._service_timeout:.1f}s"),
+            }
+        if not resp.results or not resp.results[0].successful:
+            why = (resp.results[0].reason
+                   if resp.results else "unknown error")
+            return {
+                "ok":      False,
+                "updated": result.updated,
+                "missing": result.missing,
+                "error":   f"rsp rejected the new URDF: {why}",
+            }
+
+        # Also push to each FZI cartesian controller so the per-
+        # controller on-set-parameters callback can rebuild the KDL
+        # chain at runtime (see cartesian_controller_base.cpp::
+        # onParameterUpdate in the forked submodule).  Each controller
+        # owns its own node and its own ``robot_description`` parameter;
+        # pushing to /controller_manager only updates the manager's
+        # copy, which the running controllers do not observe.  Treated
+        # as best-effort per controller: if a controller isn't loaded
+        # the Save still succeeds (rsp got the new URDF) and we report
+        # a per-controller warning so the operator can decide whether
+        # to reload manually.
+        cm_warnings: List[str] = []
+        for ctrl in self._available_controllers:
+            cli = self._param_clients.get(ctrl, {}).get("set")
+            if cli is None:
+                cm_warnings.append(
+                    f"{ctrl}: no set_parameters client (not in "
+                    "available_controllers?)")
+                continue
+            if not cli.wait_for_service(timeout_sec=0.3):
+                cm_warnings.append(
+                    f"{ctrl}: /{ctrl}/set_parameters unavailable -- "
+                    "controller may not be loaded; reload it manually "
+                    "to pick up the new chain")
+                continue
+            ctrl_resp = self._service_call_sync(
+                cli, req, self._service_timeout)
+            if ctrl_resp is None:
+                cm_warnings.append(
+                    f"{ctrl}: no response from set_parameters within "
+                    f"{self._service_timeout:.1f}s -- old chain may "
+                    "persist; reload if needed")
+            elif (not ctrl_resp.results
+                  or not ctrl_resp.results[0].successful):
+                why = (ctrl_resp.results[0].reason
+                       if ctrl_resp.results else "unknown error")
+                cm_warnings.append(
+                    f"{ctrl}: rejected the URDF push: {why} -- "
+                    "controller will keep its old chain")
+
+        out: Dict[str, Any] = {
+            "ok":      True,
+            "updated": result.updated,
+            "missing": result.missing,
+        }
+        if cm_warnings:
+            out["controller_warnings"] = cm_warnings
+        return out
+
+    # ------------------------------------------------------------------
+    # 3D-model viewer support
+    # ------------------------------------------------------------------
+    # The dashboard's "3D model" panel renders a kinematic skeleton in
+    # the browser.  It needs two things from the node:
+    #
+    # * ``/api/urdf_model`` -- the parsed URDF tree (links + joints
+    #   with their static origins).  Fetched once on page load and
+    #   whenever the user hits "Refresh".
+    #
+    # * ``/api/urdf_tf`` -- live world-frame poses of each link
+    #   relative to ``root_link``.  Polled at a few Hz so the skeleton
+    #   tracks live joint motion.  Returns ``null`` for any link whose
+    #   transform isn't in /tf yet; the renderer falls back to the
+    #   URDF static pose for those.
+    def api_urdf_model(self) -> Dict[str, Any]:
+        with self._lock:
+            model = self._urdf_model
+            age = (time.monotonic() - self._urdf_mono
+                   if self._urdf_mono is not None else None)
+            xml_len = len(self._urdf_xml) if self._urdf_xml else 0
+        if model is None:
+            return {
+                "ok":      False,
+                "message": ("waiting for /robot_description -- is "
+                            "robot_state_publisher running?"),
+                "age":     age,
+            }
+        return {
+            "ok":        True,
+            "age":       age,
+            "xml_bytes": xml_len,
+            "root_link": model["root_link"],
+            "links":     list(model["links"]),
+            "joints":    [dict(j) for j in model["joints"]],
+        }
+
+    def api_urdf_tf(self) -> Dict[str, Any]:
+        """Look up every URDF link's transform relative to ``root_link``.
+
+        Uses the existing tf2 buffer.  Links whose lookup fails are
+        emitted as ``null`` so the browser can decide what to do (the
+        renderer falls back to URDF static origins for missing
+        transforms).
+        """
+        with self._lock:
+            model = self._urdf_model
+            # Snapshot the joint positions while we hold the lock so
+            # the dict isn't mutated mid-iteration by ``_on_joint_states``.
+            joint_positions = dict(self._joint_positions)
+        if model is None:
+            return {
+                "ok":      False,
+                "message": "no URDF cached yet",
+            }
+        root = model["root_link"]
+        out: Dict[str, Any] = {}
+        zero_time = rclpy.time.Time()
+        timeout = rclpy.duration.Duration(seconds=0.05)
+        for link in model["links"]:
+            if link == root:
+                out[link] = {"t": [0.0, 0.0, 0.0], "q": [0.0, 0.0, 0.0, 1.0]}
+                continue
+            try:
+                tf = self._tf_buffer.lookup_transform(
+                    root, link, zero_time, timeout=timeout)
+            except TransformException:
+                out[link] = None
+                continue
+            t = tf.transform.translation
+            q = tf.transform.rotation
+            out[link] = {
+                "t": [float(t.x), float(t.y), float(t.z)],
+                "q": [float(q.x), float(q.y), float(q.z), float(q.w)],
+            }
+        return {
+            "ok":              True,
+            "root_link":       root,
+            "transforms":      out,
+            "joint_positions": joint_positions,
+        }
+
+    # ------------------------------------------------------------------
+    def _try_lookup_tcp_pose(self) -> Optional[Dict[str, Any]]:
+        """Best-effort TF lookup of ``base_frame -> tool_frame`` for the
+        sticky-bar TCP-pose readout.  Returns ``None`` on any failure
+        (frame missing, no TF yet) instead of raising -- this is a
+        polled read, not a user action.
+
+        The returned dict contains the cartesian xyz, the quaternion,
+        roll/pitch/yaw expressed in degrees (ZYX-extrinsic convention,
+        same as ``tf2`` ``getRPY``), and an estimated age of the TF
+        sample (seconds since the TF stamp; may be ``None`` if the
+        stamp is zero / unavailable).
+        """
+        try:
+            t = self._tf_buffer.lookup_transform(
+                self._base_frame, self._tool_frame,
+                rclpy.time.Time(),  # latest available
+                timeout=rclpy.duration.Duration(seconds=0.0))
+        except TransformException:
+            return None
+        tr = t.transform.translation
+        q = t.transform.rotation
+        # RPY from quaternion (roll about X, pitch about Y, yaw about Z,
+        # extrinsic).  Pitch is clamped at +/- pi/2 in the singular case.
+        sinr_cosp = 2.0 * (q.w * q.x + q.y * q.z)
+        cosr_cosp = 1.0 - 2.0 * (q.x * q.x + q.y * q.y)
+        roll = math.atan2(sinr_cosp, cosr_cosp)
+        sinp = 2.0 * (q.w * q.y - q.z * q.x)
+        if abs(sinp) >= 1.0:
+            pitch = math.copysign(math.pi / 2.0, sinp)
+        else:
+            pitch = math.asin(sinp)
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+        # Age of the TF sample: now - stamp.  Stamp of zero means
+        # "static" (or no stamp); report ``None`` then.
+        age: Optional[float] = None
+        try:
+            stamp_sec = (int(t.header.stamp.sec)
+                         + int(t.header.stamp.nanosec) * 1e-9)
+            if stamp_sec > 0.0:
+                now_sec = self.get_clock().now().nanoseconds * 1e-9
+                age = max(0.0, now_sec - stamp_sec)
+        except Exception:  # noqa: BLE001
+            age = None
+        return {
+            "frame_id":       t.header.frame_id,
+            "child_frame_id": t.child_frame_id,
+            "x":              float(tr.x),
+            "y":              float(tr.y),
+            "z":              float(tr.z),
+            "qx":             float(q.x),
+            "qy":             float(q.y),
+            "qz":             float(q.z),
+            "qw":             float(q.w),
+            "roll_deg":       math.degrees(roll),
+            "pitch_deg":      math.degrees(pitch),
+            "yaw_deg":        math.degrees(yaw),
+            "age":            age,
+        }
+
+    # ------------------------------------------------------------------
     def _snapshot_live_locked(self) -> Dict[str, Any]:
         with self._lock:
             now = time.monotonic()
@@ -1440,19 +2534,159 @@ class DashboardNode(Node):
                      and wrench.get("age", 99.0) <= 1.0)
             joint_states_ok = (js_age is not None and js_age <= 1.0)
 
+        # TF lookup is independent of the local cache lock -- tf2's
+        # Buffer is thread-safe and this is a cheap latest-time read.
+        tcp = self._try_lookup_tcp_pose()
+        if tcp is not None:
+            tcp["hz"] = self._tf_rate.hz()
+        if wrench is not None:
+            wrench["hz"] = self._wrench_rate.hz()
+
         return {
             "control":            ctl,
             "control_state_age":  ctl_age,
+            "control_state_hz":   self._state_rate.hz(),
             "wrench":             wrench,
             "joint_states_age":   js_age,
+            "joint_states_hz":    self._js_rate.hz(),
             "ft_ok":              ft_ok,
             "joint_states_ok":    joint_states_ok,
+            "tcp":                tcp,
+            "base_frame":         self._base_frame,
+            "tool_frame":         self._tool_frame,
         }
 
 
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+def _parse_urdf(xml_text: str) -> Optional[Dict[str, Any]]:
+    """Parse a URDF XML string into a minimal skeleton description.
+
+    Returns a dict::
+
+        {
+          "root_link": "base_link",
+          "links": ["base_link", "link_1", ...],
+          "joints": [
+            {"name": "joint_1", "type": "revolute",
+             "parent": "base_link", "child": "link_1",
+             "origin_xyz": [0, 0, 0.1], "origin_rpy": [0, 0, 0],
+             "axis_xyz": [0, 0, 1]},
+            ...
+          ],
+        }
+
+    Returns ``None`` if the XML is empty or unparseable.  Mesh
+    information is intentionally discarded -- the dashboard renders
+    only the kinematic skeleton.
+    """
+    if not xml_text or not xml_text.strip():
+        return None
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return None
+    if root.tag != "robot":
+        # Some URDFs are wrapped; try to find a <robot> element.
+        robot = root.find(".//robot")
+        if robot is None:
+            return None
+        root = robot
+
+    links: List[str] = []
+    parents: Dict[str, str] = {}  # child_link -> parent_link
+    joints: List[Dict[str, Any]] = []
+
+    for link in root.findall("link"):
+        name = link.get("name")
+        if name:
+            links.append(name)
+
+    def _floats(s: Optional[str], default: List[float]) -> List[float]:
+        if not s:
+            return list(default)
+        try:
+            parts = [float(x) for x in s.split()]
+        except ValueError:
+            return list(default)
+        if len(parts) != len(default):
+            return list(default)
+        return parts
+
+    for joint in root.findall("joint"):
+        jname = joint.get("name") or ""
+        jtype = joint.get("type") or "fixed"
+        p_el = joint.find("parent")
+        c_el = joint.find("child")
+        if p_el is None or c_el is None:
+            continue
+        parent = p_el.get("link") or ""
+        child = c_el.get("link") or ""
+        if not parent or not child:
+            continue
+        origin = joint.find("origin")
+        origin_xyz = _floats(origin.get("xyz") if origin is not None else None,
+                             [0.0, 0.0, 0.0])
+        origin_rpy = _floats(origin.get("rpy") if origin is not None else None,
+                             [0.0, 0.0, 0.0])
+        axis = joint.find("axis")
+        axis_xyz = _floats(axis.get("xyz") if axis is not None else None,
+                           [1.0, 0.0, 0.0])
+        # <limit> is required by URDF spec for revolute / prismatic
+        # joints (optional for continuous / fixed / floating /
+        # planar).  We expose ``lower``/``upper`` so the dashboard
+        # can scale the per-joint position bars; ``effort``/``velocity``
+        # are forwarded for completeness even though the floating
+        # panel doesn't visualise them today.
+        lim_el = joint.find("limit")
+        lower: Optional[float] = None
+        upper: Optional[float] = None
+        effort: Optional[float] = None
+        velocity: Optional[float] = None
+        if lim_el is not None:
+            def _opt_float(s: Optional[str]) -> Optional[float]:
+                if s is None:
+                    return None
+                try:
+                    return float(s)
+                except ValueError:
+                    return None
+            lower = _opt_float(lim_el.get("lower"))
+            upper = _opt_float(lim_el.get("upper"))
+            effort = _opt_float(lim_el.get("effort"))
+            velocity = _opt_float(lim_el.get("velocity"))
+        joints.append({
+            "name":       jname,
+            "type":       jtype,
+            "parent":     parent,
+            "child":      child,
+            "origin_xyz": origin_xyz,
+            "origin_rpy": origin_rpy,
+            "axis_xyz":   axis_xyz,
+            "lower":      lower,
+            "upper":      upper,
+            "effort":     effort,
+            "velocity":   velocity,
+        })
+        parents[child] = parent
+
+    # Root link is the only one that never appears as a child.
+    root_link = ""
+    for ln in links:
+        if ln not in parents:
+            root_link = ln
+            break
+    if not root_link and links:
+        root_link = links[0]
+
+    return {
+        "root_link": root_link,
+        "links":     links,
+        "joints":    joints,
+    }
+
+
 def _decode_param_value(pv: ParameterValue) -> Optional[Any]:
     """Best-effort scalar decode of a :class:`ParameterValue`.
 
@@ -1470,7 +2704,11 @@ def _decode_param_value(pv: ParameterValue) -> Optional[Any]:
         return float(pv.double_value)
     if t == ParameterType.PARAMETER_STRING:
         return str(pv.string_value)
-    return None  # arrays not supported by the dashboard
+    if t == ParameterType.PARAMETER_DOUBLE_ARRAY:
+        # rclpy hands us an ``array.array('d', ...)``; coerce to a plain
+        # Python list so the value is JSON-serialisable for the HTTP layer.
+        return [float(v) for v in pv.double_array_value]
+    return None  # other array types not used by the dashboard
 
 
 def _local_ip_hint() -> str:

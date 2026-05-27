@@ -1,0 +1,504 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Cartesian controller dashboard</title>
+<link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+  <!-- ============================================================
+       Sticky top bar: condensed always-visible read-out of the
+       robot's state.  Layout is two rows that stay glued to the
+       top of the viewport while the rest of the dashboard scrolls
+       beneath it.
+
+       Row 1 (compact status + freshness pills): all rate
+       indicators live here so the operator has one place to glance
+       at "is everything flowing?".  Each rate pill shows publish
+       frequency in Hz (computed from inter-arrival intervals on
+       the backend); "no data" / "no tf" appears when a stream
+       stops.
+         engaged | trip | orch | ft | q | tf | conn
+       Row 2 (BIG, single line): TCP pose + wrench, vector format
+         XYZ (x, y, z) m  RPY (r, p, y) deg | F (fx, fy, fz) N
+         T (tx, ty, tz) Nm.  The base/tool frame names appear as a
+         tooltip when hovering the row (set by dashboard.js via
+         title=) so they don't compete for visual real estate.
+
+       Row 2 uses deliberately oversized typography so the
+       readout is legible from across the workshop.
+       ============================================================ -->
+  <header class="sticky-bar" id="sticky-bar">
+    <div class="sb-row sb-row-status">
+      <span id="engaged" class="status">--</span>
+      <span class="sb-sep"></span>
+      <span class="sb-label">trip</span>
+      <span id="trip" class="status">--</span>
+      <span class="sb-sep"></span>
+      <span class="sb-label">orch</span>
+      <span id="orch-status" class="status">--</span>
+      <span class="sb-label">ft</span>
+      <span id="ft-status" class="status">--</span>
+      <span class="sb-label">q</span>
+      <span id="q-status" class="status">--</span>
+      <span class="sb-label">tf</span>
+      <span id="tcp-status" class="status">--</span>
+      <span class="sb-spacer"></span>
+      <span id="conn" class="status">connecting...</span>
+    </div>
+    <div class="sb-row sb-row-data sb-tcp-wrench" id="sb-data-row">
+      <span class="sb-vec">
+        <span class="sb-vec-label">XYZ</span>
+        <span class="sb-vec-paren">(<span id="tcp-x" class="num">--</span>, <span id="tcp-y" class="num">--</span>, <span id="tcp-z" class="num">--</span>)</span>
+        <span class="sb-vec-unit">m</span>
+      </span>
+      <span class="sb-vec">
+        <span class="sb-vec-label">RPY</span>
+        <span class="sb-vec-paren">(<span id="tcp-r" class="num">--</span>, <span id="tcp-p" class="num">--</span>, <span id="tcp-yaw" class="num">--</span>)</span>
+        <span class="sb-vec-unit">deg</span>
+      </span>
+      <span class="sb-sep"></span>
+      <span class="sb-vec">
+        <span class="sb-vec-label">F</span>
+        <span class="sb-vec-paren">(<span id="wfx" class="num">--</span>, <span id="wfy" class="num">--</span>, <span id="wfz" class="num">--</span>)</span>
+        <span class="sb-vec-unit">N</span>
+      </span>
+      <span class="sb-vec">
+        <span class="sb-vec-label">T</span>
+        <span class="sb-vec-paren">(<span id="wmx" class="num">--</span>, <span id="wmy" class="num">--</span>, <span id="wmz" class="num">--</span>)</span>
+        <span class="sb-vec-unit">Nm</span>
+      </span>
+    </div>
+  </header>
+
+  <!-- =============================================================
+       Body: two independently scrolling columns.
+
+       Left column:
+         - 3D model panel (top, anchored to the column's scroll
+           viewport)
+         - Tool frames (TCP offsets)
+         - Wrench deadband (gravity-comp noise floor)
+         - Safety thresholds (orchestrator limits)
+
+       Right column:
+         - Wrench plot panel (top, anchored)
+         - Engage bar (controller select + Engage / Disengage)
+         - Controller commands (jog grids)
+         - Controller parameters (live tuning)
+
+       Each .body-col is its own overflow:auto container, so the
+       3D view and the FT plot stay anchored at the top of each
+       column while the configuration panels below scroll
+       independently of the other side.
+       ============================================================= -->
+  <div class="body-split">
+    <div class="body-col">
+      <div class="panel" id="urdf-panel">
+        <!-- Canvas fills the panel; the title / info / controls sit on
+             top in a semi-transparent floating overlay (top-right) so
+             the 3D view gets the maximum possible display area.
+             Error messages from /api/urdf_model surface in a separate
+             top-left overlay (#urdf-overlay) that the JS layer toggles. -->
+        <canvas id="urdf-canvas"></canvas>
+        <div id="urdf-overlay"></div>
+        <div class="urdf-floating" id="urdf-floating">
+          <div class="urdf-floating-header">
+            <span class="urdf-floating-title">3D model</span>
+            <span class="pill" id="urdf-status">--</span>
+            <button id="urdf-collapse" type="button"
+                    class="urdf-floating-toggle"
+                    aria-expanded="true"
+                    aria-controls="urdf-floating-body"
+                    title="Collapse panel">&minus;</button>
+          </div>
+          <div class="urdf-floating-body" id="urdf-floating-body">
+            <div class="urdf-floating-rows">
+              <span>root</span><code id="urdf-root">--</code>
+              <span>links</span><span class="num" id="urdf-nlinks">--</span>
+              <span>joints</span><span class="num" id="urdf-njoints">--</span>
+              <span>tf age</span><span class="num" id="urdf-tfage">--</span>
+            </div>
+            <div class="urdf-floating-section-title">Joints</div>
+            <div class="urdf-joints" id="urdf-joints"></div>
+            <div class="urdf-floating-controls">
+              <label><input id="urdf-labels" type="checkbox" checked>labels</label>
+              <label><input id="urdf-axes" type="checkbox" checked>axes</label>
+            </div>
+            <div class="urdf-floating-buttons">
+              <button id="urdf-fit" type="button" class="ghost">Fit view</button>
+              <button id="urdf-reload" type="button" class="ghost">Reload</button>
+            </div>
+            <div class="urdf-floating-hint">
+              drag = orbit &middot; wheel = zoom &middot; right-drag = pan
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel" id="aux-frames-panel">
+        <h2>
+          Tool frames <span class="pill" id="aux-status">--</span>
+          <span class="small" style="margin-left:8px;">
+            offsets persisted to <code id="aux-config-path">config/robot_config.yaml</code>;
+            applied live to <code>/tf_static</code> (TF / RViz / 3D viewer
+            update immediately; FZI cartesian controllers need a reload to
+            pick up the new TCP)
+          </span>
+        </h2>
+        <div class="small" id="aux-msg" style="margin-bottom:6px;">
+          loading&hellip;
+        </div>
+        <div class="table-scroll">
+          <table id="aux-table">
+            <thead>
+              <tr>
+                <th>name</th><th>parent</th>
+                <th>x [m]</th><th>y [m]</th><th>z [m]</th>
+                <th>roll [rad]</th><th>pitch [rad]</th><th>yaw [rad]</th>
+              </tr>
+            </thead>
+            <tbody id="aux-body"></tbody>
+          </table>
+        </div>
+        <div style="margin-top:8px; display:flex; gap:8px; align-items:center;">
+          <button id="btn-aux-save" class="big">Save offsets</button>
+          <button id="btn-aux-reload" class="ghost">Reload from file</button>
+          <span class="small" id="aux-dirty-pill"></span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>
+          Wrench deadband (gravity compensation)
+          <span class="pill" id="deadband-status">--</span>
+        </h2>
+        <table id="deadband-table">
+          <thead>
+            <tr><th>axis</th><th>x</th><th>y</th><th>z</th><th>unit</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>force</td>
+              <td><input type="number" min="0" step="0.1" class="deadband-num"
+                         data-name="force_deadband" data-axis="0"></td>
+              <td><input type="number" min="0" step="0.1" class="deadband-num"
+                         data-name="force_deadband" data-axis="1"></td>
+              <td><input type="number" min="0" step="0.1" class="deadband-num"
+                         data-name="force_deadband" data-axis="2"></td>
+              <td>N</td>
+            </tr>
+            <tr>
+              <td>torque</td>
+              <td><input type="number" min="0" step="0.01" class="deadband-num"
+                         data-name="torque_deadband" data-axis="0"></td>
+              <td><input type="number" min="0" step="0.01" class="deadband-num"
+                         data-name="torque_deadband" data-axis="1"></td>
+              <td><input type="number" min="0" step="0.01" class="deadband-num"
+                         data-name="torque_deadband" data-axis="2"></td>
+              <td>Nm</td>
+            </tr>
+          </tbody>
+        </table>
+        <div style="margin-top:8px; display:flex; gap:8px; align-items:center;">
+          <button id="btn-deadband-save" class="big">Apply deadband</button>
+          <button id="btn-deadband-reset" class="ghost">Reset edits</button>
+          <button id="btn-deadband-reload" class="ghost">Reload</button>
+          <span class="small" id="deadband-dirty-pill"></span>
+        </div>
+        <div class="small" style="margin-top:6px;">
+          Per-axis soft (continuous) dead-zone applied to the
+          compensated wrench just before publishing on
+          <code>/duco_ft_sensor/wrench_compensated</code>.  Models the
+          residual noise floor left after bias calibration; the
+          downstream force / compliance controller (and the
+          <em>|F|&nbsp;/&nbsp;|T|</em> readout above) only "see" forces
+          larger than the threshold.  Defaults are <code>0&nbsp;0&nbsp;0</code>
+          (pass-through).  Values must be &ge; 0.
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>
+          Safety thresholds (orchestrator)
+          <span class="pill" id="safety-status">--</span>
+        </h2>
+        <table id="safety-table">
+          <thead>
+            <tr><th>name</th><th>current</th><th>new</th><th>unit</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>max |F|</td>
+              <td class="num" id="lim-f">--</td>
+              <td><input type="number" min="0" step="0.5" class="safety-num"
+                         data-name="max_wrench_force"></td>
+              <td>N</td>
+            </tr>
+            <tr>
+              <td>max |T|</td>
+              <td class="num" id="lim-t">--</td>
+              <td><input type="number" min="0" step="0.1" class="safety-num"
+                         data-name="max_wrench_torque"></td>
+              <td>Nm</td>
+            </tr>
+            <tr>
+              <td>engage max |qdot|</td>
+              <td class="num" id="lim-qe">--</td>
+              <td><input type="number" min="0" step="0.005" class="safety-num"
+                         data-name="engage_max_joint_velocity"></td>
+              <td>rad/s</td>
+            </tr>
+            <tr>
+              <td>FT stale after</td>
+              <td class="num" id="lim-ftstale">--</td>
+              <td><input type="number" min="0" step="0.05" class="safety-num"
+                         data-name="ft_stale_after"></td>
+              <td>s</td>
+            </tr>
+            <tr>
+              <td>joint_states stale after</td>
+              <td class="num" id="lim-qstale">--</td>
+              <td><input type="number" min="0" step="0.05" class="safety-num"
+                         data-name="joint_states_stale_after"></td>
+              <td>s</td>
+            </tr>
+          </tbody>
+        </table>
+        <div style="margin-top:8px; display:flex; gap:8px; align-items:center;">
+          <button id="btn-safety-save" class="big">Apply thresholds</button>
+          <button id="btn-safety-reset" class="ghost">Reset edits</button>
+          <span class="small" id="safety-dirty-pill"></span>
+        </div>
+        <div class="small" style="margin-top:6px;">
+          Pushed live to <code>/duco_cartesian_control</code>.  Crossing
+          a wrench / staleness limit while engaged trips the safety
+          supervisor and disengages the FZI controller.  Values must
+          be &ge; 0.
+        </div>
+      </div>
+    </div>
+
+    <div class="body-col">
+      <div class="panel" id="ft-plot-panel">
+        <h2>
+          Wrench plot <span class="pill" id="ft-plot-status">--</span>
+          <span class="small" style="margin-left:8px;">
+            live <code id="ft-plot-topic">/duco_ft_sensor/wrench_compensated</code>
+          </span>
+        </h2>
+        <div class="ft-plot-controls">
+          <label class="small">window
+            <input id="ft-plot-window" type="number" min="1" max="60"
+                   step="1" value="10"> s</label>
+          <button id="ft-plot-freeze" type="button" class="ghost">Freeze</button>
+          <span class="ft-plot-legend small">
+            <span><i class="swatch" style="background:#ef4444"></i>x <b id="ft-vfx">--</b></span>
+            <span><i class="swatch" style="background:#22c55e"></i>y <b id="ft-vfy">--</b></span>
+            <span><i class="swatch" style="background:#3b82f6"></i>z <b id="ft-vfz">--</b></span>
+          </span>
+        </div>
+        <div class="ft-plot-row">
+          <div class="ft-plot-label small">Force [N]</div>
+          <canvas id="ft-plot-force"></canvas>
+        </div>
+        <div class="ft-plot-controls" style="margin-top:6px;">
+          <span class="ft-plot-legend small">
+            <span><i class="swatch" style="background:#ef4444"></i>x <b id="ft-vmx">--</b></span>
+            <span><i class="swatch" style="background:#22c55e"></i>y <b id="ft-vmy">--</b></span>
+            <span><i class="swatch" style="background:#3b82f6"></i>z <b id="ft-vmz">--</b></span>
+          </span>
+        </div>
+        <div class="ft-plot-row">
+          <div class="ft-plot-label small">Torque [Nm]</div>
+          <canvas id="ft-plot-torque"></canvas>
+        </div>
+      </div>
+
+      <div class="panel" id="ctrl-panel">
+        <!-- ============================================================
+             Merged controller panel: engage bar + commands + parameters.
+
+             Layout sections (top to bottom):
+               1. Engage bar -- controller dropdown, kind pill,
+                  Engage / Disengage buttons, intro help text.
+               2. Commands sub-section -- header + kind-aware body:
+                  * force      -> 6 target_wrench sliders (Fx/y/z, Tx/y/z),
+                                  each row = slider + numeric input + 0
+                                  button, with a "Zero all" button.
+                  * motion/compl -> existing jog grids + snap button.
+               3. Parameters sub-section -- live param table editor.
+             ============================================================ -->
+        <div class="ctrl-section ctrl-section-engage">
+          <div class="engage-bar">
+            <span class="small">controller:</span>
+            <select id="sel-controller" title="select which FZI controller engage will activate"></select>
+            <span class="pill" id="kind-pill">kind: --</span>
+            <button id="btn-engage"    type="button" class="big success">Engage</button>
+            <button id="btn-disengage" type="button" class="big danger">Disengage</button>
+          </div>
+          <div class="small" style="margin-top:6px;">
+            Use the dropdown to select a controller; click Engage to activate
+            it (only allowed while idle).  <b>Force</b> = free-drive with
+            optional commanded target_wrench (sliders below);
+            <b>Motion</b> = pose-hold (snapshots current pose, rigid drive
+            to target); <b>Compliance</b> = pose-hold spring (snapshots
+            current pose at engage and yields to wrench &mdash; push the
+            end-effector and it bounces back like a spring).
+          </div>
+        </div>
+
+        <div class="ctrl-section ctrl-section-commands" id="control-panel">
+          <h3 class="ctrl-section-title">
+            Commands <span class="pill" id="cmd-kind-pill">kind: --</span>
+          </h3>
+
+          <div id="cmd-force" class="cmd-section" hidden>
+            <div class="small">
+              The <b>force controller</b> consumes <code>target_wrench</code>
+              and minimises <code>(target - measured)</code>.  Set all six
+              sliders to <b>0</b> for pure free-drive (hand-guidance), or
+              dial in a constant additive wrench on any axis.  Values are
+              clamped by the orchestrator to
+              <code>|F|&nbsp;&le;&nbsp;max_wrench_force</code> and
+              <code>|T|&nbsp;&le;&nbsp;max_wrench_torque</code> from the
+              Safety thresholds panel.
+              <span class="pill" id="tw-status">--</span>
+            </div>
+            <!-- Master toggle for the orchestrator's target_wrench output.
+                 When OFF the orchestrator suppresses both the heartbeat
+                 and the external-topic forwarding so an outside publisher
+                 can drive every FZI controller's ``target_wrench`` topic
+                 directly (without contention from the orchestrator).
+                 Wired in dashboard.js :: setTargetWrenchPublish(). -->
+            <div class="tw-publish-bar">
+              <span class="small">target_wrench publishing:</span>
+              <button id="btn-tw-publish-toggle" type="button"
+                      class="big" data-enabled="?">--</button>
+              <span class="small" id="tw-publish-hint">
+                ON = orchestrator drives every FZI target_wrench topic;
+                OFF = orchestrator stays silent so an external publisher
+                can drive them directly.
+              </span>
+            </div>
+            <div class="wrench-sliders" id="wrench-sliders">
+              <!-- 6 rows (Fx, Fy, Fz, Tx, Ty, Tz) injected by JS so the
+                   per-axis min/max can track the orchestrator's safety
+                   limits.  Each row layout:
+                     <label> <slider> <number> <unit> <zero-btn>
+                   See dashboard.js :: renderWrenchSliders(). -->
+            </div>
+            <div style="margin-top:8px; display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+              <button id="btn-tw-zero-all" type="button" class="ghost">Zero all</button>
+              <!-- Spring-back mode: when checked, releasing a slider
+                   snaps it back to 0 and re-publishes, so the operator
+                   can "press-and-hold" a force impulse on any axis
+                   without having to manually zero it.  Mirrors a
+                   dead-man-switch joystick.  Persisted to localStorage
+                   (key: ``tw.springToZero``) so the preference survives
+                   page reloads. -->
+              <label class="small" title="release a slider to snap it back to 0"
+                     style="display:flex; gap:6px; align-items:center; cursor:pointer;">
+                <input id="chk-tw-spring" type="checkbox">
+                spring back to 0 on release
+              </label>
+              <span class="small" id="tw-msg"></span>
+            </div>
+          </div>
+
+          <div id="cmd-motion-compliance" class="cmd-section" hidden>
+            <div class="small">
+              <div class="cmd-help-kind" id="cmd-help-motion">
+                <b>Motion controller:</b> snapshots current pose on engage,
+                then rigidly drives the end-effector to whatever target you
+                publish.  Each jog press computes
+                <code>new_target = current_EE_pose + delta</code> in
+                <b>base_link</b> and publishes it on
+                <code>/cartesian_motion_controller/target_frame</code>.
+                <b>Snap</b> resets the target to the current pose.
+              </div>
+              <div class="cmd-help-kind" id="cmd-help-compliance">
+                <b>Compliance controller (spring-hold):</b> on engage the
+                controller snapshots the current end-effector pose as its
+                target.  With <code>target_wrench=0</code> (published by the
+                orchestrator) and the configured stiffness, pushing the
+                end-effector makes it yield; release and it springs back to
+                the held pose.  Use <b>Re-snap hold pose</b> after drift to
+                re-anchor the spring at the current pose.  Tune the
+                <code>stiffness.*</code> rows in &ldquo;Parameters&rdquo;
+                below to change how stiff the spring is &mdash; higher =
+                stiffer.  Jog presses move the held pose by an incremental
+                delta.
+              </div>
+            </div>
+            <div class="cmd-grid">
+              <div class="cmd-col">
+                <div class="cmd-row">
+                  <label>trans step</label>
+                  <input id="jog-trans-step" type="number" min="0.001"
+                         max="0.10" step="0.005" value="0.010"> m
+                </div>
+                <div class="jog-grid">
+                  <button data-axis="x" data-sign="-1" class="jog">-X</button>
+                  <button data-axis="x" data-sign="+1" class="jog">+X</button>
+                  <button data-axis="y" data-sign="-1" class="jog">-Y</button>
+                  <button data-axis="y" data-sign="+1" class="jog">+Y</button>
+                  <button data-axis="z" data-sign="-1" class="jog">-Z</button>
+                  <button data-axis="z" data-sign="+1" class="jog">+Z</button>
+                </div>
+              </div>
+              <div class="cmd-col">
+                <div class="cmd-row">
+                  <label>rot step</label>
+                  <input id="jog-rot-step" type="number" min="0.5" max="30"
+                         step="0.5" value="5"> deg
+                </div>
+                <div class="jog-grid">
+                  <button data-raxis="rx" data-sign="-1" class="jog">-Rx</button>
+                  <button data-raxis="rx" data-sign="+1" class="jog">+Rx</button>
+                  <button data-raxis="ry" data-sign="-1" class="jog">-Ry</button>
+                  <button data-raxis="ry" data-sign="+1" class="jog">+Ry</button>
+                  <button data-raxis="rz" data-sign="-1" class="jog">-Rz</button>
+                  <button data-raxis="rz" data-sign="+1" class="jog">+Rz</button>
+                </div>
+              </div>
+              <div class="cmd-col">
+                <button id="btn-snap-target" type="button" class="big warn">
+                  Re-snap hold pose
+                </button>
+                <div class="small" style="margin-top:6px;">
+                  Last published target:
+                </div>
+                <div class="num small" id="last-target-pos">--</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="ctrl-section ctrl-section-params">
+          <h3 class="ctrl-section-title">Parameters</h3>
+          <div class="small" style="margin-bottom:6px;">
+            Live tuning of <code id="param-target">--</code>.  Changes apply
+            immediately to the running controller.
+          </div>
+          <table id="param-table">
+            <thead>
+              <tr><th>name</th><th>current</th><th>new</th><th></th></tr>
+            </thead>
+            <tbody id="param-body"></tbody>
+          </table>
+          <div style="margin-top:8px; display:flex; gap:8px;">
+            <button id="btn-refresh-params" class="ghost">Refresh</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+<script src="/static/dashboard.js" defer></script>
+<script src="/static/urdf_viewer.js" defer></script>
+<script src="/static/force_plot.js" defer></script>
+</body>
+</html>

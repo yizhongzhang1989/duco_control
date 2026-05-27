@@ -27,7 +27,10 @@ services).
   FZI controller's gains:
   * `pd_gains.trans_x.p`, `pd_gains.trans_y.p`, `pd_gains.trans_z.p`
   * `pd_gains.rot_x.p`, `pd_gains.rot_y.p`, `pd_gains.rot_z.p`
+  * `pd_gains.trans_x.d`, `pd_gains.trans_y.d`, `pd_gains.trans_z.d`
+  * `pd_gains.rot_x.d`, `pd_gains.rot_y.d`, `pd_gains.rot_z.d`
   * `solver.error_scale`, `solver.iterations`
+  * `stiffness.trans_{x,y,z}`, `stiffness.rot_{x,y,z}` (compliance only)
 
   Edits are applied immediately via `SetParameters` on the controller
   node -- no restart required.

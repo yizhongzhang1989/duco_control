@@ -62,6 +62,26 @@ _FALLBACKS = {
     "fzi_target_frame":        "link_6",
     "fzi_target_rate_hz":      10.0,
     "fzi_service_timeout_sec": 2.0,
+    # target_wrench setpoint published by the heartbeat (fallback when
+    # no external publisher is active).  Interpreted by FZI in the
+    # end-effector frame (hand_frame_control:=true, default), or the
+    # robot base frame (hand_frame_control:=false).  All-zero ==
+    # pure free-drive (sensor-only -> compliance to operator pushes).
+    "target_wrench_force_x":   0.0,
+    "target_wrench_force_y":   0.0,
+    "target_wrench_force_z":   0.0,
+    "target_wrench_torque_x":  0.0,
+    "target_wrench_torque_y":  0.0,
+    "target_wrench_torque_z":  0.0,
+    # external high-rate target_wrench input.  When non-empty, the
+    # orchestrator subscribes BEST_EFFORT and forwards each incoming
+    # WrenchStamped immediately (no rate limiting) to every consumer,
+    # after clamping to max_wrench_*.  Intended for teleop devices
+    # publishing 50-125 Hz (e.g. SpaceMouse).  If no message arrives
+    # for external_target_wrench_timeout_sec, the parameter setpoint
+    # above takes over via the heartbeat.  Empty = disabled.
+    "external_target_wrench_topic":       "",
+    "external_target_wrench_timeout_sec": 0.2,
     # supervisor + state publish ------------------------------------------
     "loop_rate_hz":            50.0,
     "state_publish_rate_hz":   5.0,

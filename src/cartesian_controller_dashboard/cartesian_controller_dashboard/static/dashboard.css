@@ -1,0 +1,554 @@
+  :root { color-scheme: light dark; }
+  /* The page is laid out as a fixed-viewport vertical stack:
+     [sticky-bar][.body-split].  body itself never scrolls; the two
+     columns inside .body-split scroll independently, so the 3D /
+     plot panels at the top of each column stay anchored while their
+     respective lower panels (frames / params / etc.) can be scrolled
+     past without the other side moving. */
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+         margin: 0; padding: 0; background: #0f1115; color: #e6e6e6;
+         height: 100vh; display: flex; flex-direction: column;
+         overflow: hidden; }
+  h1 { margin: 0 0 4px; font-size: 1.05rem; font-weight: 600; }  h2 { margin: 14px 0 8px; font-size: 0.95rem; font-weight: 600; color: #cfd3dc; }
+  .sub { color: #8a93a6; font-size: 0.82rem; margin-bottom: 12px; }
+  code { background: #11141a; padding: 1px 5px; border-radius: 3px; }
+  .row { display: flex; gap: 16px; flex-wrap: wrap; }
+  .col { flex: 1 1 380px; min-width: 320px; }
+  .panel { background: #181b22; border: 1px solid #262a33; border-radius: 8px;
+           padding: 10px 12px 12px; margin-bottom: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #232730;
+           font-variant-numeric: tabular-nums; }
+  th { color: #8a93a6; font-weight: 500; }
+  button { background: #2563eb; color: white; border: 0; border-radius: 4px;
+           padding: 4px 10px; font: inherit; cursor: pointer; font-size: 0.82rem; }
+  button:hover { background: #1d4ed8; }
+  button.danger  { background: #b91c1c; }
+  button.danger:hover  { background: #991b1b; }
+  button.success { background: #15803d; }
+  button.success:hover { background: #166534; }
+  button.big { padding: 8px 14px; font-size: 0.9rem; }
+  button.ghost { background: #2b3140; }
+  button.ghost:hover { background: #3a4150; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  input[type="number"] { background: #0f1218; color: #e6e6e6;
+           border: 1px solid #2b3140; border-radius: 4px; padding: 3px 6px;
+           font: inherit; font-size: 0.82rem; width: 7em;
+           font-variant-numeric: tabular-nums; }
+  select { background: #0f1218; color: #e6e6e6;
+           border: 1px solid #2b3140; border-radius: 4px; padding: 3px 6px;
+           font: inherit; font-size: 0.82rem; }
+  select:disabled { opacity: 0.5; cursor: not-allowed; }
+  .status { display: inline-block; padding: 2px 7px; border-radius: 999px;
+            background: #1f2937; color: #cfd3dc; font-variant-numeric: tabular-nums; }
+  .status.ok  { background: #14532d; color: #c6f7d6; }
+  .status.bad { background: #5a1d1d; color: #ffb4b4; }
+  .status.warn { background: #553e1a; color: #ffe6a8; }
+  .pill { display: inline-block; padding: 1px 6px; border-radius: 999px;
+          background: #11141a; border: 1px solid #2b3140; font-size: 0.75rem;
+          color: #cfd3dc; margin-right: 4px; }
+  .pill.active { background: #14532d; color: #c6f7d6; border-color: #14532d; }
+  .small { font-size: 0.78rem; color: #8a93a6; }
+  .num { font-variant-numeric: tabular-nums; }
+  .engage-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .cmd-grid { display: flex; gap: 24px; flex-wrap: wrap; margin-top: 8px; }
+  .cmd-col  { display: flex; flex-direction: column; gap: 6px; min-width: 180px; }
+  .cmd-row  { display: flex; gap: 8px; align-items: center; }
+  .cmd-row label { color: #8a93a6; font-size: 0.78rem; min-width: 5em; }
+  .jog-grid { display: grid; grid-template-columns: repeat(2, 60px);
+              grid-auto-rows: 32px; gap: 6px; }
+  button.jog { background: #2a3142; color: #e6e6e6; border: 1px solid #3a4258;
+               border-radius: 4px; cursor: pointer; font: inherit;
+               font-size: 0.85rem; padding: 4px 0; }
+  button.jog:hover:not(:disabled) { background: #3a4258; }
+  button.jog:disabled { opacity: 0.4; cursor: not-allowed; }
+  .cmd-section[hidden] { display: none; }
+  .toast { position: fixed; right: 14px; bottom: 14px; max-width: 400px;
+           background: #181b22; border: 1px solid #262a33; border-radius: 8px;
+           padding: 8px 12px; font-size: 0.82rem; color: #cfd3dc;
+           opacity: 0; transition: opacity .15s; pointer-events: none; }
+  .toast.show { opacity: 1; }
+  .toast.bad { border-color: #b91c1c; color: #ffb4b4; }
+  .toast.ok  { border-color: #15803d; color: #c6f7d6; }
+  /* Horizontal-scroll fallback for wide tables that would otherwise
+     overflow a narrow .col container.  Used by aux-frames. */
+  .table-scroll { overflow-x: auto; }
+  /* Tool-frames editor: 8 columns (name, parent, 3 xyz, 3 rpy) crammed
+     into a half-width .col, so everything in this table is squeezed:
+     - narrower numeric inputs (4.5em vs the global 7em),
+     - spinner buttons hidden so the field width is the actual cell
+       budget (saves ~16px per input on Chromium),
+     - tighter cell padding,
+     - allow the parent code cell to wrap on long names.
+     ``input.aux-num`` is the dirty-state-tracking input (changes get a
+     subtle yellow ring until Save commits them). */
+  #aux-table { min-width: 0; }
+  #aux-table th, #aux-table td { padding: 3px 4px; }
+  #aux-table input.aux-num { width: 4.5em; }
+  #aux-table input.aux-num.dirty {
+    border-color: #b08a3a; box-shadow: 0 0 0 1px #553e1a inset;
+  }
+  /* Strip native number-spinner chrome inside the aux table — frees
+     ~16px per input which is enough to fit 6 inputs in the half-col.
+     Operators edit via direct typing, scroll-wheel still works. */
+  #aux-table input.aux-num::-webkit-outer-spin-button,
+  #aux-table input.aux-num::-webkit-inner-spin-button {
+    -webkit-appearance: none; margin: 0;
+  }
+  #aux-table input.aux-num { -moz-appearance: textfield; }
+  #aux-table td.aux-name code,
+  #aux-table td:nth-child(2) code { white-space: nowrap; }
+  #aux-table td.aux-name code { color: #c6f7d6; }
+  /* Safety-thresholds editor: same dirty-state styling as aux frames. */
+  #safety-table input.safety-num { width: 7em; }
+  #safety-table input.safety-num.dirty {
+    border-color: #b08a3a; box-shadow: 0 0 0 1px #553e1a inset;
+  }
+  /* Wrench-deadband editor (gravity-compensation node parameters):
+     3 numeric inputs per row (xyz), reuse the same dirty-state styling. */
+  #deadband-table input.deadband-num { width: 5.5em; }
+  #deadband-table input.deadband-num.dirty {
+    border-color: #b08a3a; box-shadow: 0 0 0 1px #553e1a inset;
+  }
+  /* Kind-aware help text inside the controller-commands panel. */
+  .cmd-help-kind { display: none; }
+  .cmd-help-kind.active { display: block; }
+  button.warn { background: #b45309; }
+  button.warn:hover { background: #92400e; }
+
+  /* ------------------------------------------------------------------
+     Merged controller panel (engage / commands / parameters).
+
+     Sub-sections are separated by a subtle top border + spacing so
+     the merged panel still reads as three logically distinct blocks
+     without paying for the visual cost (and screen real estate) of
+     three separate .panel boxes.  Section titles use h3 weight so
+     they sit visually *below* the h2 panel titles used elsewhere.
+     ------------------------------------------------------------------ */
+  #ctrl-panel .ctrl-section + .ctrl-section {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid #232730;
+  }
+  #ctrl-panel .ctrl-section-title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    margin: 0 0 8px 0;
+    color: #d8dbe2;
+  }
+  #ctrl-panel .ctrl-section-title .pill {
+    font-weight: 400;
+    vertical-align: 2px;
+  }
+
+  /* ------------------------------------------------------------------
+     Target-wrench publish-enable toggle.
+
+     Sits above the slider widget; controls the orchestrator's master
+     ``publish_target_wrench`` parameter so the operator can hand off
+     the FZI controllers' ``target_wrench`` topics to an external
+     publisher (teleop, scripts, RViz marker) without contention.
+
+     Color reflects current state:
+       data-enabled="true"  -> green (orchestrator driving)
+       data-enabled="false" -> red   (silent, external owns it)
+       data-enabled="?"     -> grey  (unknown / not yet fetched)
+     ------------------------------------------------------------------ */
+  .tw-publish-bar {
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    margin: 10px 0 4px 0;
+    padding: 8px 10px;
+    background: #11141a;
+    border: 1px solid #232730;
+    border-radius: 6px;
+  }
+  #btn-tw-publish-toggle[data-enabled="true"]  { background: #15803d; }
+  #btn-tw-publish-toggle[data-enabled="true"]:hover  { background: #166534; }
+  #btn-tw-publish-toggle[data-enabled="false"] { background: #b91c1c; }
+  #btn-tw-publish-toggle[data-enabled="false"]:hover { background: #991b1b; }
+  #btn-tw-publish-toggle[data-enabled="?"] { background: #2b3140; }
+  #btn-tw-publish-toggle[data-enabled="?"]:hover { background: #3a4150; }
+  #tw-publish-hint { flex: 1 1 220px; min-width: 0; }
+
+  /* ------------------------------------------------------------------
+     Target-wrench sliders (force-controller commands).
+
+     Six rows, one per axis (Fx/y/z, Tx/y/z).  Each row is a CSS grid
+     with five tracks:
+       [label] [slider, flex] [number] [unit] [zero-btn]
+     The slider expands to take whatever width remains so dragging
+     gives a meaningful resolution even in the narrow half-width col.
+     Sliders pick up a ``.suppressed`` modifier (added by the JS when
+     ``publish_target_wrench`` is OFF) to hint that the values are
+     stored on the orchestrator but the heartbeat is muted.
+     ------------------------------------------------------------------ */
+  .wrench-sliders {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .wrench-row {
+    display: grid;
+    grid-template-columns: 2.3em minmax(0, 1fr) 5.5em 1.7em 1.8em;
+    gap: 8px;
+    align-items: center;
+  }
+  .wrench-row .wrench-label {
+    color: #cfd3dc;
+    font-size: 0.85rem;
+    font-weight: 600;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  .wrench-row input.wrench-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 4px;
+    background: #2b3140;
+    border-radius: 2px;
+    outline: none;
+    margin: 0;
+  }
+  .wrench-row input.wrench-slider::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: #2563eb; cursor: pointer; border: 0;
+  }
+  .wrench-row input.wrench-slider::-moz-range-thumb {
+    width: 14px; height: 14px; border-radius: 50%;
+    background: #2563eb; cursor: pointer; border: 0;
+  }
+  .wrench-row input.wrench-slider:focus::-webkit-slider-thumb {
+    box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.4);
+  }
+  .wrench-row input.wrench-num {
+    width: 100%;
+    text-align: right;
+  }
+  /* Strip native spinner chrome from the wrench numeric input so the
+     visible field width is the actual cell budget (otherwise the
+     5.5em slot loses ~16px to the spinner buttons).  Editing is via
+     direct typing + scroll-wheel; the zero button covers the most
+     common shortcut. */
+  .wrench-row input.wrench-num::-webkit-outer-spin-button,
+  .wrench-row input.wrench-num::-webkit-inner-spin-button {
+    -webkit-appearance: none; margin: 0;
+  }
+  .wrench-row input.wrench-num { -moz-appearance: textfield; }
+  .wrench-row .wrench-unit {
+    color: #8a93a6;
+    font-size: 0.78rem;
+  }
+  .wrench-row button.wrench-zero {
+    padding: 2px 0;
+    font-size: 0.78rem;
+    background: #2b3140;
+    width: 100%;
+  }
+  .wrench-row button.wrench-zero:hover { background: #3a4150; }
+  /* Highlight a slider whose value is non-zero so the operator can
+     see at a glance which axes are commanding force. */
+  .wrench-row.nonzero .wrench-label { color: #ffe6a8; }
+  .wrench-row.nonzero input.wrench-slider {
+    background: linear-gradient(to right, #2b3140, #b45309 50%, #2b3140);
+  }
+  /* When the orchestrator's publish_target_wrench is OFF the slider
+     values are stored in the orchestrator's parameters but the
+     heartbeat is muted; dim the whole widget so the operator notices
+     the disconnect at a glance.  Inputs stay enabled so values can be
+     pre-set before flipping the toggle back on. */
+  .wrench-sliders.suppressed { opacity: 0.55; }
+
+  /* ------------------------------------------------------------------
+     Sticky top bar.
+
+     Lives at the very top of <body>; pins to the viewport top while
+     the rest of the dashboard scrolls beneath it.  The bar bleeds
+     into the body's 14px padding via negative margins so it spans
+     the full width of the window.  Background is semi-opaque dark
+     indigo so it visually separates from the near-black body and
+     slate panels beneath.
+
+     Layout is two rows:
+       .sb-row-status: small status pills (engaged, trip, orch, ft, q, conn)
+       .sb-row-data:   BIG single-line TCP pose + wrench data, no
+                       group labels (axis shorthand is self-evident).
+                       Base/tool frame names live in the row's
+                       title= tooltip so they don't clutter the bar.
+     ------------------------------------------------------------------ */
+  .sticky-bar { flex: 0 0 auto; z-index: 100;
+                padding: 8px 16px 10px;
+                /* Solid (not backdrop-blurred) so scrolling content
+                   underneath doesn't force a per-frame blur-shader
+                   rasterization -- that was the dominant cause of
+                   the 1-2 s scroll stalls.  Bumped from 0.96 to 1.0
+                   alpha to compensate visually for the lost blur.
+                   No position:sticky -- body itself doesn't scroll
+                   in the new layout, so being a normal flex item at
+                   the top of body keeps the bar anchored. */
+                background: #1c2338;
+                border-bottom: 1px solid #3a4368;
+                box-shadow: 0 4px 12px -8px #000; }
+  .sticky-bar .sb-row { display: flex; flex-wrap: wrap;
+                        gap: 8px 10px; align-items: center;
+                        font-variant-numeric: tabular-nums; }
+  .sticky-bar .sb-row-status { font-size: 0.82rem; line-height: 1.4; }
+  .sticky-bar .sb-row + .sb-row { margin-top: 6px;
+                                  padding-top: 6px;
+                                  border-top: 1px dashed #3a4368; }
+  .sticky-bar .sb-label { color: #aab3c8; font-size: 0.75rem; }
+  .sticky-bar .sb-sep { display: inline-block; width: 1px; height: 22px;
+                        background: #3a4368; }
+  .sticky-bar .sb-spacer { flex: 1 1 auto; }
+
+  /* --- BIG single-line data row (TCP pose + wrench) -------------------- */
+  /* Compact vector format:  LABEL (a, b, c)
+       XYZ (x, y, z)  RPY (r, p, y)  F (fx, fy, fz)  T (tx, ty, tz)
+     Units are not shown inline; hover the row to see them (set as
+     title= by dashboard.js).  Each .sb-vec group is laid out
+     inline-flex so the label, opening paren, numbers and closing
+     paren sit on one baseline. */
+  .sticky-bar .sb-row-data { font-size: 1.4rem; line-height: 1.2;
+                             gap: 10px 18px; }
+  .sticky-bar .sb-vec { display: inline-flex; align-items: baseline;
+                        gap: 8px;
+                        color: #cfd3dc;
+                        background: #1a2138;
+                        border: 1px solid #2e3756;
+                        border-radius: 6px;
+                        padding: 4px 12px; }
+  .sticky-bar .sb-vec-label {
+                        color: #aab3c8; font-weight: 600;
+                        letter-spacing: 0.04em;
+                        font-size: 1.05rem; }
+  .sticky-bar .sb-vec-paren {
+                        color: #f1f4fb; font-weight: 600;
+                        font-variant-numeric: tabular-nums; }
+  .sticky-bar .sb-vec-paren .num { color: #f1f4fb; }
+  .sticky-bar .sb-vec-unit {
+                        color: #8a93a6; font-weight: 400;
+                        font-size: 0.85rem;
+                        margin-left: -2px; }
+
+  /* Body split: two independently scrolling columns that fill the
+     viewport below the sticky bar.  Each .body-col is its own
+     overflow:auto container, so the 3D panel at the top of the left
+     column and the wrench-plot panel at the top of the right column
+     stay anchored while the panels below them scroll under each
+     column independently. */
+  .body-split { flex: 1 1 auto; display: flex; gap: 16px;
+                padding: 14px;
+                overflow: hidden; min-height: 0; }
+  .body-col   { flex: 1 1 0; min-width: 0; min-height: 0;
+                overflow-y: auto; overflow-x: hidden;
+                /* Hide the per-column scrollbar -- the cols still
+                   scroll via wheel / touch / keyboard, but the
+                   visible bar on either side of the body looked
+                   noisy.  scrollbar-width covers Firefox;
+                   ::-webkit-scrollbar covers Chromium / Safari. */
+                scrollbar-width: none; }
+  .body-col::-webkit-scrollbar { width: 0; height: 0; display: none; }
+  /* Last panel inside a body-col shouldn't add an extra 12px gap at
+     the bottom of the scroll viewport. */
+  .body-col > .panel:last-child { margin-bottom: 0; }
+
+  /* ----------- Narrow-viewport collapse to one column --------------
+     Below ~900px the two side-by-side columns would each be too
+     cramped (the wrench plot canvases want at least ~400px and the
+     aux-frames table wants a similar floor), so we drop back to a
+     single column and let the whole page scroll instead of the
+     two columns scrolling independently.  The sticky-bar regains
+     position:sticky here so it stays pinned during page scroll.
+
+     Stacking order is NOT a simple concatenation of left-col then
+     right-col -- the operator wants the two "hero" panels (3D and
+     wrench plot) to lead, followed by the rest of the left column,
+     then the rest of the right column.  We achieve that by
+     flattening the .body-col wrappers with ``display: contents``
+     (so their .panel children become direct flex items of
+     .body-split) and assigning explicit ``order`` values. */
+  @media (max-width: 900px) {
+    body { height: auto; overflow: visible; display: block; }
+    .sticky-bar { position: sticky; top: 0; }
+    .body-split { display: flex; flex-direction: column;
+                  overflow: visible;
+                  min-height: 0; padding: 12px; gap: 0; }
+    /* Flatten the column wrappers so .panel elements become direct
+       flex items of .body-split and CSS ``order`` can interleave
+       them across the original column boundary. */
+    .body-col   { display: contents; }
+    /* Panel margins handle spacing in the stacked layout. */
+    .body-col > .panel:last-child { margin-bottom: 12px; }
+    /* 1. 3D model, 2. wrench plot, 3. rest of left col,
+       4. rest of right col.  DOM order within each ``order`` group
+       is preserved, so e.g. Tool frames -> Deadband -> Safety stays
+       in the left col's intended order. */
+    #urdf-panel                                            { order: 1; }
+    #ft-plot-panel                                         { order: 2; }
+    .body-col:first-child  > .panel:not(#urdf-panel)       { order: 3; }
+    .body-col:nth-child(2) > .panel:not(#ft-plot-panel)    { order: 4; }
+  }
+
+  /* ===== 3D model panel ==========================================
+     The canvas fills the panel edge-to-edge (no h2, no padding) so
+     the 3D viewport gets the maximum possible display area; the
+     title / status / info / controls live in a semi-transparent
+     ``.urdf-floating`` panel pinned to the top-right corner.  This
+     mirrors the layout pattern in duco_dashboard's standalone 3D
+     viewer.  ``min-height: 480px`` matches the wrench plot panel's
+     natural height so when the two are side-by-side they line up. */
+  #urdf-panel { position: relative; padding: 0; overflow: hidden;
+                min-height: 480px; }
+  #urdf-panel > #urdf-canvas {
+                position: absolute; inset: 0;
+                width: 100%; height: 100%;
+                display: block; cursor: grab;
+                background: #0b0e14; border: 0;
+                border-radius: 8px; }
+  /* Error / status overlay (top-left) — only visible when the JS
+     layer pushes a fetch-failure message into it.  ``font-size:0``
+     when empty keeps it from reserving any whitespace. */
+  #urdf-panel > #urdf-overlay {
+                position: absolute; left: 12px; top: 10px; z-index: 5;
+                color: #ef5350; font-size: 0.78rem; pointer-events: none;
+                font-variant-numeric: tabular-nums; max-width: 60%;
+                white-space: pre-wrap; }
+  /* Floating info / controls (top-right).  Background is
+     near-opaque (no backdrop-filter) so scrolling the page or
+     repainting the 3D canvas behind it doesn't force a per-frame
+     blur-shader pass.  pointer-events default to auto so the
+     buttons / checkboxes are interactive. */
+  #urdf-panel .urdf-floating {
+                position: absolute; right: 10px; top: 10px; z-index: 10;
+                min-width: 210px; max-width: 260px;
+                max-height: calc(100% - 20px); overflow: auto;
+                background: rgba(22, 25, 33, 0.94);
+                border: 1px solid rgba(79, 195, 247, 0.30);
+                border-radius: 8px; padding: 10px 12px 12px;
+                color: #e0e6ef;
+                box-shadow: 0 12px 32px rgba(0, 0, 0, 0.40); }
+  .urdf-floating-header { display: flex; align-items: center;
+                gap: 8px; justify-content: space-between;
+                margin-bottom: 8px; }
+  .urdf-floating-title { font-size: 0.92rem; font-weight: 600;
+                color: #cfd3dc; }
+  /* Collapse / expand toggle (square button next to the status pill).
+     Switches between ``-`` (expanded) and ``+`` (collapsed); JS flips
+     the .collapsed class on .urdf-floating and the aria-expanded
+     attribute on the button.  In collapsed mode .urdf-floating-body
+     is hidden so the panel shrinks to just its header strip and the
+     3D canvas gets the full panel area. */
+  .urdf-floating-toggle { flex: 0 0 auto; width: 22px; height: 22px;
+                padding: 0; margin: 0; border-radius: 5px;
+                border: 1px solid rgba(79, 195, 247, 0.35);
+                background: rgba(255, 255, 255, 0.06);
+                color: #cfd3dc; font-size: 0.95rem; line-height: 1;
+                font-weight: 700; cursor: pointer;
+                display: inline-flex; align-items: center;
+                justify-content: center; }
+  .urdf-floating-toggle:hover {
+                background: rgba(79, 195, 247, 0.18);
+                color: #ffffff; }
+  .urdf-floating.collapsed { min-width: 0; }
+  .urdf-floating.collapsed .urdf-floating-header { margin-bottom: 0; }
+  .urdf-floating.collapsed .urdf-floating-body { display: none; }
+  .urdf-floating-rows { display: grid;
+                grid-template-columns: auto 1fr; gap: 4px 12px;
+                margin-bottom: 8px; font-size: 0.78rem; }
+  .urdf-floating-rows > span:nth-child(odd) {
+                /* Label column */
+                color: #8a93a6;
+                text-transform: uppercase;
+                letter-spacing: 0.04em; }
+  .urdf-floating-rows > code,
+  .urdf-floating-rows > span:nth-child(even) {
+                font-variant-numeric: tabular-nums;
+                color: #e6e6e6; text-align: right;
+                background: transparent; padding: 0;
+                white-space: nowrap; overflow: hidden;
+                text-overflow: ellipsis; }
+  .urdf-floating-controls { display: flex; gap: 14px; flex-wrap: wrap;
+                margin-bottom: 8px; font-size: 0.8rem;
+                color: #cfd3dc; }
+  .urdf-floating-controls label { display: inline-flex;
+                align-items: center; gap: 5px; cursor: pointer; }
+  .urdf-floating-buttons { display: flex; gap: 6px; }
+  .urdf-floating-buttons button { flex: 1; padding: 4px 6px;
+                font-size: 0.78rem; }
+  .urdf-floating-hint { margin-top: 8px; font-size: 0.7rem;
+                color: #6a7282; line-height: 1.3; }
+
+  /* ---- Joint rows -------------------------------------------------
+     One row per non-fixed joint, populated by urdf_viewer.js after
+     the URDF model arrives.  Layout: J<n> label (20px), bar (flex),
+     numeric value (50px).  Bars fill outward from a centre line so
+     positive vs negative excursions are visually distinct -- the
+     same pattern duco_dashboard uses. */
+  .urdf-floating-section-title {
+                font-size: 0.7rem; color: #78909c;
+                text-transform: uppercase; letter-spacing: 0.08em;
+                margin: 2px 0 4px; }
+  .urdf-joints { display: flex; flex-direction: column; gap: 3px;
+                margin-bottom: 8px; }
+  .urdf-joint-row { display: grid;
+                grid-template-columns: 22px 1fr 56px;
+                align-items: center; gap: 6px; height: 18px; }
+  .urdf-joint-label { font-size: 0.72rem; font-weight: 700;
+                text-align: center; }
+  .urdf-joint-bar-bg { position: relative; height: 12px;
+                background: #0f1923; border-radius: 3px;
+                overflow: hidden;
+                box-shadow: inset 0 0 0 1px rgba(55, 71, 79, 0.55); }
+  .urdf-joint-center { position: absolute; left: 50%; top: 0;
+                bottom: 0; width: 1px; background: #37474f; z-index: 2; }
+  .urdf-joint-bar { position: absolute; top: 0; height: 100%;
+                border-radius: 2px; transition: width 0.06s ease-out; }
+  .urdf-joint-bar.positive { left: 50%; }
+  .urdf-joint-bar.negative { right: 50%; }
+  .urdf-joint-val { text-align: right; font-size: 0.72rem;
+                font-family: ui-monospace, "SFMono-Regular",
+                Consolas, monospace; color: #e6e6e6;
+                font-variant-numeric: tabular-nums;
+                white-space: nowrap; }
+
+  /* Force / torque plot panel layout.  Two stacked canvas rows
+     (Force / Torque) each have a rotated y-axis label on the left
+     and a full-width canvas on the right.  The canvas is sized in
+     CSS pixels here; the JS layer multiplies by devicePixelRatio
+     when (re)sizing the backing store so the drawing stays crisp
+     on hi-DPI displays. */
+  #ft-plot-panel .ft-plot-controls {
+                       display: flex; gap: 12px; align-items: center;
+                       flex-wrap: wrap; margin-bottom: 4px; }
+  #ft-plot-panel .ft-plot-controls input[type=number] {
+                       width: 4em; background: #11141a; color: #e6e6e6;
+                       border: 1px solid #2b3140; border-radius: 4px;
+                       padding: 2px 4px; font-variant-numeric: tabular-nums; }
+  #ft-plot-panel .ft-plot-legend {
+                       display: inline-flex; gap: 14px; align-items: center; }
+  #ft-plot-panel .ft-plot-legend b {
+                       color: #f1f4fb; font-weight: 600;
+                       font-variant-numeric: tabular-nums;
+                       min-width: 4.5em; display: inline-block;
+                       text-align: right; }
+  #ft-plot-panel .swatch {
+                       display: inline-block; width: 10px; height: 10px;
+                       border-radius: 2px; margin-right: 4px;
+                       vertical-align: -1px; }
+  #ft-plot-panel .ft-plot-row {
+                       display: flex; align-items: stretch; gap: 6px;
+                       margin-top: 4px; }
+  #ft-plot-panel .ft-plot-label {
+                       /* Rotated y-axis label.  Fixed-width column so
+                          the canvases on Force / Torque rows line up
+                          horizontally even when their text differs. */
+                       writing-mode: vertical-rl;
+                       transform: rotate(180deg);
+                       text-align: center; flex: 0 0 14px;
+                       color: #8a93a6; padding: 4px 0; }
+  #ft-plot-panel canvas {
+                       flex: 1 1 auto; width: 100%; height: 180px;
+                       display: block; background: #0c0e13;
+                       border: 1px solid #2b3140; border-radius: 6px; }
