@@ -361,13 +361,23 @@ to the forward-dynamics solver in [`ForwardDynamicsSolver::getJointControlCmds`]
 The solver treats the robot as a fictitious rigid body with a custom
 inertia distribution (last link mass = 1 kg, inertia = 1 kg·m²; all
 other links use `solver.forward_dynamics.link_mass`, default 0.1 kg)
-and integrates one step forward in 0.02 s:
+and integrates one step forward in 0.02 s using **symplectic (semi-implicit) Euler**:
 
 $$
 \ddot{\mathbf{q}} = H(\mathbf{q})^{-1}\, J(\mathbf{q})^{\top}\, \mathbf{F}_{\text{cmd}}, \qquad
 \dot{\mathbf{q}}_{t+\Delta t} = 0.9 \cdot \bigl(\dot{\mathbf{q}}_t + \ddot{\mathbf{q}}\, \Delta t\bigr), \qquad
-\mathbf{q}_{t+\Delta t} = \mathbf{q}_t + \dot{\mathbf{q}}_t\, \Delta t
+\mathbf{q}_{t+\Delta t} = \mathbf{q}_t + \dot{\mathbf{q}}_{t+\Delta t}\, \Delta t
 $$
+
+The crucial detail is that the position update uses the **new**
+velocity $\dot{\mathbf{q}}_{t+\Delta t}$, not the old one.  This is a
+local patch on top of the upstream FZI implementation, which used
+plain explicit (forward) Euler $\mathbf{q}_{t+\Delta t} = \mathbf{q}_t + \dot{\mathbf{q}}_t\,\Delta t$
+and was prone to instability when the closed-loop stiffness
+$\text{error\_scale}\cdot P\cdot K\cdot\Delta t^2$ approached unity.
+The change is a one-line reorder in `ForwardDynamicsSolver::getJointControlCmds`
+and does not affect steady-state behaviour (at $\ddot{\mathbf{q}}=0$ both
+schemes give identical results).
 
 * $H(\mathbf{q})$ is the joint-space inertia (recomputed every cycle
   via `KDL::ChainDynParam`).
@@ -380,6 +390,12 @@ $$
   `pd_gains.*.d`.  It is also why the arm comes to rest even when the
   PD gains are very low: stop pushing, and the EE coasts to a halt in
   a few hundred milliseconds.
+* The symplectic step does **not** help with pure-damper stability
+  limits (the explicit-Euler bound $D\cdot\text{error\_scale}\cdot\Delta t/m < 2$
+  still applies); for that you need implicit treatment of the
+  velocity-proportional term &mdash; not currently implemented.  In
+  practice the $\times 0.9$ multiplier and small $\Delta t$ keep the
+  margin two orders of magnitude above any reasonable PD gain.
 
 The result is a `JointTrajectoryPoint` of new joint positions and
 velocities; `writeJointControlCmds` writes them onto whichever
