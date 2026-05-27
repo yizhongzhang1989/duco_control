@@ -2,12 +2,13 @@
 
 Subtracts tool weight (mass + center of mass) and bias from the raw F/T
 sensor wrench using the **live TCP orientation from `/tf`**, and republishes
-a compensated wrench.
+a compensated wrench. Robot-agnostic: the input/output topics and the
+sensor frame are launch parameters.
 
-* **Input:**  `geometry_msgs/WrenchStamped` on `/duco_ft_sensor/wrench_raw`
-              + `/tf` (`base_link` -> `link_6`, published by
+* **Input:**  `geometry_msgs/WrenchStamped` on `/ft_sensor/wrench_raw`
+              + `/tf` (`base_link` -> sensor frame, published by
               `robot_state_publisher` from the bringup launch)
-* **Output:** `geometry_msgs/WrenchStamped` on `/duco_ft_sensor/wrench_compensated`
+* **Output:** `geometry_msgs/WrenchStamped` on `/ft_sensor/wrench_compensated`
 * **Web dashboard (opt-in):** `http://<host>:8100/` -- launched only when
   `enable_dashboard:=true` (or `enable_dashboard: true` under
   `ft_sensor_gravity_compensation:` in `config/robot_config.yaml`)
@@ -17,22 +18,23 @@ a compensated wrench.
   * Switch the active end-effector live -- the next outgoing wrench uses it
     immediately
 
-The node is intentionally a **separate package** from `duco_ft_sensor`: the
-driver keeps publishing the raw, untouched wrench, while this node owns all
-calibration state. That makes both pieces easier to reason about and keeps
-the raw stream available for diagnostics.
+The node is intentionally a **separate package** from any vendor F/T driver:
+the driver keeps publishing the raw, untouched wrench, while this node owns
+all calibration state. That makes both pieces easier to reason about and
+keeps the raw stream available for diagnostics.
 
 ## Why TF and not a custom TCP-pose topic?
 
-`robot_state_publisher` (started by `duco_robot_bringup`) already publishes
-the full kinematic chain on `/tf`, including the
-`base_link` -> `link_1` -> ... -> `link_6` transforms. This is the standard
-ROS pose representation, so the compensation node simply uses
-`tf2_ros.Buffer` -- no separate TCP-pose publisher is needed.
+`robot_state_publisher` (started by your robot's bringup) already publishes
+the full kinematic chain on `/tf`, including the base-link -> end-effector
+transforms. This is the standard ROS pose representation, so the
+compensation node simply uses `tf2_ros.Buffer` -- no separate TCP-pose
+publisher is needed.
 
-If you later add a dedicated `ft_sensor_link` to the URDF (with a static
-transform from `link_6`), just set `sensor_frame:=ft_sensor_link` and the
-node will use that frame for the gravity vector.
+If you add a dedicated `ft_sensor_link` to the URDF (with a static
+transform from the end of the kinematic chain), just set
+`sensor_frame:=ft_sensor_link` and the node will use that frame for the
+gravity vector.
 
 ## Math
 
@@ -71,13 +73,9 @@ tool pointing down, then forward, then sideways.
 
 ## Workflow
 
-1. Make sure the bringup launch is running (so `/tf` is alive):
-
-       ros2 launch duco_robot_bringup gcr5_910_ros2_control.launch.py
-
-2. Make sure the F/T driver is publishing the raw wrench:
-
-       ros2 launch duco_ft_sensor ft_sensor.launch.py
+1. Make sure the bringup launch is running (so `/tf` is alive), then
+2. Make sure your F/T driver is publishing the raw wrench on the topic
+   passed to `input_topic` (default `/ft_sensor/wrench_raw`).
 
 3. Launch the compensation node + dashboard:
 
@@ -107,10 +105,10 @@ the very next incoming raw frame -- no relaunch needed.
 
 | name                  | type    | default                                                        |
 |-----------------------|---------|----------------------------------------------------------------|
-| `input_topic`         | string  | `/duco_ft_sensor/wrench_raw`                                   |
-| `output_topic`        | string  | `/duco_ft_sensor/wrench_compensated`                           |
+| `input_topic`         | string  | `/ft_sensor/wrench_raw`                                        |
+| `output_topic`        | string  | `/ft_sensor/wrench_compensated`                                |
 | `world_frame`         | string  | `base_link`                                                    |
-| `sensor_frame`        | string  | `link_6`                                                       |
+| `sensor_frame`        | string  | `tool0`                                                        |
 | `reliability`         | string  | `best_effort`                                                  |
 | `publish_when_no_tf`  | bool    | `false`                                                        |
 | `storage_path`        | string  | `~/.ros/ft_sensor_gravity_compensation/end_effectors.yaml`     |

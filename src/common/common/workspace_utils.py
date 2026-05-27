@@ -1,17 +1,17 @@
-"""Workspace location helpers for the duco_control project.
+"""Workspace location helpers for the cartesian_controllers_toolkit.
 
-Lets any code in the workspace find the project root (the directory that
-contains ``src/``, ``config/``, ``tools/``, etc.) regardless of whether
-it's running from the source tree or from a colcon ``install/`` overlay.
+Lets any code in the workspace find the consuming project root (the
+directory that contains ``src/``, ``config/``, ``tools/``, etc.)
+regardless of whether it's running from the source tree or from a
+colcon ``install/`` overlay.
 
 The project root is found by, in order:
 
-  1. The ``DUCO_CONTROL_ROOT`` environment variable (explicit override).
+  1. The ``ROBOT_WORKSPACE_ROOT`` environment variable (explicit
+     override).  ``DUCO_CONTROL_ROOT`` is accepted as a legacy alias.
   2. Walking up from a known installed share dir (``ament_index``).
   3. Walking up from this file's own location (development case).
   4. ``COLCON_PREFIX_PATH`` / ``ROS_WORKSPACE``.
-  5. A small list of common locations (``~/Documents/duco_control``,
-     ``~/duco_control``).
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from typing import Optional
 
 
 # Files/directories that, when present together at the same level, identify
-# the duco_control project root.
+# the consuming workspace root.
 _ROOT_MARKERS = ("src", "config")
 
 
@@ -31,10 +31,12 @@ def _looks_like_root(path: Path) -> bool:
 
 
 def get_workspace_root() -> Optional[str]:
-    """Return the absolute path of the duco_control project root, or None."""
+    """Return the absolute path of the consuming workspace root, or None."""
 
-    # 1. explicit env var override
-    env = os.environ.get("DUCO_CONTROL_ROOT")
+    # 1. explicit env var override (ROBOT_WORKSPACE_ROOT preferred;
+    #    DUCO_CONTROL_ROOT accepted as a legacy alias).
+    env = os.environ.get("ROBOT_WORKSPACE_ROOT") or \
+        os.environ.get("DUCO_CONTROL_ROOT")
     if env:
         p = Path(env).expanduser().resolve()
         if _looks_like_root(p):
@@ -43,7 +45,10 @@ def get_workspace_root() -> Optional[str]:
     # 2. walk up from an installed package's share dir
     try:
         from ament_index_python.packages import get_package_share_directory
-        for pkg in ("common", "duco_ft_sensor", "ft_sensor_dashboard"):
+        for pkg in ("common",
+                    "cartesian_control_manager",
+                    "ft_sensor_gravity_compensation",
+                    "ft_sensor_dashboard"):
             try:
                 share = Path(get_package_share_directory(pkg)).resolve()
             except Exception:
@@ -71,14 +76,6 @@ def get_workspace_root() -> Optional[str]:
                 if _looks_like_root(parent):
                     return str(parent)
 
-    # 5. fallback well-known paths
-    for fallback in (
-        Path.home() / "Documents" / "duco_control",
-        Path.home() / "duco_control",
-    ):
-        if _looks_like_root(fallback):
-            return str(fallback.resolve())
-
     return None
 
 
@@ -90,8 +87,8 @@ def get_config_dir() -> str:
     root = get_workspace_root()
     if root is None:
         raise RuntimeError(
-            "Could not find duco_control workspace root. "
-            "Set DUCO_CONTROL_ROOT or run from inside the project tree.")
+            "Could not find the consuming workspace root. "
+            "Set ROBOT_WORKSPACE_ROOT or run from inside the project tree.")
     return str(Path(root) / "config")
 
 
@@ -113,8 +110,8 @@ def get_temp_dir(create: bool = True) -> str:
     root = get_workspace_root()
     if root is None:
         raise RuntimeError(
-            "Could not find duco_control workspace root. "
-            "Set DUCO_CONTROL_ROOT or run from inside the project tree.")
+            "Could not find the consuming workspace root. "
+            "Set ROBOT_WORKSPACE_ROOT or run from inside the project tree.")
     p = Path(root) / "temp"
     if create:
         p.mkdir(parents=True, exist_ok=True)

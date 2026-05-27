@@ -209,7 +209,7 @@
         <div class="small" style="margin-top:6px;">
           Per-axis soft (continuous) dead-zone applied to the
           compensated wrench just before publishing on
-          <code>/duco_ft_sensor/wrench_compensated</code>.  Models the
+          <code>/ft_sensor/wrench_compensated</code>.  Models the
           residual noise floor left after bias calibration; the
           downstream force / compliance controller (and the
           <em>|F|&nbsp;/&nbsp;|T|</em> readout above) only "see" forces
@@ -271,7 +271,7 @@
           <span class="small" id="safety-dirty-pill"></span>
         </div>
         <div class="small" style="margin-top:6px;">
-          Pushed live to <code>/duco_cartesian_control</code>.  Crossing
+          Pushed live to <code>/cartesian_control_manager</code>.  Crossing
           a wrench / staleness limit while engaged trips the safety
           supervisor and disengages the FZI controller.  Values must
           be &ge; 0.
@@ -284,7 +284,7 @@
         <h2>
           Wrench plot <span class="pill" id="ft-plot-status">--</span>
           <span class="small" style="margin-left:8px;">
-            live <code id="ft-plot-topic">/duco_ft_sensor/wrench_compensated</code>
+            live <code id="ft-plot-topic">/ft_sensor/wrench_compensated</code>
           </span>
         </h2>
         <div class="ft-plot-controls">

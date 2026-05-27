@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'duco_cartesian_control'
+package_name = 'cartesian_control_manager'
 
 setup(
     name=package_name,
@@ -14,21 +14,18 @@ setup(
             'launch/cartesian_control.launch.py',
             'launch/cartesian_control_real.launch.py',
         ]),
-        ('share/' + package_name + '/config', [
-            'config/fzi_zero_gravity.yaml',
-        ]),
     ],
     install_requires=['setuptools', 'numpy', 'pyyaml'],
     zip_safe=True,
     maintainer='yizhongzhang',
     maintainer_email='yizhongzhang1989@gmail.com',
-    description='FZI cartesian_force_controller setup + engage/disengage UX '
-                'and safety supervisor for the Duco GCR5_910 arm.',
+    description='Robot-agnostic orchestrator for FZI cartesian controllers: '
+                'engage/disengage UX, wrench relay, and safety supervisor.',
     license='MIT',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'cartesian_control_node = duco_cartesian_control.control_node:main',
+            'cartesian_control_node = cartesian_control_manager.control_node:main',
         ],
     },
 )

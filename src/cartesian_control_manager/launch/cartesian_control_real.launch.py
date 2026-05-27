@@ -6,7 +6,7 @@ real arm cannot accelerate, push, or jerk hard.
 
 Usage::
 
-    ros2 launch duco_cartesian_control cartesian_control_real.launch.py
+    ros2 launch cartesian_control_manager cartesian_control_real.launch.py
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ _CONSERVATIVE_OVERRIDES = {
 
 def generate_launch_description() -> LaunchDescription:
     base = os.path.join(
-        get_package_share_directory("duco_cartesian_control"),
+        get_package_share_directory("cartesian_control_manager"),
         "launch", "cartesian_control.launch.py")
 
     # Expose the conservative overrides as launch arguments so the
@@ -61,7 +61,7 @@ def generate_launch_description() -> LaunchDescription:
     }
 
     log = LogInfo(msg=(
-        "[duco_cartesian_control] REAL-HARDWARE profile: "
+        "[cartesian_control_manager] REAL-HARDWARE profile: "
         "conservative limits applied. FZI's cartesian_force_controller "
         "is the hot path; this node is the safety supervisor + engage UX."))
 

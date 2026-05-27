@@ -7,7 +7,7 @@ fresh checkout.
 
 The dashboard is a pure UI / monitoring layer.  It does not launch
 controllers, wrench relays, or safety supervisors -- those live in
-:package:`duco_cartesian_control`.
+:package:`cartesian_control_manager`.
 
 Examples::
 
@@ -22,10 +22,11 @@ from launch_ros.actions import Node
 
 
 _FALLBACKS = {
-    "orchestrator_ns":     "/duco_cartesian_control",
+    "orchestrator_ns":     "/cartesian_control_manager",
     "controller_name":     "cartesian_force_controller",
-    "wrench_topic":        "/duco_ft_sensor/wrench_compensated",
+    "wrench_topic":        "/ft_sensor/wrench_compensated",
     "joint_states_topic":  "/joint_states",
+    "aux_frames_section":  "",
     "service_timeout_sec": 2.0,
     "host":                "0.0.0.0",
     "port":                8120,

@@ -15,8 +15,9 @@ pre-loaded as **inactive** at launch time and selectable at runtime:
 This node provides the operational glue:
 
 * an **engage / disengage** UX (``Trigger`` services) that atomically
-  switches ``arm_1_controller`` (the ``JointTrajectoryController``) with
-  whichever FZI controller is currently selected via the parameter
+  switches the robot's JointTrajectoryController (named by the
+  ``fzi_jtc_controller_name`` parameter) with whichever FZI
+  controller is currently selected via the parameter
   ``active_controller_name``, using ``controller_manager``'s
   ``switch_controller`` service;
 * a **wrench relay** that republishes the gravity-compensated
@@ -57,9 +58,9 @@ plugin (inactive) into the controller_manager.
 
 Operator interfaces::
 
-    /duco_cartesian_control/engage      (std_srvs/srv/Trigger)
-    /duco_cartesian_control/disengage   (std_srvs/srv/Trigger)
-    /duco_cartesian_control/state       (std_msgs/String, JSON)
+    /cartesian_control_manager/engage      (std_srvs/srv/Trigger)
+    /cartesian_control_manager/disengage   (std_srvs/srv/Trigger)
+    /cartesian_control_manager/state       (std_msgs/String, JSON)
 
 Live parameters::
 
@@ -123,7 +124,7 @@ _DEFAULT_CONTROLLER_KINDS: List[str] = [
 # ---------------------------------------------------------------------------
 _PARAM_DECLARATIONS: List[Tuple[str, object]] = [
     # connectivity ---------------------------------------------------------
-    ("wrench_topic",          "/duco_ft_sensor/wrench_compensated"),
+    ("wrench_topic",          "/ft_sensor/wrench_compensated"),
     ("joint_states_topic",    "/joint_states"),
     ("controller_manager_ns", "/controller_manager"),
     ("engaged_default",       False),
@@ -131,8 +132,11 @@ _PARAM_DECLARATIONS: List[Tuple[str, object]] = [
     ("available_controllers",  _DEFAULT_AVAILABLE_CONTROLLERS),
     ("controller_kinds",       _DEFAULT_CONTROLLER_KINDS),
     ("active_controller_name", "cartesian_force_controller"),
-    ("fzi_jtc_controller_name", "arm_1_controller"),
-    ("fzi_target_frame",        "link_6"),
+    # Default JTC name follows ros2_control's convention; per-robot
+    # configs override (Duco uses 'arm_1_controller', UR uses
+    # 'scaled_joint_trajectory_controller').
+    ("fzi_jtc_controller_name", "joint_trajectory_controller"),
+    ("fzi_target_frame",        "tool0"),
     ("fzi_target_rate_hz",      10.0),
     ("fzi_service_timeout_sec", 2.0),
     # target_wrench setpoint published by the heartbeat ---------------
@@ -141,7 +145,7 @@ _PARAM_DECLARATIONS: List[Tuple[str, object]] = [
     # robot base frame when false.  All zero -> pure free-drive
     # (sensor-wrench-only error -> compliance to operator pushes).
     # Set per-axis live via, e.g.,
-    #   ros2 param set /duco_cartesian_control target_wrench_force_z 5.0
+    #   ros2 param set /cartesian_control_manager target_wrench_force_z 5.0
     ("target_wrench_force_x",   0.0),   # N
     ("target_wrench_force_y",   0.0),   # N
     ("target_wrench_force_z",   0.0),   # N
@@ -195,7 +199,7 @@ class CartesianControlNode(Node):
     )
 
     def __init__(self) -> None:
-        super().__init__("duco_cartesian_control")
+        super().__init__("cartesian_control_manager")
         for name, default in _PARAM_DECLARATIONS:
             self.declare_parameter(name, default)
         self._read_params()
@@ -337,11 +341,11 @@ class CartesianControlNode(Node):
             f"target_wrench={self._target_wrench.tolist()} to "
             f"force/compliance @ {rate:.0f} Hz; {ext}")
         self.get_logger().info(
-            f"engage via `ros2 service call /duco_cartesian_control/engage "
+            f"engage via `ros2 service call /cartesian_control_manager/engage "
             f"std_srvs/srv/Trigger`")
         self.get_logger().info(
             f"switch active controller via "
-            f"`ros2 param set /duco_cartesian_control "
+            f"`ros2 param set /cartesian_control_manager "
             f"active_controller_name <name>` (must be disengaged first)")
 
     # ------------------------------------------------------------------

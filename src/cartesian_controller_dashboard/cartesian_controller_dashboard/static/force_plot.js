@@ -9,7 +9,7 @@
 //   #ft-plot-torque  →  Tx / Ty / Tz  (Nm)
 //
 // Data source: backend ring buffer fed by the orchestrator's
-// /duco_ft_sensor/wrench_compensated subscriber.  This module polls
+// /ft_sensor/wrench_compensated subscriber.  This module polls
 // /api/wrench_samples?since=<lastT> at ~30 Hz and only receives the
 // delta since the previous poll, so payload size is proportional to
 // the publish rate, not the window length.

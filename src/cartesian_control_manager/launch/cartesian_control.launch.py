@@ -1,7 +1,7 @@
 """Launch the Cartesian-control orchestrator + spawn FZI's controllers (inactive).
 
 Defaults are loaded from ``config/robot_config.yaml`` under
-``duco_cartesian_control:`` (via the ``common`` package) when present,
+``cartesian_control_manager:`` (via the ``common`` package) when present,
 with hard-coded fallbacks so the launch still works on a fresh checkout.
 
 The launch spawns each FZI Cartesian controller plugin into the live
@@ -15,22 +15,31 @@ loaded:
 * ``cartesian_compliance_controller``
 
 The default selection is ``cartesian_force_controller``; switch live
-via ``ros2 param set /duco_cartesian_control active_controller_name
+via ``ros2 param set /cartesian_control_manager active_controller_name
 <name>`` (must be disengaged first), or use the
 ``cartesian_controller_dashboard`` UI.
 
+The FZI controller YAML (joint names, base/EE frames, PD gains) is
+**not** shipped by this package -- it is robot-specific.  The launch
+takes a ``(fzi_controller_yaml_package, fzi_controller_yaml_relpath)``
+pair pointing into a per-robot bringup package; the path is resolved
+at launch time via ``ament_index``.
+
 Examples::
 
-    ros2 launch duco_cartesian_control cartesian_control.launch.py
-    ros2 launch duco_cartesian_control cartesian_control.launch.py \\
+    ros2 launch cartesian_control_manager cartesian_control.launch.py
+    ros2 launch cartesian_control_manager cartesian_control.launch.py \\
         active_controller_name:=cartesian_compliance_controller
+    ros2 launch cartesian_control_manager cartesian_control.launch.py \\
+        fzi_controller_yaml_package:=ur_robot_bringup \\
+        fzi_controller_yaml_relpath:=config/fzi_preset.yaml
 """
 
 import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, LogInfo
+from launch.actions import DeclareLaunchArgument, LogInfo, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -52,16 +61,24 @@ _FZI_CONTROLLERS = [
 
 _FALLBACKS = {
     # connectivity ---------------------------------------------------------
-    "wrench_topic":          "/duco_ft_sensor/wrench_compensated",
+    "wrench_topic":          "/ft_sensor/wrench_compensated",
     "joint_states_topic":    "/joint_states",
     "controller_manager_ns": "/controller_manager",
     "engaged_default":       False,
     # FZI controller wiring ------------------------------------------------
+    # Default JTC name 'joint_trajectory_controller' matches ros2_control's
+    # convention; per-robot configs override (Duco uses 'arm_1_controller',
+    # UR uses 'scaled_joint_trajectory_controller').
     "active_controller_name":  "cartesian_force_controller",
-    "fzi_jtc_controller_name": "arm_1_controller",
-    "fzi_target_frame":        "link_6",
+    "fzi_jtc_controller_name": "joint_trajectory_controller",
+    "fzi_target_frame":        "tool0",
     "fzi_target_rate_hz":      10.0,
     "fzi_service_timeout_sec": 2.0,
+    # FZI controller YAML location.  Resolved at launch time as
+    # ``get_package_share_directory(<package>) / <relpath>``.
+    # Each per-robot bringup package ships its own preset.
+    "fzi_controller_yaml_package": "duco_robot_bringup",
+    "fzi_controller_yaml_relpath": "config/fzi_preset.yaml",
     # target_wrench setpoint published by the heartbeat (fallback when
     # no external publisher is active).  Interpreted by FZI in the
     # end-effector frame (hand_frame_control:=true, default), or the
@@ -107,11 +124,11 @@ def _defaults():
         return (dict(_FALLBACKS),
                 f"FALLBACK (could not load config: "
                 f"{type(exc).__name__}: {exc})")
-    if not cfg.has("duco_cartesian_control"):
+    if not cfg.has("cartesian_control_manager"):
         return (dict(_FALLBACKS),
-                f"FALLBACK (no 'duco_cartesian_control:' section in "
+                f"FALLBACK (no 'cartesian_control_manager:' section in "
                 f"{cfg.config_path})")
-    sec = cfg.section("duco_cartesian_control")
+    sec = cfg.section("cartesian_control_manager")
     return ({k: sec.get(k, v) for k, v in _FALLBACKS.items()},
             f"loaded from {cfg.config_path}")
 
@@ -131,10 +148,18 @@ def generate_launch_description() -> LaunchDescription:
             args.append(DeclareLaunchArgument(key, default_value=str(d[key])))
 
     log = LogInfo(msg=(
-        f"[duco_cartesian_control] config: {source}; "
+        f"[cartesian_control_manager] config: {source}; "
         f"controllers={[n for n,_,_ in _FZI_CONTROLLERS]}"))
 
-    parameters = {key: LaunchConfiguration(key) for key in _FALLBACKS.keys()}
+    # Static parameter map -- the (yaml_package, yaml_relpath) pair is
+    # only used by the spawners below (not by the orchestrator node), so
+    # we strip those two entries to keep the node's parameter set lean.
+    parameters = {
+        key: LaunchConfiguration(key)
+        for key in _FALLBACKS.keys()
+        if key not in ("fzi_controller_yaml_package",
+                       "fzi_controller_yaml_relpath")
+    }
     # The orchestrator's catalogue (parallel string lists) is fixed at
     # launch time -- we always preload the three FZI controllers below,
     # so we hardcode the matching catalogue here too.
@@ -142,9 +167,9 @@ def generate_launch_description() -> LaunchDescription:
     parameters["controller_kinds"] = [k for _, k, _ in _FZI_CONTROLLERS]
 
     node = Node(
-        package="duco_cartesian_control",
+        package="cartesian_control_manager",
         executable="cartesian_control_node",
-        name="duco_cartesian_control",
+        name="cartesian_control_manager",
         output="screen",
         emulate_tty=True,
         parameters=[parameters],
@@ -154,23 +179,47 @@ def generate_launch_description() -> LaunchDescription:
     # (inactive).  Our orchestrator activates the *selected* one on
     # engage via the SwitchController service.  All three share the
     # same YAML config (controller_manager picks the section keyed by
-    # the controller's own name).
-    pkg_share = get_package_share_directory("duco_cartesian_control")
-    fzi_yaml = os.path.join(pkg_share, "config", "fzi_zero_gravity.yaml")
-    fzi_spawners = [
-        Node(
-            package="controller_manager",
-            executable="spawner",
-            arguments=[
-                name,
-                "-c", LaunchConfiguration("controller_manager_ns"),
-                "-p", fzi_yaml,
-                "-t", plugin_type,
-                "--inactive",
+    # the controller's own name).  The YAML lives in a per-robot
+    # bringup package; we resolve its absolute path at launch time.
+    def _spawn_fzi(context, *_args, **_kwargs):
+        yaml_pkg = LaunchConfiguration(
+            "fzi_controller_yaml_package").perform(context)
+        yaml_relpath = LaunchConfiguration(
+            "fzi_controller_yaml_relpath").perform(context)
+        try:
+            pkg_share = get_package_share_directory(yaml_pkg)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"[cartesian_control_manager] could not resolve FZI YAML "
+                f"package '{yaml_pkg}': {type(exc).__name__}: {exc}") from exc
+        fzi_yaml = os.path.join(pkg_share, yaml_relpath)
+        if not os.path.isfile(fzi_yaml):
+            raise RuntimeError(
+                f"[cartesian_control_manager] FZI YAML not found at "
+                f"{fzi_yaml} (resolved from package={yaml_pkg!r} "
+                f"relpath={yaml_relpath!r})")
+        return [
+            LogInfo(msg=f"[cartesian_control_manager] FZI YAML: {fzi_yaml}"),
+            *[
+                Node(
+                    package="controller_manager",
+                    executable="spawner",
+                    arguments=[
+                        name,
+                        "-c", LaunchConfiguration("controller_manager_ns"),
+                        "-p", fzi_yaml,
+                        "-t", plugin_type,
+                        "--inactive",
+                    ],
+                    output="screen",
+                )
+                for name, _kind, plugin_type in _FZI_CONTROLLERS
             ],
-            output="screen",
-        )
-        for name, _kind, plugin_type in _FZI_CONTROLLERS
-    ]
+        ]
 
-    return LaunchDescription([log, *args, *fzi_spawners, node])
+    return LaunchDescription([
+        log,
+        *args,
+        OpaqueFunction(function=_spawn_fzi),
+        node,
+    ])

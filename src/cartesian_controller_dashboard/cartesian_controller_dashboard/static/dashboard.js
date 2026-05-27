@@ -637,7 +637,7 @@
       } else {
         const why = (r.live && r.live.error) ? r.live.error : "unknown";
         msg += " -- live URDF push failed (" + why
-             + "); restart duco_robot_bringup to apply";
+             + "); restart the bringup launch to apply";
         toast("aux_frames saved (live push failed)", "warn");
       }
       $("aux-msg").textContent = msg;

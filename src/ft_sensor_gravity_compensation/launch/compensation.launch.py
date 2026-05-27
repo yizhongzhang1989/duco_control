@@ -10,8 +10,8 @@ Examples:
       enable_dashboard:=true
   ros2 launch ft_sensor_gravity_compensation compensation.launch.py port:=8101
   ros2 launch ft_sensor_gravity_compensation compensation.launch.py \\
-      input_topic:=/duco_ft_sensor/wrench_raw \\
-      output_topic:=/ft/wrench_compensated \\
+      input_topic:=/ft_sensor/wrench_raw \\
+      output_topic:=/ft_sensor/wrench_compensated \\
       sensor_frame:=ft_sensor_link
 """
 
@@ -22,10 +22,10 @@ from launch_ros.actions import Node
 
 
 _FALLBACKS = {
-    "input_topic":  "/duco_ft_sensor/wrench_raw",
-    "output_topic": "/duco_ft_sensor/wrench_compensated",
+    "input_topic":  "/ft_sensor/wrench_raw",
+    "output_topic": "/ft_sensor/wrench_compensated",
     "world_frame":  "base_link",
-    "sensor_frame": "link_6",
+    "sensor_frame": "tool0",
     "reliability":  "best_effort",
     "publish_when_no_tf": False,
     "storage_path": "~/.ros/ft_sensor_gravity_compensation/end_effectors.yaml",

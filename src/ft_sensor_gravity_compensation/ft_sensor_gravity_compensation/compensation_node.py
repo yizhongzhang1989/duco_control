@@ -12,19 +12,19 @@ Topics
 ------
 subscribes:
   ``input_topic``  geometry_msgs/WrenchStamped   raw F/T (default
-                                                  /duco_ft_sensor/wrench_raw)
+                                                  /ft_sensor/wrench_raw)
   /tf, /tf_static                                  TCP orientation (via tf2_ros)
 
 publishes:
   ``output_topic`` geometry_msgs/WrenchStamped   compensated wrench (default
-                                                  /duco_ft_sensor/wrench_compensated)
+                                                  /ft_sensor/wrench_compensated)
 
 Parameters
 ----------
-  input_topic       string  default "/duco_ft_sensor/wrench_raw"
-  output_topic      string  default "/duco_ft_sensor/wrench_compensated"
+  input_topic       string  default "/ft_sensor/wrench_raw"
+  output_topic      string  default "/ft_sensor/wrench_compensated"
   world_frame       string  default "base_link"
-  sensor_frame      string  default "link_6"
+  sensor_frame      string  default "tool0"
   reliability       string  default "best_effort"
   publish_when_no_tf bool   default False  -- if True, publish raw-minus-bias
                                               with zero gravity when /tf is
@@ -1150,10 +1150,10 @@ class CompensationNode(Node):
         super().__init__("ft_sensor_gravity_compensation")
 
         # --- parameters ---------------------------------------------------
-        self.declare_parameter("input_topic",  "/duco_ft_sensor/wrench_raw")
-        self.declare_parameter("output_topic", "/duco_ft_sensor/wrench_compensated")
+        self.declare_parameter("input_topic",  "/ft_sensor/wrench_raw")
+        self.declare_parameter("output_topic", "/ft_sensor/wrench_compensated")
         self.declare_parameter("world_frame",  "base_link")
-        self.declare_parameter("sensor_frame", "link_6")
+        self.declare_parameter("sensor_frame", "tool0")
         self.declare_parameter("reliability",  "best_effort")
         self.declare_parameter("publish_when_no_tf", False)
         self.declare_parameter(

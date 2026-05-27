@@ -1,28 +1,27 @@
 # cartesian_controller_dashboard
 
 Web dashboard for monitoring and tuning the FZI cartesian controllers
-(currently `cartesian_force_controller`) on the Duco GCR5_910 arm.
+(force / motion / compliance). Robot-agnostic: it talks to the rest
+of the stack purely over standard ROS interfaces (topics + Trigger
+services + `rcl_interfaces` parameter services).
 
 This package is a **pure UI / monitoring** layer.  It does **not**
 launch any controllers, wrench relays, or safety supervisors -- those
 responsibilities live in
-[`duco_cartesian_control`](../duco_cartesian_control).  The dashboard
-talks to the rest of the stack purely over the standard ROS interfaces
-(topics + Trigger services + the standard `rcl_interfaces` parameter
-services).
+[`cartesian_control_manager`](../cartesian_control_manager).
 
 ## What the dashboard shows / does
 
 * **Engaged / tripped status** (read from
-  `/duco_cartesian_control/state`).
-* **Live wrench** (from `/duco_ft_sensor/wrench_compensated`) with
-  per-axis readouts and a magnitude pill.
+  `/cartesian_control_manager/state`).
+* **Live wrench** (from `/ft_sensor/wrench_compensated` by default)
+  with per-axis readouts and a magnitude pill.
 * **Freshness pills** for the FT and joint_states topics.
 * **Safety thresholds** (read-only display from the orchestrator's
   state JSON).
 * **Engage / Disengage buttons** that call
-  `/duco_cartesian_control/engage` and
-  `/duco_cartesian_control/disengage` (`std_srvs/srv/Trigger`).
+  `/cartesian_control_manager/engage` and
+  `/cartesian_control_manager/disengage` (`std_srvs/srv/Trigger`).
 * **Controller parameter editor** for a curated whitelist of the
   FZI controller's gains:
   * `pd_gains.trans_x.p`, `pd_gains.trans_y.p`, `pd_gains.trans_z.p`
@@ -39,7 +38,7 @@ services).
 
 ```bash
 # Bring up the orchestrator first (the dashboard is optional).
-ros2 launch duco_cartesian_control cartesian_control_real.launch.py
+ros2 launch cartesian_control_manager cartesian_control_real.launch.py
 
 # Then launch the dashboard.
 ros2 launch cartesian_controller_dashboard dashboard.launch.py
@@ -63,10 +62,11 @@ ros2 launch cartesian_controller_dashboard dashboard.launch.py \
 
 | key | default | description |
 |---|---|---|
-| `orchestrator_ns`     | `/duco_cartesian_control` | namespace of the orchestrator (state topic + engage / disengage services) |
+| `orchestrator_ns`     | `/cartesian_control_manager` | namespace of the orchestrator (state topic + engage / disengage services) |
 | `controller_name`     | `cartesian_force_controller` | name of the FZI controller node whose parameters are edited |
-| `wrench_topic`        | `/duco_ft_sensor/wrench_compensated` | live wrench input |
+| `wrench_topic`        | `/ft_sensor/wrench_compensated` | live wrench input |
 | `joint_states_topic`  | `/joint_states` | live joint-state freshness |
+| `aux_frames_section`  | `""` | top-level `robot_config.yaml` key whose `aux_frames` list backs the "Tool frames" panel (e.g. `duco_robot_bringup`); empty disables the panel |
 | `service_timeout_sec` | `2.0` | timeout for engage / disengage / parameter calls |
 | `host`, `port`        | `0.0.0.0`, `8120` | HTTP bind address |
 
@@ -81,8 +81,8 @@ with `curl` for scripting too:
 | GET  | `/api/state`    | snapshot incl. control state, live wrench, current parameter values |
 | GET  | `/api/live`     | smaller snapshot of just the changing parts (polled at 5 Hz) |
 | GET  | `/api/params`   | current values of the tunable parameters |
-| POST | `/api/engage`   | call `/duco_cartesian_control/engage` |
-| POST | `/api/disengage`| call `/duco_cartesian_control/disengage` |
+| POST | `/api/engage`   | call `/cartesian_control_manager/engage` |
+| POST | `/api/disengage`| call `/cartesian_control_manager/disengage` |
 | POST | `/api/param`    | set a single tunable parameter; body `{"name": "...", "kind": "double|integer", "value": <number>}` |
 
 The parameter setter only accepts names from the dashboard's
@@ -93,7 +93,7 @@ through `ros2 param set` directly.
 
 ```
 +------------------------------------+    +------------------------------------+
-|  duco_cartesian_control            |    |  cartesian_force_controller (C++)  |
+|  cartesian_control_manager         |    |  FZI cartesian controller (C++)    |
 |  - publishes /state (JSON)         |    |  - rcl_interfaces parameter        |
 |  - exposes ~/engage, ~/disengage   |    |    services (get/set/list)         |
 +--------------------+---------------+    +----------------+-------------------+

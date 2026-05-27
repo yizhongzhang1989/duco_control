@@ -3,7 +3,7 @@
 <package format="3">
   <name>common</name>
   <version>0.1.0</version>
-  <description>Centralized configuration loader and workspace utilities shared by all packages in the duco_control project.</description>
+  <description>Centralised configuration loader and workspace utilities shared by all packages in the cartesian_controllers_toolkit.</description>
 
   <maintainer email="yizhongzhang1989@gmail.com">yizhongzhang</maintainer>
   <license>MIT</license>

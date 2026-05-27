@@ -5,8 +5,8 @@
   <version>0.1.0</version>
   <description>
     Web dashboard for monitoring and tuning the FZI cartesian
-    controllers (currently cartesian_force_controller). Subscribes to
-    the orchestrator's state topic (duco_cartesian_control/state),
+    controllers (force / motion / compliance). Subscribes to the
+    orchestrator's state topic (cartesian_control_manager/state),
     the live wrench, and joint_states; calls the orchestrator's
     engage/disengage Trigger services; reads and writes the
     controller's parameters (pd_gains.*, solver.*) via the standard

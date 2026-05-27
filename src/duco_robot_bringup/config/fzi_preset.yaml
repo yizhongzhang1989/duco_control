@@ -1,6 +1,13 @@
-# FZI Cartesian controllers -- shared "zero-gravity" / hold-pose preset.
+# FZI Cartesian controllers -- Duco GCR5_910 preset.
 #
-# The orchestrator pre-loads three FZI controller plugins (all inactive)
+# This file is the per-robot configuration consumed by the
+# robot-agnostic ``cartesian_control_manager`` package. The manager's
+# launch resolves the YAML path at runtime via the
+# ``fzi_controller_yaml_package`` / ``fzi_controller_yaml_relpath``
+# launch arguments (defaulting to ``duco_robot_bringup`` /
+# ``config/fzi_preset.yaml``).
+#
+# The manager pre-loads three FZI controller plugins (all inactive)
 # and switches whichever is currently selected with the JTC on engage.
 # This file is loaded into controller_manager once for each spawner;
 # controller_manager picks the section keyed by the controller's own

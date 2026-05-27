@@ -27,7 +27,7 @@ setup(
     maintainer='yizhongzhang',
     maintainer_email='yizhongzhang1989@gmail.com',
     description='Web dashboard for monitoring and tuning FZI cartesian '
-                'controllers via the duco_cartesian_control orchestrator.',
+                'controllers via the cartesian_control_manager orchestrator.',
     license='MIT',
     tests_require=['pytest'],
     entry_points={

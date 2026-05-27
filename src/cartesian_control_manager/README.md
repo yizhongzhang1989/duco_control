@@ -1,17 +1,27 @@
-# duco_cartesian_control
+# cartesian_control_manager
 
-Cartesian-controller setup + operator orchestration for the Duco
-GCR5_910 arm.  Brings up FZI's `cartesian_force_controller` in the live
+Robot-agnostic orchestrator for FZI's Cartesian controllers. Brings up
+`cartesian_force_controller`, `cartesian_motion_controller`, and
+`cartesian_compliance_controller` (all inactive at launch) in the live
 `controller_manager` and provides the operator UX (engage / disengage),
-wrench plumbing, zero-target heartbeat, and safety supervisor.
+wrench plumbing, target_wrench heartbeat, and safety supervisor.
 
 The actual Cartesian compliance hot path is a C++ `ros2_control` plugin
 from
 [yizhongzhang1989/cartesian_controllers](https://github.com/yizhongzhang1989/cartesian_controllers)
 (a fork of [fzi-forschungszentrum-informatik/cartesian_controllers](https://github.com/fzi-forschungszentrum-informatik/cartesian_controllers)),
 which runs inside `controller_manager` and writes joint position
-commands directly to the hardware interface.  This package is the glue
-that makes it usable end-to-end on the Duco arm.
+commands directly to the hardware interface.  This package is the
+operator glue that makes it usable end-to-end on any robot whose URDF
+is reachable to the FZI plugins.
+
+All robot-specific knobs (joint names, base / end-effector / FT-sensor
+frame names, JTC controller name, topic names, FZI YAML location) are
+parameters loaded from the consuming workspace's
+`config/robot_config.yaml` under `cartesian_control_manager:`. Each
+per-robot bringup package ships its own `fzi_preset.yaml` selected via
+the `fzi_controller_yaml_package` / `fzi_controller_yaml_relpath`
+launch arguments.
 
 The system runs without any dashboard; the
 [`cartesian_controller_dashboard`](../cartesian_controller_dashboard)
@@ -20,33 +30,39 @@ and calls the engage/disengage services exposed here.
 
 ## What this package does
 
-1. **Spawns** `cartesian_force_controller` into the live
-   `controller_manager` in the **inactive** state at launch
-   (using [`config/fzi_zero_gravity.yaml`](config/fzi_zero_gravity.yaml)).
-2. **Subscribes** to the gravity-compensated wrench
-   (`/duco_ft_sensor/wrench_compensated`, BEST_EFFORT) and republishes
-   it onto FZI's RELIABLE input
-   (`/cartesian_force_controller/ft_sensor_wrench`).
-3. **Publishes** a constant zero `WrenchStamped` at 10 Hz on
-   `/cartesian_force_controller/target_wrench`.  FZI's controller
-   minimises `(target - measured)`, so an identically zero target
-   means it tries to drive the operator-applied wrench to zero --
-   pure free-drive / hand-guidance.
+1. **Spawns** the FZI Cartesian controllers into the live
+   `controller_manager` in the **inactive** state at launch, loading
+   the joint/frame/PD configuration from a per-robot
+   `fzi_preset.yaml` selected via launch args.
+2. **Subscribes** to the gravity-compensated wrench (BEST_EFFORT) on
+   the topic configured via `wrench_topic` and republishes it onto
+   each FZI controller's RELIABLE input
+   `/<controller>/ft_sensor_wrench`.
+3. **Publishes** a `WrenchStamped` at `fzi_target_rate_hz` on
+   `/<controller>/target_wrench` for the force + compliance
+   controllers.  FZI's controller minimises `(target - measured)`, so
+   an identically zero target drives the operator-applied wrench to
+   zero -- pure free-drive / hand-guidance.
 4. **Exposes** `~/engage` and `~/disengage` `Trigger` services.
-   Engage atomically deactivates `arm_1_controller` (the JTC) and
-   activates `cartesian_force_controller` via
+   Engage atomically deactivates the JTC named by
+   `fzi_jtc_controller_name` and activates the FZI controller named
+   by `active_controller_name` via
    `controller_manager/switch_controller`; disengage does the reverse.
-5. **Supervises safety** at 50 Hz: stale FT or joint_states topic,
-   force-magnitude limit, torque-magnitude limit.  Any trip
-   auto-disengages and reverses the controller switch so the JTC
-   takes over and the arm holds its current pose.
+5. **Supervises safety** at `loop_rate_hz` (default 50 Hz): stale FT
+   or joint_states topic, force-magnitude limit, torque-magnitude
+   limit.  Any trip auto-disengages and reverses the controller
+   switch so the JTC takes over and the arm holds its current pose.
 6. **Publishes** orchestration state (engaged / tripped, limits,
    wired topics) as JSON on `~/state` (`std_msgs/String`,
-   `TRANSIENT_LOCAL`) at 5 Hz, plus an extra publish on every state
-   transition.  Late subscribers (such as a dashboard) see the
-   current state immediately.
+   `TRANSIENT_LOCAL`) at `state_publish_rate_hz`, plus an extra
+   publish on every state transition.  Late subscribers (such as a
+   dashboard) see the current state immediately.
 
-## Quick start (real hardware)
+## Quick start (real hardware -- example on Duco GCR5_910)
+
+The Duco workspace ships an `fzi_preset.yaml` under `duco_robot_bringup`,
+so the manager's default launch args resolve to it without further
+configuration.
 
 ```bash
 # Terminal 1 -- bringup
@@ -58,16 +74,22 @@ ros2 launch duco_ft_sensor ft_sensor.launch.py
 ros2 launch ft_sensor_gravity_compensation compensation.launch.py
 
 # Terminal 3 -- this orchestrator (with conservative real-HW limits)
-ros2 launch duco_cartesian_control cartesian_control_real.launch.py
+ros2 launch cartesian_control_manager cartesian_control_real.launch.py
 
 # Terminal 4 -- engage / disengage
-ros2 service call /duco_cartesian_control/engage    std_srvs/srv/Trigger
-ros2 service call /duco_cartesian_control/disengage std_srvs/srv/Trigger
+ros2 service call /cartesian_control_manager/engage    std_srvs/srv/Trigger
+ros2 service call /cartesian_control_manager/disengage std_srvs/srv/Trigger
 
 # (optional) Terminal 5 -- web dashboard
 ros2 launch cartesian_controller_dashboard dashboard.launch.py
 # -> opens at http://<host>:8120/
 ```
+
+For other robots, override the FZI YAML location via launch args, e.g.::
+
+    ros2 launch cartesian_control_manager cartesian_control.launch.py \\
+        fzi_controller_yaml_package:=ur_robot_bringup \\
+        fzi_controller_yaml_relpath:=config/fzi_preset.yaml
 
 For lab / fake-hardware bring-up use `cartesian_control.launch.py`
 instead (no conservative-limit overlay).
@@ -92,16 +114,16 @@ Auto-disengage trips:
 
 ## State topic
 
-`/duco_cartesian_control/state` (`std_msgs/String`, JSON):
+`/cartesian_control_manager/state` (`std_msgs/String`, JSON):
 
 ```json
 {
   "engaged": false,
   "trip_reason": "",
-  "wrench_topic": "/duco_ft_sensor/wrench_compensated",
+  "wrench_topic": "/ft_sensor/wrench_compensated",
   "joint_states_topic": "/joint_states",
   "fzi_controller": "cartesian_force_controller",
-  "fzi_jtc": "arm_1_controller",
+  "fzi_jtc": "joint_trajectory_controller",
   "fzi_ft_topic": "/cartesian_force_controller/ft_sensor_wrench",
   "fzi_target_topic": "/cartesian_force_controller/target_wrench",
   "controller_manager_ns": "/controller_manager",
@@ -156,24 +178,24 @@ The same parameters can be edited from the
 ## Configuration
 
 Defaults are loaded from `config/robot_config.yaml` under the
-`duco_cartesian_control:` key (see
+`cartesian_control_manager:` key (see
 `config/robot_config.example.yaml` for the schema).  Anything declared
 in the launch file's `_FALLBACKS` can be overridden from the CLI as
 well.
 
 | key | default | description |
 |---|---|---|
-| `wrench_topic`               | `/duco_ft_sensor/wrench_compensated` | input wrench (BEST_EFFORT) |
+| `wrench_topic`               | `/ft_sensor/wrench_compensated` | input wrench (BEST_EFFORT) |
 | `joint_states_topic`         | `/joint_states` | joint state for staleness + engage gate |
 | `controller_manager_ns`      | `/controller_manager` | where switch_controller lives |
 | `engaged_default`            | `false` | auto-engage on first complete state |
-| `fzi_controller_name`        | `cartesian_force_controller` | name registered in controller_manager |
-| `fzi_jtc_controller_name`    | `arm_1_controller` | the JTC to swap with |
-| `fzi_ft_topic`               | `/cartesian_force_controller/ft_sensor_wrench` | FZI's RELIABLE wrench input |
-| `fzi_target_topic`           | `/cartesian_force_controller/target_wrench` | FZI's setpoint topic |
-| `fzi_target_frame`           | `link_6` | `header.frame_id` for the zero-target heartbeat |
+| `active_controller_name`     | `cartesian_force_controller` | FZI controller engaged on `~/engage` |
+| `fzi_jtc_controller_name`    | `joint_trajectory_controller` | the JTC to swap with (per-robot) |
+| `fzi_target_frame`           | `tool0` | `header.frame_id` for the target_wrench heartbeat |
 | `fzi_target_rate_hz`         | `10.0` | heartbeat rate |
 | `fzi_service_timeout_sec`    | `2.0` | switch_controller call timeout |
+| `fzi_controller_yaml_package` | `duco_robot_bringup` | ament package that ships the FZI YAML |
+| `fzi_controller_yaml_relpath` | `config/fzi_preset.yaml` | path within that package |
 | `loop_rate_hz`               | `50.0` | safety-supervisor tick rate (NOT the FZI hot path) |
 | `state_publish_rate_hz`      | `5.0`  | rate at which the state topic is heartbeated |
 | `max_wrench_force`           | `80.0`  N | trip threshold |
@@ -186,33 +208,33 @@ well.
 
 ```
 +---------------------+       +-----------------------+       +----------------------+
-|  duco_ft_sensor     |  --   ft_sensor_gravity_-     |  --   wrench_compensated     |
-|  (raw ~960 Hz)      |       compensation            |       (BEST_EFFORT)          |
+|  FT sensor driver   |  --   ft_sensor_gravity_-     |  --   wrench_compensated     |
+|  (raw, robot-       |       compensation            |       (BEST_EFFORT)          |
+|   specific)         |       (robot-agnostic)        |                              |
 +---------------------+       +-----------------------+       +----------+-----------+
                                                                           |
                                                   this node relays it     |
                                                           (RELIABLE)      v
 +----------------------------------+   <- BEST_EFFORT  ----------------------------+
-|  duco_cartesian_control          |   ROS subscriber                              |
-|  (orchestrator + supervisor)     |   ROS publisher  -> /cartesian_force_-        |
-|  - engage / disengage Trigger    |                     controller/ft_sensor_-    |
-|  - state topic (JSON)            |                     wrench (RELIABLE)         |
+|  cartesian_control_manager       |   ROS subscriber                              |
+|  (orchestrator + supervisor)     |   ROS publisher  -> /<controller>/            |
+|  - engage / disengage Trigger    |                     ft_sensor_wrench          |
+|  - state topic (JSON)            |                     (RELIABLE)                |
 |  - safety trips @ 50 Hz          |                                               |
-|  - target_wrench=0 @ 10 Hz       |   +--------------------------------------+    |
-+------+---------------------------+   |  cartesian_force_controller (C++)    |    |
+|  - target_wrench @ heartbeat     |   +--------------------------------------+    |
++------+---------------------------+   |  FZI cartesian controllers (C++)     |    |
        | switch_controller (sync)      |  - forward-dynamics solver           |    |
        v                               |  - writes joint *position*           |    |
 +----------------------------+         |    commands directly to hardware     |    |
 |  controller_manager        |  <----  +-------------------+------------------+    |
-|  - arm_1_controller (JTC)  |  active <-> inactive (atomic switch on engage)      |
-|  - cartesian_force_-       |                                                     |
-|    controller (FZI)        |                                                     |
+|  - <robot> JTC             |  active <-> inactive (atomic switch on engage)      |
+|  - FZI controllers         |                                                     |
 +----------------------------+                                                     |
        |                                                                           |
-       v   joint_position_command (250 Hz)                                         |
+       v   joint_position_command                                                  |
 +----------------------------+                                                     |
-|  duco_hardware             |                                                     |
-|  (DucoHardwareInterface)   |                                                     |
+|  Robot HardwareInterface   |                                                     |
+|  (vendor-specific)         |                                                     |
 +----------------------------+                                                     |
 ```
 
@@ -229,7 +251,7 @@ Implementation notes:
 ## Testing
 
 ```bash
-cd src/duco_cartesian_control
+cd src/cartesian_control_manager
 python3 -m pytest test/ -v
 ```
 
@@ -455,9 +477,9 @@ ros2 param set /cartesian_force_controller solver.error_scale 0.05
 ros2 param set /cartesian_force_controller hand_frame_control true
 ```
 
-All of these can also be set persistently in
-[`config/fzi_zero_gravity.yaml`](config/fzi_zero_gravity.yaml) under
-the `cartesian_force_controller:` block; live changes via
+All of these can also be set persistently in your robot's
+`fzi_preset.yaml` (e.g. `duco_robot_bringup/config/fzi_preset.yaml`)
+under the `cartesian_force_controller:` block; live changes via
 `SetParameters` survive only until the controller is unloaded.
 
 #### What the force controller does *not* do

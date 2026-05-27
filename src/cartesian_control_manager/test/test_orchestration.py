@@ -26,7 +26,7 @@ from typing import Any, List, Optional
 # a real ROS test environment, so the import always succeeds.
 from controller_manager_msgs.srv import SwitchController  # type: ignore
 
-from duco_cartesian_control.control_node import CartesianControlNode
+from cartesian_control_manager.control_node import CartesianControlNode
 
 
 # --- helpers ---------------------------------------------------------------
@@ -87,7 +87,7 @@ def _make_stub() -> SimpleNamespace:
     # disengage / trip).
     stub._active_controller_name = "cartesian_force_controller"
     stub._engaged_controller_name = ""
-    stub._fzi_jtc_controller_name = "arm_1_controller"
+    stub._fzi_jtc_controller_name = "joint_trajectory_controller"
     stub._fzi_service_timeout = 0.5
     stub._fzi_switch_cli = DummyClient()
     # Bind real (unbound) methods from CartesianControlNode onto the stub.
@@ -196,7 +196,7 @@ def test_switch_to_fzi_sync_targets_correct_controllers():
     ok, _ = stub._switch_to_fzi_sync()
     assert ok is True
     assert captured[0].activate_controllers == ["cartesian_force_controller"]
-    assert captured[0].deactivate_controllers == ["arm_1_controller"]
+    assert captured[0].deactivate_controllers == ["joint_trajectory_controller"]
 
 
 def test_switch_to_jtc_sync_targets_correct_controllers():
@@ -210,7 +210,7 @@ def test_switch_to_jtc_sync_targets_correct_controllers():
     stub._engaged_controller_name = "cartesian_force_controller"
     ok, _ = stub._switch_to_jtc_sync()
     assert ok is True
-    assert captured[0].activate_controllers == ["arm_1_controller"]
+    assert captured[0].activate_controllers == ["joint_trajectory_controller"]
     assert captured[0].deactivate_controllers == ["cartesian_force_controller"]
 
 
@@ -227,7 +227,7 @@ def test_switch_to_fzi_sync_uses_active_controller_name():
     assert ok is True
     assert captured[0].activate_controllers == [
         "cartesian_compliance_controller"]
-    assert captured[0].deactivate_controllers == ["arm_1_controller"]
+    assert captured[0].deactivate_controllers == ["joint_trajectory_controller"]
 
 
 def test_switch_to_jtc_sync_falls_back_to_active_when_idle():

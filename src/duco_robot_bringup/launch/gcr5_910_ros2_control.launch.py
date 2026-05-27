@@ -116,7 +116,7 @@ def _launch_setup(context, *args, **kwargs):
 
     # Lazy import: surfaces any import error at launch time, not at
     # module import time of this launch file (which would mask it).
-    from duco_robot_bringup.urdf_loader import augment_urdf, run_xacro
+    from common.urdf_loader import augment_urdf, run_xacro
 
     aux_frames = _load_aux_frames()
     urdf_xml = run_xacro(

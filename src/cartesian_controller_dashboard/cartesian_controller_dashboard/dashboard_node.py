@@ -2,19 +2,19 @@
 
 This node is a **pure UI / monitoring** layer.  It does **not** launch
 any controllers, run a wrench relay, or perform safety supervision --
-those responsibilities live in :package:`duco_cartesian_control`.
+those responsibilities live in :package:`cartesian_control_manager`.
 
 Responsibilities
 ----------------
 
-* subscribe to ``/duco_cartesian_control/state`` (JSON status from the
+* subscribe to ``/cartesian_control_manager/state`` (JSON status from the
   orchestrator) so the dashboard reflects engaged/tripped state and
   the orchestrator's safety thresholds;
 * subscribe to the live wrench topic and to ``/joint_states`` so the
   dashboard can show fresh data and freshness pills even before the
   orchestrator publishes its first state;
-* call ``/duco_cartesian_control/engage`` and
-  ``/duco_cartesian_control/disengage`` (``std_srvs/srv/Trigger``) when
+* call ``/cartesian_control_manager/engage`` and
+  ``/cartesian_control_manager/disengage`` (``std_srvs/srv/Trigger``) when
   the operator clicks a button;
 * read and write a curated list of parameters on the FZI Cartesian
   controller (e.g. ``cartesian_force_controller``) using the standard
@@ -57,7 +57,7 @@ from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 
 # `common.config_manager` exposes the project's robot_config.yaml.  The
-# dashboard's "Tool frames" editor reads `duco_robot_bringup.aux_frames`
+# dashboard's "Tool frames" editor reads `<bringup>.aux_frames`
 # from the resolved config and writes back via the line-based
 # `save_aux_frames` helper (which preserves comments).  Imported with a
 # soft fallback so the dashboard still starts in environments where
@@ -76,13 +76,13 @@ except Exception as _exc:  # noqa: BLE001
     _save_aux_frames = None  # type: ignore
     _COMMON_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
 
-# ``duco_robot_bringup.urdf_loader.update_aux_frames`` rewrites the
+# ``common.urdf_loader.update_aux_frames`` rewrites the
 # ``<origin>`` of existing aux-frame joints in a URDF string, returning
 # a new URDF that can be pushed to ``robot_state_publisher`` via
 # SetParameters for live tool-frame updates.  Soft-imported for the
 # same reason as ``common.config_manager`` above.
 try:
-    from duco_robot_bringup.urdf_loader import (  # type: ignore
+    from common.urdf_loader import (  # type: ignore
         update_aux_frames as _update_aux_frames,
     )
     _URDF_LOADER_IMPORT_ERROR: Optional[str] = None
@@ -206,7 +206,8 @@ _BASE_TUNABLES: List[Tuple[str, str]] = [
     ("pd_gains.rot_z.p",   "double"),
     # D (damping of de/dt; sized against the spring loop for compliance,
     # against FT-sensor noise for the force controller -- see
-    # src/duco_cartesian_control/config/fzi_zero_gravity.yaml header).
+    # the per-robot fzi_preset.yaml header (e.g.
+    # src/duco_robot_bringup/config/fzi_preset.yaml).
     ("pd_gains.trans_x.d", "double"),
     ("pd_gains.trans_y.d", "double"),
     ("pd_gains.trans_z.d", "double"),
@@ -234,8 +235,8 @@ _TUNABLES_BY_KIND: Dict[str, List[Tuple[str, str]]] = {
 # ---------------------------------------------------------------------------
 # orchestrator safety thresholds editable from the dashboard.
 #
-# These parameters live on the ``/duco_cartesian_control`` node (see
-# :class:`duco_cartesian_control.control_node.CartesianControlNode`) and
+# These parameters live on the ``/cartesian_control_manager`` node (see
+# :class:`cartesian_control_manager.control_node.CartesianControlNode`) and
 # already accept live parameter updates -- the orchestrator validates
 # they are non-negative and refuses changes that would interrupt the
 # safety supervisor's invariants.  The dashboard simply forwards a
@@ -256,8 +257,8 @@ _SAFETY_THRESHOLD_NAMES = {n for (n, _k, _u) in _SAFETY_THRESHOLDS}
 # ---------------------------------------------------------------------------
 # target_wrench setpoint editable from the dashboard (force-controller UI).
 #
-# These six parameters live on the ``/duco_cartesian_control`` node (see
-# :class:`duco_cartesian_control.control_node.CartesianControlNode`) --
+# These six parameters live on the ``/cartesian_control_manager`` node (see
+# :class:`cartesian_control_manager.control_node.CartesianControlNode`) --
 # the orchestrator publishes them at a configurable heartbeat rate to
 # every FZI controller's ``/<ctrl>/target_wrench`` topic.  With all six
 # set to 0 the force controller gives pure free-drive (hand-guidance);
@@ -594,7 +595,7 @@ class DashboardNode(Node):
 
     _PARAM_DECLARATIONS: List[Tuple[str, object]] = [
         # connectivity ---------------------------------------------------
-        ("orchestrator_ns",  "/duco_cartesian_control"),
+        ("orchestrator_ns",  "/cartesian_control_manager"),
         # Catalogue of FZI controller node names this dashboard knows
         # how to talk to.  Must match the orchestrator's
         # ``available_controllers`` list (this is the *fallback* for
@@ -605,7 +606,7 @@ class DashboardNode(Node):
             "cartesian_compliance_controller",
         ]),
         ("default_controller_name",  "cartesian_force_controller"),
-        ("wrench_topic",     "/duco_ft_sensor/wrench_compensated"),
+        ("wrench_topic",     "/ft_sensor/wrench_compensated"),
         ("joint_states_topic", "/joint_states"),
         # Fully-qualified name (relative to root, with leading slash) of
         # the gravity-compensation node whose ``force_deadband`` /
@@ -622,13 +623,20 @@ class DashboardNode(Node):
         # actual frames via ``_resolve_active_frames()`` so they
         # automatically track whatever the FZI YAML configured.  The
         # default ``compliance_link`` matches the EE tip declared in
-        # ``config/fzi_zero_gravity.yaml`` and ``aux_frames`` in
+        # the per-robot ``fzi_preset.yaml`` and ``aux_frames`` in
         # ``config/robot_config.yaml``; if the dashboard is launched
         # before the controllers, jog will use these defaults until
         # the parameters become available.
         ("base_frame", "base_link"),
         ("tool_frame", "compliance_link"),
         ("service_timeout_sec", 2.0),
+        # Top-level YAML key in ``robot_config.yaml`` whose
+        # ``aux_frames`` list the dashboard's "Tool frames" panel
+        # reads / writes.  Empty string disables the panel (the
+        # API returns a clear error).  Per-robot workspaces should
+        # set this to their bringup package name (e.g.
+        # ``duco_robot_bringup``).
+        ("aux_frames_section", ""),
         # http -----------------------------------------------------------
         ("host", "0.0.0.0"),
         ("port", 8120),
@@ -662,6 +670,7 @@ class DashboardNode(Node):
         self._base_frame = str(gp("base_frame")).strip("/")
         self._tool_frame = str(gp("tool_frame")).strip("/")
         self._service_timeout = float(gp("service_timeout_sec"))
+        self._aux_frames_section = str(gp("aux_frames_section")).strip()
         self._host = str(gp("host"))
         self._port = int(gp("port"))
 
@@ -807,7 +816,7 @@ class DashboardNode(Node):
         # Used by the "Tool frames" editor to push an updated
         # ``robot_description`` URDF when the operator saves aux-frame
         # offsets, so the static TF tree refreshes live without
-        # restarting ``duco_robot_bringup`` (rsp re-parses the URDF and
+        # restarting the bringup launch (rsp re-parses the URDF and
         # re-publishes ``/tf_static`` with the new offsets).  The name
         # ``/robot_state_publisher`` is the standard one for
         # ROS 2 Humble; if a remap is ever introduced this client will
@@ -998,7 +1007,7 @@ class DashboardNode(Node):
         """Issue ``call_async`` and block until done or timeout.
 
         Mirrors the orchestrator's helper -- see
-        :class:`duco_cartesian_control.control_node.CartesianControlNode`.
+        :class:`cartesian_control_manager.control_node.CartesianControlNode`.
         """
         if not client.wait_for_service(timeout_sec=min(0.5, timeout_s)):
             return None
@@ -1017,7 +1026,7 @@ class DashboardNode(Node):
     def _trigger(self, client, kind: str) -> Dict[str, Any]:
         if not client.wait_for_service(timeout_sec=0.2):
             raise RuntimeError(
-                f"{kind} service unavailable -- is duco_cartesian_control "
+                f"{kind} service unavailable -- is cartesian_control_manager "
                 "running?")
         resp = self._service_call_sync(
             client, Trigger.Request(), self._service_timeout)
@@ -1441,7 +1450,7 @@ class DashboardNode(Node):
             "control_state_age": ctl_age,
             "thresholds":      items,
             "message": ("orchestrator-owned safety limits "
-                        "(/duco_cartesian_control); live-tunable; "
+                        "(/cartesian_control_manager); live-tunable; "
                         "trips disengage the FZI controller"),
         }
 
@@ -1506,7 +1515,7 @@ class DashboardNode(Node):
             "results": results,
             "message": (
                 f"applied {successful}/{len(results)} threshold(s) "
-                "to /duco_cartesian_control" if ok else
+                "to /cartesian_control_manager" if ok else
                 f"orchestrator rejected {len(results) - successful}/"
                 f"{len(results)} threshold(s)"
             ),
@@ -1566,7 +1575,7 @@ class DashboardNode(Node):
             "max_wrench_torque": max_t,
             "axes":            items,
             "message": ("orchestrator-owned target_wrench setpoint "
-                        "(/duco_cartesian_control); republished to every "
+                        "(/cartesian_control_manager); republished to every "
                         "FZI controller's target_wrench topic at the "
                         "heartbeat rate"),
         }
@@ -1629,7 +1638,7 @@ class DashboardNode(Node):
             "results": results,
             "message": (
                 f"applied {successful}/{len(results)} axis(es) "
-                "to /duco_cartesian_control" if ok else
+                "to /cartesian_control_manager" if ok else
                 f"orchestrator rejected {len(results) - successful}/"
                 f"{len(results)} axis(es)"
             ),
@@ -2094,11 +2103,12 @@ class DashboardNode(Node):
     # without editing YAML by hand.  Changes are persisted to
     # ``config/robot_config.yaml`` via the line-targeted
     # ``common.config_manager.save_aux_frames`` helper which preserves
-    # comments and unrelated keys; they take effect on the next
-    # ``duco_robot_bringup`` launch.
+    # comments and unrelated keys; they take effect on the next robot
+    # bringup.  The top-level YAML key that owns the list is set by
+    # the ``aux_frames_section`` parameter (per-robot configuration).
     #
     # Adding, renaming, or removing aux_frames is intentionally NOT
-    # exposed -- those edits ripple into ``fzi_zero_gravity.yaml``
+    # exposed -- those edits ripple into the per-robot ``fzi_preset.yaml``
     # (which names a specific end-effector link in the KDL chain), so
     # operators do them by hand.
     def api_get_aux_frames(self) -> Dict[str, Any]:
@@ -2107,11 +2117,17 @@ class DashboardNode(Node):
             raise RuntimeError(
                 "common.config_manager not importable: "
                 f"{_COMMON_IMPORT_ERROR}")
+        if not self._aux_frames_section:
+            raise RuntimeError(
+                "aux_frames panel disabled: "
+                "set the 'aux_frames_section' parameter to the "
+                "top-level robot_config.yaml key that owns the "
+                "aux_frames list (e.g. the bringup package name)")
         cfg = _get_config()
         config_path = cfg.config_path
         if not config_path:
             raise RuntimeError("config_manager has not resolved a path")
-        frames = _read_aux_frames(config_path)
+        frames = _read_aux_frames(config_path, self._aux_frames_section)
         return {
             "ok":            True,
             "config_path":   config_path,
@@ -2141,6 +2157,12 @@ class DashboardNode(Node):
             raise RuntimeError(
                 "common.config_manager not importable: "
                 f"{_COMMON_IMPORT_ERROR}")
+        if not self._aux_frames_section:
+            raise RuntimeError(
+                "aux_frames panel disabled: "
+                "set the 'aux_frames_section' parameter to the "
+                "top-level robot_config.yaml key that owns the "
+                "aux_frames list (e.g. the bringup package name)")
         if not isinstance(body, dict):
             raise RuntimeError("body must be a JSON object")
         frames_in = body.get("frames")
@@ -2186,13 +2208,14 @@ class DashboardNode(Node):
             raise RuntimeError("config_manager has not resolved a path")
 
         try:
-            updated = _save_aux_frames(config_path, updates)
+            updated = _save_aux_frames(config_path, updates,
+                                       self._aux_frames_section)
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(
                 f"failed to save aux_frames: {exc}") from exc
 
         # ---- Live update: push the rebuilt URDF to rsp so /tf_static
-        # refreshes without restarting duco_robot_bringup.  Best-effort:
+        # refreshes without restarting the bringup.  Best-effort:
         # any failure here is reported in the response but does not
         # roll back the yaml save (the file edit is the source of truth
         # for the next launch).
@@ -2215,7 +2238,7 @@ class DashboardNode(Node):
                             "needed).")
         else:
             message = (f"saved to yaml, but live URDF push failed: "
-                       f"{live['error']}. Restart duco_robot_bringup "
+                       f"{live['error']}. Restart the bringup launch "
                        f"to apply the change.")
 
         return {
@@ -2243,7 +2266,7 @@ class DashboardNode(Node):
         if _update_aux_frames is None or _read_aux_frames is None:
             return {
                 "ok":    False,
-                "error": ("duco_robot_bringup.urdf_loader not "
+                "error": ("common.urdf_loader not "
                           f"importable: {_URDF_LOADER_IMPORT_ERROR}"),
             }
 
@@ -2268,7 +2291,7 @@ class DashboardNode(Node):
         if not config_path:
             return {"ok": False, "error": "config path not resolved"}
         try:
-            frames = _read_aux_frames(config_path)
+            frames = _read_aux_frames(config_path, self._aux_frames_section)
         except Exception as exc:  # noqa: BLE001
             return {"ok": False,
                     "error": f"could not re-read aux_frames: {exc}"}

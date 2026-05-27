@@ -5,9 +5,11 @@
   <version>0.1.0</version>
   <description>
     Gravity-compensated wrench publisher and web-based calibration dashboard
-    for the Duco F/T sensor. Subtracts tool weight (mass + center of mass)
+    for a 6-axis F/T sensor. Subtracts tool weight (mass + center of mass)
     and bias from the raw wrench using the live TCP orientation from /tf.
     Supports multiple end-effector configurations with live switching.
+    Robot-agnostic: the input topic, output topic, world frame and sensor
+    frame are all parameters.
   </description>
 
   <maintainer email="yizhongzhang1989@gmail.com">yizhongzhang</maintainer>

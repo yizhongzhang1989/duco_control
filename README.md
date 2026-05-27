@@ -22,7 +22,7 @@ dashboards.
 | [`duco_ft_sensor`](src/duco_ft_sensor) | serial driver + ROS publisher for the Duco F/T sensor | -- |
 | [`ft_sensor_dashboard`](src/ft_sensor_dashboard) | optional web UI for any `WrenchStamped` topic | `8080` |
 | [`ft_sensor_gravity_compensation`](src/ft_sensor_gravity_compensation) | subscribes to the raw wrench + `/tf`, publishes a gravity-compensated wrench, has its own calibration UI | `8100` |
-| [`duco_cartesian_control`](src/duco_cartesian_control) | spawns FZI's `cartesian_force_controller` / `cartesian_motion_controller` / `cartesian_compliance_controller` (all inactive), relays the wrench, publishes a zero target_wrench heartbeat, runs the engage / disengage Trigger services and a safety supervisor | -- |
+| [`cartesian_control_manager`](src/cartesian_control_manager) | spawns FZI's `cartesian_force_controller` / `cartesian_motion_controller` / `cartesian_compliance_controller` (all inactive), relays the wrench, publishes a zero target_wrench heartbeat, runs the engage / disengage Trigger services and a safety supervisor | -- |
 | [`cartesian_controller_dashboard`](src/cartesian_controller_dashboard) | optional web UI for engage / disengage, controller selection (force / motion / compliance), and live-tuning of the active controller's gains | `8120` |
 | [`duco_dashboard`](src/duco_dashboard) | optional web UI for joint / controller / TCP state | `8090` |
 | [`alicia_teleop`](src/alicia_teleop) | leader-follower teleop bridge: maps Alicia-D joint angles to the Duco follower with a per-joint velocity- and acceleration-limited interpolator; auto-switches `arm_1_controller` ↔ `forward_position_controller` at launch / shutdown | -- |
@@ -52,7 +52,7 @@ Key knobs:
   `false` only when the controller IP is reachable.
 * `duco_robot_bringup.duco_ip`, `duco_port` -- the Duco controller endpoint.
 * `duco_ft_sensor.port`, `baud` -- serial device for the F/T sensor.
-* `duco_cartesian_control.max_wrench_force`, `max_wrench_torque`,
+* `cartesian_control_manager.max_wrench_force`, `max_wrench_torque`,
   `engage_max_joint_velocity` -- safety supervisor trip thresholds.
 * `duco_robot_bringup.aux_frames` -- list of fixed-joint TF frames the
   bringup appends to the URDF (default chain
@@ -142,7 +142,7 @@ calibration UI on port `8100`.
 
 ```bash
 # Conservative real-HW limits + dashboard-friendly defaults.
-ros2 launch duco_cartesian_control cartesian_control_real.launch.py
+ros2 launch cartesian_control_manager cartesian_control_real.launch.py
 ```
 
 This:
@@ -165,7 +165,7 @@ This:
   the dashboard's dropdown -- locked while engaged),
 * runs a 50 Hz safety supervisor that auto-disengages on stale topics
   or wrench / torque limit violation,
-* publishes a JSON status snapshot on `/duco_cartesian_control/state`
+* publishes a JSON status snapshot on `/cartesian_control_manager/state`
   (`std_msgs/String`, RELIABLE + TRANSIENT_LOCAL) including the
   catalogue, the current `active_controller`, and the
   `engaged_controller`.
@@ -184,9 +184,9 @@ ros2 control list_controllers
 # cartesian_compliance_controller   inactive
 ros2 topic hz /cartesian_force_controller/ft_sensor_wrench
 ros2 topic hz /cartesian_force_controller/target_wrench   # ~10 Hz
-ros2 service list | grep duco_cartesian_control
+ros2 service list | grep cartesian_control_manager
 # Switch which controller engage will activate (only while idle):
-ros2 param set /duco_cartesian_control active_controller_name \\
+ros2 param set /cartesian_control_manager active_controller_name \\
     cartesian_compliance_controller
 ```
 
@@ -229,8 +229,8 @@ efforts, controller list, TCP pose, latest wrench.
 Either click the dashboard buttons, or use the CLI:
 
 ```bash
-ros2 service call /duco_cartesian_control/engage    std_srvs/srv/Trigger
-ros2 service call /duco_cartesian_control/disengage std_srvs/srv/Trigger
+ros2 service call /cartesian_control_manager/engage    std_srvs/srv/Trigger
+ros2 service call /cartesian_control_manager/disengage std_srvs/srv/Trigger
 ```
 
 Engage preconditions: at least one wrench + one joint_states have
@@ -268,19 +268,19 @@ orchestrator publishes these six values at `fzi_target_rate_hz`
 
 ```bash
 # Apply +10 N along the EE +Z axis (e.g. press into a surface).
-ros2 param set /duco_cartesian_control target_wrench_force_z 10.0
+ros2 param set /cartesian_control_manager target_wrench_force_z 10.0
 
 # Zero everything (pure free-drive again).
 for ax in x y z; do
-  ros2 param set /duco_cartesian_control target_wrench_force_$ax  0.0
-  ros2 param set /duco_cartesian_control target_wrench_torque_$ax 0.0
+  ros2 param set /cartesian_control_manager target_wrench_force_$ax  0.0
+  ros2 param set /cartesian_control_manager target_wrench_torque_$ax 0.0
 done
 ```
 
 These six params can also be set as launch overrides:
 
 ```bash
-ros2 launch duco_cartesian_control cartesian_control_real.launch.py \
+ros2 launch cartesian_control_manager cartesian_control_real.launch.py \
     target_wrench_force_z:=10.0
 ```
 
@@ -292,7 +292,7 @@ message, and forwards it to FZI immediately (no rate limiting):
 
 ```bash
 # Launch with the SpaceMouse topic wired in:
-ros2 launch duco_cartesian_control cartesian_control_real.launch.py \
+ros2 launch cartesian_control_manager cartesian_control_real.launch.py \
     external_target_wrench_topic:=/spacemouse/target_wrench \
     external_target_wrench_timeout_sec:=0.2
 
@@ -320,7 +320,7 @@ you unless you publish at >10 Hz **and** keep
 ros2 topic echo /cartesian_force_controller/target_wrench
 
 # Orchestrator status (engaged, active controller, last external age):
-ros2 topic echo /duco_cartesian_control/state --once
+ros2 topic echo /cartesian_control_manager/state --once
 ```
 
 Sign conventions on the GCR5_910 with the default URDF: EE +Z points
@@ -330,7 +330,7 @@ means "press the tool tip into the surface in front of it".
 > Tuning note: holding a steady non-zero wrench against a **rigid**
 > surface is governed by the force-control loop gain
 > (`pd_gains.*.p × solver.error_scale`).  The packaged defaults in
-> [`config/fzi_zero_gravity.yaml`](src/duco_cartesian_control/config/fzi_zero_gravity.yaml)
+> [`config/fzi_preset.yaml`](src/duco_robot_bringup/config/fzi_preset.yaml)
 > are tuned for stable rigid contact.  See
 > [Live tuning of the FZI controller](#live-tuning-of-the-fzi-controller)
 > if you need to trade some contact stability for snappier free-drive
@@ -404,7 +404,7 @@ For a contained sanity check without the real Duco controller:
 ```bash
 # In config/robot_config.yaml: duco_robot_bringup.use_fake_hardware: true
 ros2 launch duco_robot_bringup gcr5_910_ros2_control.launch.py use_rviz:=false
-ros2 launch duco_cartesian_control cartesian_control.launch.py
+ros2 launch cartesian_control_manager cartesian_control.launch.py
 ros2 launch cartesian_controller_dashboard dashboard.launch.py     # optional
 ```
 
@@ -432,7 +432,7 @@ ros2 param set /cartesian_force_controller solver.iterations  5
 ```
 
 The packaged defaults
-([`config/fzi_zero_gravity.yaml`](src/duco_cartesian_control/config/fzi_zero_gravity.yaml))
+([`config/fzi_preset.yaml`](src/duco_robot_bringup/config/fzi_preset.yaml))
 are deliberately conservative; on the GCR5_910 the working values felt
 around `pd_gains.trans p = 0.2`, `error_scale = 0.05`.
 
@@ -453,7 +453,7 @@ around `pd_gains.trans p = 0.2`, `error_scale = 0.05`.
                                               relayed by      |
                                               orchestrator    v
 +--------------------------------------+    +-----------------+-------------+
-| duco_cartesian_control               |    | cartesian_force_controller    |
+| cartesian_control_manager            |    | cartesian_force_controller    |
 |  - spawns + engages FZI controller   |--->|  (C++ ros2_control plugin)    |
 |  - wrench relay (BEST -> RELIABLE)   |    |  - forward-dynamics solver    |
 |  - target_wrench=0 @ 10 Hz           |    |  - writes joint *position*    |
@@ -471,7 +471,7 @@ around `pd_gains.trans p = 0.2`, `error_scale = 0.05`.
 +-------------------+ +----------------+             +---------------------+
 ```
 
-`duco_cartesian_control` is the only project-owned node that talks to
+`cartesian_control_manager` is the only project-owned node that talks to
 `controller_manager`'s `switch_controller` service.  All UIs (dashboards)
 talk through standard topics + Trigger services, so they're optional and
 swappable.
@@ -494,7 +494,7 @@ duco_control/
 │   ├── duco_ft_sensor/
 │   ├── ft_sensor_dashboard/
 │   ├── ft_sensor_gravity_compensation/
-│   ├── duco_cartesian_control/
+│   ├── cartesian_control_manager/
 │   ├── cartesian_controller_dashboard/
 │   ├── duco_dashboard/
 │   ├── alicia_teleop/                # leader -> follower teleop bridge
@@ -509,11 +509,11 @@ duco_control/
 Each Python package has its own `test/` directory:
 
 ```bash
-colcon test --packages-select duco_cartesian_control cartesian_controller_dashboard
+colcon test --packages-select cartesian_control_manager cartesian_controller_dashboard
 colcon test-result --verbose
 ```
 
-The `duco_cartesian_control` orchestration suite stubs out the rclpy
+The `cartesian_control_manager` orchestration suite stubs out the rclpy
 service-client API and verifies the controller-switch logic
 (request shape, timeout / failure handling, controller-name routing);
 the full engage flow is covered by end-to-end runs on the real arm.

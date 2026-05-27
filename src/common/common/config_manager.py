@@ -1,4 +1,4 @@
-"""Centralized configuration loader for the duco_control project.
+"""Centralized configuration loader for cartesian_controllers_toolkit.
 
 Reads ``config/robot_config.yaml`` (or, if missing, falls back to
 ``config/robot_config.example.yaml``) once and caches it in a thread-safe
@@ -9,15 +9,15 @@ Typical use::
     from common.config_manager import get_config
 
     cfg = get_config()
-    ip      = cfg.get("duco.network.ip", "192.168.1.10")
-    port    = cfg.get("duco.ft_sensor.port", "/dev/ttyUSB0")
-    web_port = cfg.get("dashboards.ft_sensor.port", 8080)
+    topic   = cfg.get("cartesian_control_manager.wrench_topic",
+                      "/ft_sensor/wrench_compensated")
+    web_port = cfg.get("cartesian_controller_dashboard.port", 8120)
 
 There is also :class:`SectionView` for scoped access::
 
-    ft = cfg.section("duco.ft_sensor")
-    print(ft.get("port"))     # "/dev/ttyUSB0"
-    print(ft.get("baud", 0))  # 460800
+    sec = cfg.section("cartesian_control_manager")
+    print(sec.get("wrench_topic"))
+    print(sec.get("max_wrench_force", 0.0))
 
 Strings in the YAML may use ``${ENV_VAR}`` to reference environment
 variables (left as-is if the variable is unset). Any string value under
@@ -134,14 +134,16 @@ class ConfigManager:
     # --- loading ----------------------------------------------------------
     def _resolve_config_path(self) -> Path:
         """Find robot_config.yaml (preferred) or its .example fallback."""
-        # 1. explicit env override
-        env_path = os.environ.get("DUCO_CONTROL_CONFIG")
+        # 1. explicit env override (ROBOT_CONFIG_PATH preferred;
+        #    DUCO_CONTROL_CONFIG accepted as a legacy alias).
+        env_path = os.environ.get("ROBOT_CONFIG_PATH") or \
+            os.environ.get("DUCO_CONTROL_CONFIG")
         if env_path:
             p = Path(env_path).expanduser().resolve()
             if p.is_file():
                 return p
             raise ConfigError(
-                f"DUCO_CONTROL_CONFIG points at {env_path!r} which does not exist")
+                f"ROBOT_CONFIG_PATH points at {env_path!r} which does not exist")
 
         # 2. <project_root>/config/<filename>
         root = get_workspace_root()
@@ -155,7 +157,7 @@ class ConfigManager:
         raise ConfigError(
             "no config/robot_config.yaml found. "
             "Copy config/robot_config.example.yaml to config/robot_config.yaml, "
-            "or set DUCO_CONTROL_CONFIG to an explicit path.")
+            "or set ROBOT_CONFIG_PATH to an explicit path.")
 
     def _load(self) -> None:
         path = self._resolve_config_path()
@@ -287,7 +289,12 @@ def get_config() -> ConfigManager:
 # explicitly out of scope (the dashboard does not expose those edits
 # either): such changes are infrequent and operators edit the YAML by
 # hand.
-_AUX_TOP_KEY = "duco_robot_bringup"
+#
+# The top-level YAML key that contains the ``aux_frames`` list is
+# robot-specific (e.g. ``duco_robot_bringup`` for the Duco workspace,
+# ``ur_robot_bringup`` for a UR workspace).  Callers pass it via the
+# ``top_key`` argument; there is no default so the toolkit does not
+# bake in any single robot's package name.
 _AUX_LIST_KEY = "aux_frames"
 _AUX_TRIPLE_RE = re.compile(
     r"^(?P<indent>\s+)(?P<key>xyz|rpy):\s*\[[^\]]*\]\s*(?P<trail>#.*)?$"
@@ -295,10 +302,9 @@ _AUX_TRIPLE_RE = re.compile(
 _AUX_ENTRY_RE = re.compile(
     r"^(?P<indent>\s*)-\s*name:\s*(?P<name>\S+)\s*(#.*)?$"
 )
-_AUX_SECTION_RE = re.compile(rf"^{re.escape(_AUX_TOP_KEY)}:\s*$")
 _AUX_LIST_RE = re.compile(rf"^\s+{re.escape(_AUX_LIST_KEY)}:\s*$")
 # A top-level YAML key (non-indented, ends with ':').  We use this as
-# the terminator for both the duco_robot_bringup section and the
+# the terminator for both the bringup section and the
 # aux_frames list within it.
 _TOP_LEVEL_KEY_RE = re.compile(r"^[A-Za-z_][\w.-]*:\s*(#.*)?$")
 
@@ -319,20 +325,24 @@ def _fmt_triple(values: Iterable[float]) -> str:
 
 
 def save_aux_frames(file_path: str,
-                    frames: Dict[str, Dict[str, List[float]]]) -> int:
+                    frames: Dict[str, Dict[str, List[float]]],
+                    top_key: str) -> int:
     """Update ``xyz`` / ``rpy`` of named entries under
-    ``duco_robot_bringup.aux_frames`` in ``file_path``.
+    ``<top_key>.aux_frames`` in ``file_path``.
 
     Parameters
     ----------
     file_path:
         Absolute path to the YAML file to rewrite.  Must already contain
-        the ``duco_robot_bringup`` section and an ``aux_frames`` list.
+        the ``<top_key>`` section and an ``aux_frames`` list.
     frames:
         Mapping of ``name -> {"xyz": [x, y, z], "rpy": [r, p, y]}``.
         Keys not present in the file are skipped (and counted toward the
         return value as 0 updates).  Entries in the file whose name is
         not in this dict are left untouched.
+    top_key:
+        Name of the top-level YAML section that owns the
+        ``aux_frames`` list (e.g. ``"duco_robot_bringup"``).
 
     Returns
     -------
@@ -343,7 +353,7 @@ def save_aux_frames(file_path: str,
     Raises
     ------
     ConfigError
-        If the file cannot be read, the ``duco_robot_bringup`` /
+        If the file cannot be read, the ``<top_key>`` /
         ``aux_frames`` block is missing, or the write fails.
 
     Notes
@@ -361,14 +371,16 @@ def save_aux_frames(file_path: str,
 
     lines = text.splitlines(keepends=True)
 
-    # Locate the duco_robot_bringup: line, then aux_frames: within it.
+    section_re = re.compile(rf"^{re.escape(top_key)}:\s*$")
+
+    # Locate the <top_key>: line, then aux_frames: within it.
     section_start = next(
-        (i for i, ln in enumerate(lines) if _AUX_SECTION_RE.match(ln)),
+        (i for i, ln in enumerate(lines) if section_re.match(ln)),
         None,
     )
     if section_start is None:
         raise ConfigError(
-            f"{p}: no top-level '{_AUX_TOP_KEY}:' section to update")
+            f"{p}: no top-level '{top_key}:' section to update")
 
     section_end = len(lines)
     for j in range(section_start + 1, len(lines)):
@@ -383,7 +395,7 @@ def save_aux_frames(file_path: str,
             break
     if aux_start is None:
         raise ConfigError(
-            f"{p}: no '{_AUX_LIST_KEY}:' list under '{_AUX_TOP_KEY}:'")
+            f"{p}: no '{_AUX_LIST_KEY}:' list under '{top_key}:'")
 
     # Walk entries from aux_start+1 until the section ends or a
     # sibling key at the same indent as aux_frames: is hit.
@@ -450,13 +462,21 @@ def save_aux_frames(file_path: str,
     return updated_count
 
 
-def read_aux_frames(file_path: str) -> List[Dict[str, Any]]:
+def read_aux_frames(file_path: str, top_key: str) -> List[Dict[str, Any]]:
     """Read aux_frames entries directly from ``file_path`` via PyYAML.
 
     Returns the raw list as currently on disk (each entry is the dict
     YAML parsed from the file).  Returns ``[]`` if the section is
     missing.  Unlike :func:`get_config`, this does NOT go through the
     singleton's cache, so it reflects pending on-disk edits.
+
+    Parameters
+    ----------
+    file_path:
+        Absolute path to the YAML file to read.
+    top_key:
+        Name of the top-level YAML section that owns the
+        ``aux_frames`` list (e.g. ``"duco_robot_bringup"``).
     """
     p = Path(file_path)
     try:
@@ -468,7 +488,7 @@ def read_aux_frames(file_path: str) -> List[Dict[str, Any]]:
         raise ConfigError(f"failed to read {p}: {exc}") from exc
     if not isinstance(data, dict):
         return []
-    section = data.get(_AUX_TOP_KEY)
+    section = data.get(top_key)
     if not isinstance(section, dict):
         return []
     frames = section.get(_AUX_LIST_KEY)

@@ -1,20 +1,23 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>duco_cartesian_control</name>
+  <name>cartesian_control_manager</name>
   <version>0.1.0</version>
   <description>
-    Cartesian-controller setup + operator orchestration for the Duco
-    GCR5_910 arm. Spawns FZI's cartesian_force_controller into the live
-    controller_manager, relays the gravity-compensated wrench onto the
-    controller's RELIABLE input, publishes a zero target_wrench
-    heartbeat, exposes engage/disengage Trigger services that atomically
-    swap arm_1_controller and the FZI controller, and runs a safety
-    supervisor that auto-disengages on stale topics or excessive
-    force/torque. The actual Cartesian compliance hot path is the C++
-    plugin from
-    https://github.com/yizhongzhang1989/cartesian_controllers (a fork
-    of fzi-forschungszentrum-informatik/cartesian_controllers).
+    Robot-agnostic orchestrator for FZI's Cartesian controllers. Spawns
+    cartesian_force_controller / cartesian_motion_controller /
+    cartesian_compliance_controller (all inactive) into the live
+    controller_manager, relays a gravity-compensated wrench onto each
+    controller's RELIABLE input, publishes a target_wrench heartbeat,
+    exposes engage/disengage Trigger services that atomically swap the
+    robot's JointTrajectoryController with the selected FZI controller,
+    and runs a safety supervisor that auto-disengages on stale topics
+    or excessive force/torque. All robot-specific knobs (joint names,
+    frame names, JTC controller name, topic names, FZI YAML location)
+    are parameters, so the same manager runs on any robot whose URDF
+    is reachable to the FZI plugins. The Cartesian hot path itself is
+    the C++ plugin from a fork of
+    https://github.com/fzi-forschungszentrum-informatik/cartesian_controllers.
     The system runs without any dashboard; cartesian_controller_dashboard
     is a separate, optional package.
   </description>
