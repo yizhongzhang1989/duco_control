@@ -1,7 +1,7 @@
 """Launch the Duco F/T sensor node.
 
 Defaults are taken from ``config/robot_config.yaml`` under
-``duco.ft_sensor`` (via the ``common`` package). CLI overrides win.
+``duco.ft_sensor`` (via the ``cct_common`` package). CLI overrides win.
 
 Examples:
   ros2 launch duco_ft_sensor ft_sensor.launch.py
@@ -37,10 +37,10 @@ def _defaults():
     makes it obvious.
     """
     try:
-        from common.config_manager import get_config  # type: ignore
+        from cct_common.config_manager import get_config  # type: ignore
     except Exception as exc:  # noqa: BLE001
         return (dict(_FALLBACKS),
-                f"FALLBACK (could not import common.config_manager: "
+                f"FALLBACK (could not import cct_common.config_manager: "
                 f"{type(exc).__name__}: {exc})")
     try:
         cfg = get_config()

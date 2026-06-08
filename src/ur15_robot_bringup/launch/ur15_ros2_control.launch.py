@@ -4,7 +4,7 @@ Thin wrapper around upstream ``ur_robot_driver/ur_control.launch.py``
 that:
 
 1. Reads its defaults from ``config/robot_config.yaml`` under the
-   ``ur15_robot_bringup`` section (via ``common.config_manager``).
+   ``ur15_robot_bringup`` section (via ``cct_common.config_manager``).
 2. Forwards them as launch arguments to the upstream UR launch.
 3. Leaves the controller list to the upstream config -- the FZI
    Cartesian controllers are NOT spawned here.  They are spawned by
@@ -65,10 +65,10 @@ _FALLBACKS = {
 
 def _defaults():
     try:
-        from common.config_manager import get_config  # type: ignore
+        from cct_common.config_manager import get_config  # type: ignore
     except Exception as exc:  # noqa: BLE001
         return (dict(_FALLBACKS),
-                f'FALLBACK (could not import common.config_manager: '
+                f'FALLBACK (could not import cct_common.config_manager: '
                 f'{type(exc).__name__}: {exc})')
     try:
         cfg = get_config()

@@ -23,13 +23,13 @@ dashboards.
 | [`duco_ft_sensor`](src/duco_ft_sensor) | serial driver + ROS publisher for the Duco F/T sensor | -- |
 | [`ft_sensor_dashboard`](external/cartesian_controllers_toolkit/ft_sensor_dashboard) | optional web UI for any `WrenchStamped` topic *(from the toolkit submodule)* | `8080` |
 | [`ft_sensor_gravity_compensation`](external/cartesian_controllers_toolkit/ft_sensor_gravity_compensation) | subscribes to the raw wrench + `/tf`, publishes a gravity-compensated wrench, has its own calibration UI *(from the toolkit submodule)* | `8100` |
-| [`cartesian_control_manager`](external/cartesian_controllers_toolkit/cartesian_control_manager) | spawns FZI's `cartesian_force_controller` / `cartesian_motion_controller` / `cartesian_compliance_controller` (all inactive), relays the wrench, publishes a zero target_wrench heartbeat, runs the engage / disengage Trigger services and a safety supervisor *(from the toolkit submodule)* | -- |
+| [`cartesian_control_manager`](external/cartesian_controllers_toolkit/cartesian_control_manager) | spawns FZI's `cartesian_force_controller` / `cartesian_motion_controller` / `cartesian_compliance_controller` (all inactive), relays the wrench, optionally publishes a zero target_wrench heartbeat, runs the engage / disengage Trigger services and a safety supervisor *(from the toolkit submodule)* | -- |
 | [`cartesian_controller_dashboard`](external/cartesian_controllers_toolkit/cartesian_controller_dashboard) | optional web UI for engage / disengage, controller selection (force / motion / compliance), and live-tuning of the active controller's gains *(from the toolkit submodule)* | `8120` |
 | [`duco_dashboard`](src/duco_dashboard) | optional web UI for joint / controller / TCP state | `8090` |
 | [`alicia_teleop`](src/alicia_teleop) | leader-follower teleop bridge: maps Alicia-D joint angles to the Duco follower with a per-joint velocity- and acceleration-limited interpolator; auto-switches `arm_1_controller` ↔ `forward_position_controller` at launch / shutdown | -- |
 | [`alicia_duo_leader_driver`](src/alicia_leader/alicia_duo_leader_driver) | serial driver for the Alicia-D 6-DoF leader arm (publishes `/arm_joint_state`) | -- |
 | [`alicia_duo_leader_dashboard`](src/alicia_leader/alicia_duo_leader_dashboard) | optional web UI for the leader arm (button / joint state) | `8130` |
-| [`common`](external/cartesian_controllers_toolkit/common) | centralised config loader (reads `config/robot_config.yaml`) + shared URDF/XML helpers *(from the toolkit submodule)* |
+| [`cct_common`](external/cartesian_controllers_toolkit/cct_common) | centralised config loader (reads `config/robot_config.yaml`) + shared URDF/XML helpers *(from the toolkit submodule)* |
 
 The official Duco ROS 2 driver is tracked as a git submodule at
 `external/duco_ros2_driver`.  Its packages provide
@@ -51,7 +51,7 @@ Key knobs:
 
 * `duco_robot_bringup.use_fake_hardware` -- `true` by default; flip to
   `false` only when the controller IP is reachable.
-* `duco_robot_bringup.duco_ip`, `duco_port` -- the Duco controller endpoint.
+* `duco_robot_bringup.robot_ip`, `robot_port` -- the Duco controller endpoint.
 * `duco_ft_sensor.port`, `baud` -- serial device for the F/T sensor.
 * `cartesian_control_manager.max_wrench_force`, `max_wrench_torque`,
   `engage_max_joint_velocity` -- safety supervisor trip thresholds.
@@ -99,7 +99,7 @@ is assumed.
 
 > Before starting: make sure `duco_robot_bringup.use_fake_hardware: false`
 > in `config/robot_config.yaml`, the Duco controller is reachable at
-> `duco_ip:duco_port`, and the FT sensor is connected at `duco_ft_sensor.port`.
+> `robot_ip:robot_port`, and the FT sensor is connected at `duco_ft_sensor.port`.
 
 ### 1. Robot bringup -- `controller_manager` + JTC
 
@@ -125,19 +125,25 @@ ros2 launch duco_ft_sensor ft_sensor.launch.py
 ```
 
 Publishes raw wrench on `/duco_ft_sensor/wrench_raw` (BEST_EFFORT) at the
-sensor's native rate (~960 Hz).
+sensor's native rate (a few hundred Hz over USB at 460800 baud).
+
+Optional raw-wrench web plot on <http://localhost:8080/>:
+
+```bash
+ros2 launch ft_sensor_dashboard dashboard.launch.py topic:=/duco_ft_sensor/wrench_raw
+```
 
 ### 3. Gravity compensation
 
 ```bash
-ros2 launch ft_sensor_gravity_compensation compensation.launch.py
+ros2 launch ft_sensor_gravity_compensation compensation.launch.py enable_dashboard:=true
 ```
 
 Subscribes to the raw wrench + `/tf`, subtracts the tool's gravity-
 induced force/torque using the stored end-effector profile, and publishes
 the **gravity-compensated** wrench on `/duco_ft_sensor/wrench_compensated`
-(BEST_EFFORT).  Pass `enable_dashboard:=true` to also serve the
-calibration UI on port `8100`.
+(BEST_EFFORT).  The `enable_dashboard:=true` flag also serves the
+calibration UI on <http://localhost:8100/> (drop it to run headless).
 
 ### 4. Cartesian-controller orchestrator
 
@@ -156,10 +162,13 @@ This:
   * `cartesian_compliance_controller` -- pose-hold + yields to wrench;
 * relays `/duco_ft_sensor/wrench_compensated` (BEST_EFFORT) onto each
   controller's RELIABLE input `/<controller>/ft_sensor_wrench`,
-* publishes a constant zero `WrenchStamped` at 10 Hz on
+* can publish a constant zero `WrenchStamped` at 10 Hz on
   `/<controller>/target_wrench` for the force + compliance controllers
   (FZI minimises `target - measured`, so identically zero target =
-  pure free-drive / compliance against zero),
+  pure free-drive / compliance against zero).  This heartbeat is **off
+  by default** (`publish_target_wrench` = `false`) so an external
+  publisher can own the topic; FZI still defaults its internal target to
+  zero, so free-drive works either way,
 * exposes `~/engage` and `~/disengage` `Trigger` services that
   atomically swap `arm_1_controller` <-> the **active** Cartesian
   controller (selected via the `active_controller_name` parameter or
@@ -183,12 +192,13 @@ ros2 control list_controllers
 # cartesian_force_controller        inactive   <-- selectable, standby
 # cartesian_motion_controller       inactive
 # cartesian_compliance_controller   inactive
-ros2 topic hz /cartesian_force_controller/ft_sensor_wrench
-ros2 topic hz /cartesian_force_controller/target_wrench   # ~10 Hz
+ros2 topic hz /cartesian_force_controller/ft_sensor_wrench   # ~FT rate (relay always on)
 ros2 service list | grep cartesian_control_manager
+# The zero-target heartbeat is OFF by default; turn it on to monitor it:
+ros2 param set /cartesian_control_manager publish_target_wrench true
+ros2 topic hz /cartesian_force_controller/target_wrench   # ~10 Hz
 # Switch which controller engage will activate (only while idle):
-ros2 param set /cartesian_control_manager active_controller_name \\
-    cartesian_compliance_controller
+ros2 param set /cartesian_control_manager active_controller_name cartesian_compliance_controller
 ```
 
 ### 5. Cartesian dashboard (optional but recommended)
@@ -309,9 +319,11 @@ rather than freezing the last value.
 
 #### 3. Direct to FZI (bypasses the safety clamp)
 
-You can also publish straight to `/<controller>/target_wrench`, but
-the orchestrator's clamp and the 10 Hz heartbeat will keep overwriting
-you unless you publish at >10 Hz **and** keep
+You can also publish straight to `/<controller>/target_wrench`.  By
+default the orchestrator's own heartbeat is **off**
+(`publish_target_wrench` = `false`), so nothing competes with you.  If
+you enabled it, the heartbeat (and the external-topic forwarder) will
+keep overwriting you at 10 Hz unless you publish faster **and** keep
 `external_target_wrench_topic` empty.  Use only for debugging.
 
 #### Verifying
@@ -457,7 +469,7 @@ around `pd_gains.trans p = 0.2`, `error_scale = 0.05`.
 | cartesian_control_manager            |    | cartesian_force_controller    |
 |  - spawns + engages FZI controller   |--->|  (C++ ros2_control plugin)    |
 |  - wrench relay (BEST -> RELIABLE)   |    |  - forward-dynamics solver    |
-|  - target_wrench=0 @ 10 Hz           |    |  - writes joint *position*    |
+|  - target_wrench=0 @ 10 Hz (opt-in)  |    |  - writes joint *position*    |
 |  - safety supervisor @ 50 Hz         |    |    commands to hardware       |
 |  - /state JSON topic                 |    +-----------------+-------------+
 |  - ~/engage, ~/disengage Trigger     |                      |

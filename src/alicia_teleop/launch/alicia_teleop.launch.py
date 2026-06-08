@@ -10,7 +10,7 @@ The driver and dashboard pieces can each be disabled with
 already running in another terminal.
 
 Teleop defaults are loaded from ``config/robot_config.yaml`` under
-``alicia_teleop`` (via the ``common`` package); CLI overrides win.
+``alicia_teleop`` (via the ``cct_common`` package); CLI overrides win.
 
 Example:
   ros2 launch alicia_teleop alicia_teleop.launch.py
@@ -82,10 +82,10 @@ def _defaults():
     swallowed so the LogInfo line at launch time makes it obvious.
     """
     try:
-        from common.config_manager import get_config  # type: ignore
+        from cct_common.config_manager import get_config  # type: ignore
     except Exception as exc:  # noqa: BLE001
         return (dict(_FALLBACKS),
-                f"FALLBACK (could not import common.config_manager: "
+                f"FALLBACK (could not import cct_common.config_manager: "
                 f"{type(exc).__name__}: {exc})")
     try:
         cfg = get_config()
@@ -109,7 +109,7 @@ def generate_launch_description() -> LaunchDescription:
     # from. Empty string is a safe fallback -- the upstream alicia driver
     # falls back to its packaged template in that case.
     try:
-        from common.workspace_utils import get_config_path  # type: ignore
+        from cct_common.workspace_utils import get_config_path  # type: ignore
         joint_config_default = get_config_path("joint_config.yaml")
     except Exception:
         joint_config_default = ""
