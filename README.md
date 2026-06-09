@@ -18,6 +18,7 @@ dashboards.
 
 | package | purpose | runtime port |
 |---|---|---|
+| [`robot_bringup`](src/robot_bringup) | top-level "start all" meta-bringup: one launch per robot (`duco_bringup.launch.py`, `ur15_bringup.launch.py`) that starts the **complete** stack -- robot bringup, F/T + gravity compensation, the cartesian orchestrator, and the web dashboards -- with a single command. Pins `ROBOT_CONFIG_PATH` to the robot's config automatically. See [One-command bringup](#one-command-bringup). | -- |
 | [`duco_robot_bringup`](src/duco_robot_bringup) | project-owned launch wrapper around the upstream `duco_*` driver (URDF + `controller_manager` + JTC); also ships the per-robot `config/fzi_preset.yaml` consumed by `cartesian_control_manager` | -- |
 | [`ur15_robot_bringup`](src/ur15_robot_bringup) | sibling bringup wrapper around the apt-installed `ur_robot_driver` for the UR15 (Universal Robots) arm; also ships its own `config/fzi_preset.yaml`. Selected via `ROBOT_CONFIG_PATH=$PWD/config/robot_config.ur15.yaml`. See [Multi-robot support](#multi-robot-support). | -- |
 | [`duco_ft_sensor`](src/duco_ft_sensor) | serial driver + ROS publisher for the Duco F/T sensor | -- |
@@ -90,6 +91,60 @@ take effect on the next launch without rebuilding.
 
 ---
 
+## One-command bringup
+
+The [`robot_bringup`](src/robot_bringup) package starts the **entire** stack
+for a robot with a single launch -- no need to open six terminals.  Each
+per-robot launch pins `ROBOT_CONFIG_PATH` to that robot's config
+automatically, brings up the robot + F/T + gravity compensation immediately,
+then stages the Cartesian orchestrator and the web dashboards a few seconds
+later (so `controller_manager` is up first).
+
+```bash
+cd /home/robot/Documents/duco_control
+source install/setup.bash
+
+# Duco GCR5-910 -- everything (uses config's use_fake_hardware)
+ros2 launch robot_bringup duco_bringup.launch.py
+
+# UR15 -- everything
+ros2 launch robot_bringup ur15_bringup.launch.py
+```
+
+What each launch starts:
+
+| stage | Duco (`duco_bringup.launch.py`) | UR15 (`ur15_bringup.launch.py`) |
+|---|---|---|
+| 0 (now) | `duco_robot_bringup` + `duco_ft_sensor` + `ft_sensor_gravity_compensation` | `ur15_robot_bringup` (incl. FT broadcaster) + `ft_sensor_gravity_compensation` |
+| 1 (after `cartesian_delay`, default 8 s) | `cartesian_control_manager` (real-HW limits) + `cartesian_controller_dashboard` (`8120`) + `duco_dashboard` (`8090`) | `cartesian_control_manager` (real-HW limits) + `cartesian_controller_dashboard` (`8120`) |
+
+Common overrides (forwarded to the sub-launches):
+
+```bash
+# Fake-hardware smoke test (no robot connected)
+ros2 launch robot_bringup duco_bringup.launch.py use_fake_hardware:=true
+ros2 launch robot_bringup ur15_bringup.launch.py use_fake_hardware:=true robot_ip:=127.0.0.1
+
+# Headless (no web dashboards), and move the gravity-comp UI off 8100
+ros2 launch robot_bringup duco_bringup.launch.py \
+    ft_dashboard_port:=0 launch_cartesian_dashboard:=false \
+    launch_robot_state_dashboard:=false
+
+# Select a robot config explicitly (otherwise the per-robot default is used)
+ROBOT_CONFIG_PATH=$PWD/config/robot_config.ur15.yaml \
+    ros2 launch robot_bringup ur15_bringup.launch.py
+```
+
+After it's up, engage exactly as in the manual flow:
+
+```bash
+ros2 service call /cartesian_control_manager/engage std_srvs/srv/Trigger
+```
+
+> The sections below document the **manual, terminal-per-step** flow that
+> `robot_bringup` automates -- useful for understanding each stage,
+> debugging, or running a subset.
+
 ## Bringup sequence (real hardware)
 
 The full free-drive / hand-guidance stack is started by running each of
@@ -122,6 +177,7 @@ ros2 topic echo /joint_states --once
 
 ```bash
 ros2 launch duco_ft_sensor ft_sensor.launch.py
+
 ```
 
 Publishes raw wrench on `/duco_ft_sensor/wrench_raw` (BEST_EFFORT) at the
@@ -130,20 +186,20 @@ sensor's native rate (a few hundred Hz over USB at 460800 baud).
 Optional raw-wrench web plot on <http://localhost:8080/>:
 
 ```bash
-ros2 launch ft_sensor_dashboard dashboard.launch.py topic:=/duco_ft_sensor/wrench_raw
+ros2 launch ft_sensor_dashboard dashboard.launch.py topic:=/duco_ft_sensor/wrench_raw port:=8080
 ```
 
 ### 3. Gravity compensation
 
 ```bash
-ros2 launch ft_sensor_gravity_compensation compensation.launch.py enable_dashboard:=true
+ros2 launch ft_sensor_gravity_compensation compensation.launch.py dashboard_port:=8100
 ```
 
 Subscribes to the raw wrench + `/tf`, subtracts the tool's gravity-
 induced force/torque using the stored end-effector profile, and publishes
 the **gravity-compensated** wrench on `/duco_ft_sensor/wrench_compensated`
-(BEST_EFFORT).  The `enable_dashboard:=true` flag also serves the
-calibration UI on <http://localhost:8100/> (drop it to run headless).
+(BEST_EFFORT).  Passing `dashboard_port:=8100` also serves the
+calibration UI on <http://localhost:8100/> (omit it to run headless).
 
 ### 4. Cartesian-controller orchestrator
 
@@ -204,7 +260,7 @@ ros2 param set /cartesian_control_manager active_controller_name cartesian_compl
 ### 5. Cartesian dashboard (optional but recommended)
 
 ```bash
-ros2 launch cartesian_controller_dashboard dashboard.launch.py
+ros2 launch cartesian_controller_dashboard dashboard.launch.py port:=8120
 ```
 
 Open <http://localhost:8120/>.  The dashboard:

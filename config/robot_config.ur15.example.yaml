@@ -41,9 +41,8 @@ ft_sensor_gravity_compensation:
   reliability: "reliable"       # match the upstream broadcaster's QoS
   publish_when_no_tf: false
   storage_path: "~/.ros/ft_sensor_gravity_compensation/ur15_end_effectors.yaml"
-  enable_dashboard: true
   host: "0.0.0.0"
-  port: 8100
+  dashboard_port: 8100            # web calibration UI on :8100 (0 = disabled)
   gravity: 9.80665
   tf_timeout: 0.05
   tf_max_age: 1.0
