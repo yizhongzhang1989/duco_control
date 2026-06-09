@@ -10,7 +10,7 @@
 
   <buildtool_depend>ament_python</buildtool_depend>
 
-  <exec_depend>common</exec_depend>
+  <exec_depend>cct_common</exec_depend>
   <exec_depend>duco_gcr5_910_moveit_config</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>

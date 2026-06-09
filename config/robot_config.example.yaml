@@ -52,21 +52,20 @@ ft_sensor_gravity_compensation:
   reliability: "best_effort"      # match the publisher's QoS
   publish_when_no_tf: false       # if true, fall back to bias-only when TF stale
   storage_path: "~/.ros/ft_sensor_gravity_compensation/end_effectors.yaml"
-  enable_dashboard: false         # set true to launch the calibration web UI
   host: "0.0.0.0"
-  port: 8100
+  dashboard_port: 0               # 0 = dashboard off; set a port (e.g. 8100) to enable
   gravity: 9.80665                # m/s^2
   tf_timeout: 0.05                # seconds, per lookup_transform call
   tf_max_age: 1.0                 # seconds; older TF -> stop publishing
 
 # ============================================================================
-# duco_cartesian_control (FZI orchestrator: engage UX + safety supervisor
-# wrapping FZI's cartesian_force_controller; the C++ controller does the
-# actual Cartesian admittance work in controller_manager).  System works
-# end-to-end without any dashboard; cartesian_controller_dashboard below
-# is a separate, optional UI.
+# cartesian_control_manager (FZI orchestrator: engage UX + safety supervisor
+# wrapping FZI's cartesian_force/motion/compliance controllers; the C++
+# controller does the actual Cartesian admittance work in
+# controller_manager).  System works end-to-end without any dashboard;
+# cartesian_controller_dashboard below is a separate, optional UI.
 # ============================================================================
-duco_cartesian_control:
+cartesian_control_manager:
   # ---- connectivity ----
   wrench_topic: "/duco_ft_sensor/wrench_compensated"
   joint_states_topic: "/joint_states"
@@ -80,6 +79,11 @@ duco_cartesian_control:
   fzi_target_frame:        "link_6"
   fzi_target_rate_hz:      10.0
   fzi_service_timeout_sec: 2.0
+  # Where the FZI YAML preset for the three FZI controllers lives.
+  # The manager package itself is robot-agnostic; the per-robot
+  # preset is shipped by the bringup package.
+  fzi_controller_yaml_package: "duco_robot_bringup"
+  fzi_controller_yaml_relpath: "config/fzi_preset.yaml"
   # ---- supervisor + state publish ----
   loop_rate_hz: 50.0              # safety-supervisor tick (not the FZI hot path)
   state_publish_rate_hz: 5.0      # rate the JSON state topic is heartbeated
@@ -92,14 +96,21 @@ duco_cartesian_control:
 
 # ============================================================================
 # cartesian_controller_dashboard (web UI for monitoring + parameter tuning).
-# Pure UI: subscribes to duco_cartesian_control's state, calls its
+# Pure UI: subscribes to cartesian_control_manager's state, calls its
 # Trigger services, and reads/writes parameters on the FZI controller.
 # ============================================================================
 cartesian_controller_dashboard:
-  orchestrator_ns:     "/duco_cartesian_control"
+  orchestrator_ns:     "/cartesian_control_manager"
   controller_name:     "cartesian_force_controller"
   wrench_topic:        "/duco_ft_sensor/wrench_compensated"
   joint_states_topic:  "/joint_states"
+  # TCP-pose display frames (base_frame -> tool_frame via TF). The Duco's
+  # end-effector tip is the compliance_link aux frame added at bringup.
+  base_frame:          "base_link"
+  tool_frame:          "compliance_link"
+  # Top-level robot_config.yaml key whose aux_frames list the dashboard's
+  # "Tool frames" panel reads / writes; empty string disables the panel.
+  aux_frames_section:  "duco_robot_bringup"
   service_timeout_sec: 2.0
   host: "0.0.0.0"
   port: 8120
@@ -137,11 +148,11 @@ duco_robot_bringup:
   # IMPORTANT: FZI's robotChainContains(link) only walks the KDL chain
   # from robot_base_link to end_effector_link. Aux frames are visible to
   # the cartesian controllers ONLY IF they are chained in series from
-  # link_6 up to whatever fzi_zero_gravity.yaml declares as
+  # link_6 up to whatever the per-robot fzi_preset.yaml declares as
   # end_effector_link. The default chain is
   #   link_6 -> ft_sensor_link -> compliance_link
   # with compliance_link as the end-effector tip; do not insert siblings
-  # of these two without also updating fzi_zero_gravity.yaml.
+  # of these two without also updating fzi_preset.yaml.
   aux_frames:
     - name: ft_sensor_link
       parent: link_6

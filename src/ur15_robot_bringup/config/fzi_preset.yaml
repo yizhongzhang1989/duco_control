@@ -1,0 +1,166 @@
+# FZI Cartesian controllers -- UR15 preset.
+#
+# Per-robot configuration consumed by the robot-agnostic
+# ``cartesian_control_manager`` package from
+# ``external/cartesian_controllers_toolkit/``.  The manager's launch
+# resolves this YAML at runtime via the ``fzi_controller_yaml_package``
+# / ``fzi_controller_yaml_relpath`` launch args (defaulting to
+# ``ur15_robot_bringup`` / ``config/fzi_preset.yaml`` in this workspace
+# via ``config/robot_config.yaml``).
+#
+# Conventions for UR15:
+#   * The URDF supplied by ``ur_description`` exposes the chain
+#       base_link -> base_link_inertia -> shoulder_link -> upper_arm_link
+#       -> forearm_link -> wrist_1_link -> wrist_2_link -> wrist_3_link
+#       -> flange -> tool0
+#     so ``base_link`` and ``tool0`` are valid endpoints with no aux
+#     frames needed.  FZI's ``robotChainContains`` walks this chain.
+#   * The UR firmware's built-in TCP F/T sensor is published by
+#     ``force_torque_sensor_broadcaster`` (from the standard upstream
+#     ``ur_controllers.yaml``) on the topic
+#     ``/force_torque_sensor_broadcaster/wrench`` in the ``tool0`` frame.
+#     We route it through ``ft_sensor_gravity_compensation`` to produce
+#     ``/ft_compensated`` and feed that to FZI's ``ft_sensor_wrench``
+#     input via the cartesian_control_manager.
+#   * ``command_interfaces: [position]`` is the same UR command
+#     interface ``scaled_joint_trajectory_controller`` uses, so the
+#     manager simply switches between the two on engage / disengage.
+#   * PD gains start at the CONSERVATIVE values validated on the Duco
+#     GCR5-910 -- they tune the IK solver's internal virtual end-
+#     effector mass (``link_mass``, ~0.1 kg by default), which is
+#     INDEPENDENT of the real arm's inertia, so the same starting
+#     gains transfer between robots.  Re-tune live via
+#         ros2 param set /<controller> pd_gains.<axis>.{p,d} <value>
+#     once the arm is on real hardware.  See the Duco preset's
+#     header comments for the underlying omega_n / zeta math.
+
+# --- Force controller ----------------------------------------------------
+# Minimises (target_wrench - ft_sensor_wrench).  With the orchestrator
+# publishing target_wrench=0, this is pure free-drive (hand guidance).
+cartesian_force_controller:
+  ros__parameters:
+    end_effector_link: "tool0"
+    robot_base_link: "base_link"
+    ft_sensor_ref_link: "tool0"   # UR's built-in TCP F/T is at tool0
+    joints:
+      - shoulder_pan_joint
+      - shoulder_lift_joint
+      - elbow_joint
+      - wrist_1_joint
+      - wrist_2_joint
+      - wrist_3_joint
+    command_interfaces:
+      - position
+    solver:
+      # UR15 first-engage SAFETY values.  The previous p=5.0, error_scale=0.05
+      # caused heavy shaking on real hardware because:
+      #   1. loop_gain ~ p * error_scale / link_mass = 5*0.05/0.1 = 2.5,
+      #      a factor of 12.5x above what the Duco arm tolerated;
+      #   2. the UR's scaled_joint_trajectory_controller adds an extra
+      #      lag in the loop that Duco's direct-position interface does
+      #      not have, so the FZI command rate can outrun the JTC and
+      #      drive a positive-feedback oscillation;
+      #   3. residual gravity-compensation bias (e.g. fz ~ -7 N at rest)
+      #      is amplified by the loop gain into Cartesian motion.
+      # Re-tune live AFTER calibrating gravity comp and confirming the
+      # arm holds still on engage.  See
+      # /memories/repo/fzi_force_controller_damping.md.
+      error_scale: 0.02       # FZI default 1.0; this keeps omega_n low.
+      iterations: 3           # Was 5; lower => less integration per tick.
+      publish_state_feedback: true
+    pd_gains:
+      # Auto-tuned 2026-05-27 via tools/cartesian_auto_tune.py with
+      # target_wrench bias-cancellation: ladder p in {0.5,1.0,1.5,2.0}
+      # stayed in the linear noise-tracking regime; growth factors
+      # tracked the p-ratio (no super-linear blow-up = no oscillation).
+      # p=1.5 was the largest gain that kept joint range <3 deg over
+      # a 2 s window; p=2.0 reached 3.18 deg, still linear but past
+      # the safety threshold.  Headroom of ~33% below true instability.
+      trans_x: {p: 1.5,  d: 0.075}
+      trans_y: {p: 1.5,  d: 0.075}
+      trans_z: {p: 1.5,  d: 0.075}
+      rot_x:   {p: 30.0, d: 3.0}
+      rot_y:   {p: 30.0, d: 3.0}
+      rot_z:   {p: 30.0, d: 3.0}
+
+# --- Motion controller ---------------------------------------------------
+# Drives the end-effector toward target_frame (PoseStamped on
+# /<controller>/target_frame).  On activate it snapshots the current
+# pose, so without an external publisher it simply holds pose.
+cartesian_motion_controller:
+  ros__parameters:
+    end_effector_link: "tool0"
+    robot_base_link: "base_link"
+    joints:
+      - shoulder_pan_joint
+      - shoulder_lift_joint
+      - elbow_joint
+      - wrist_1_joint
+      - wrist_2_joint
+      - wrist_3_joint
+    command_interfaces:
+      - position
+    solver:
+      error_scale: 1.0        # FZI default
+      iterations: 3           # Match force_controller; was 5.
+      publish_state_feedback: true
+    pd_gains:
+      # Lowered in lockstep with the force controller -- same UR JTC
+      # lag applies here when tracking target_frame.  Auto-tune used
+      # the force controller as the proxy; motion mirrors those gains.
+      trans_x: {p: 1.5}
+      trans_y: {p: 1.5}
+      trans_z: {p: 1.5}
+      rot_x:   {p: 30.0}
+      rot_y:   {p: 30.0}
+      rot_z:   {p: 30.0}
+
+# --- Compliance controller ----------------------------------------------
+# net_force = stiffness * (target_frame - current_frame)
+#             + (target_wrench - measured_wrench)
+# fed through the SAME ForwardDynamicsSolver pipeline as the force
+# controller, so pd_gains.* mirror the force-controller values and
+# only stiffness.* is genuinely compliance-specific.
+cartesian_compliance_controller:
+  ros__parameters:
+    end_effector_link: "tool0"
+    robot_base_link: "base_link"
+    ft_sensor_ref_link: "tool0"
+    compliance_ref_link: "tool0"
+    joints:
+      - shoulder_pan_joint
+      - shoulder_lift_joint
+      - elbow_joint
+      - wrist_1_joint
+      - wrist_2_joint
+      - wrist_3_joint
+    command_interfaces:
+      - position
+    stiffness:                # virtual spring at compliance_ref_link
+      trans_x: 30.0           # N/m -- 1 N push gives ~33 mm displacement
+      trans_y: 30.0
+      trans_z: 30.0
+      rot_x:   2.0            # Nm/rad -- 0.1 Nm gives ~2.9 deg
+      rot_y:   2.0
+      rot_z:   2.0
+    solver:
+      error_scale: 0.05
+      iterations: 1           # Conservative for first bring-up.  The
+                              # Duco preset runs iters=3 for faster
+                              # tracking; UR15 may require lab tuning
+                              # before raising this (see Duco preset
+                              # header for the omega_n / zeta math).
+      forward_dynamics:
+        link_mass: 0.1        # FZI default; sets the IK solver's
+                              # virtual EE mass and is the dominant
+                              # stability knob.  Read once at
+                              # on_configure -- changing requires
+                              # controller reload, NOT just a param set.
+      publish_state_feedback: true
+    pd_gains:
+      trans_x: {p: 1.0, d: 0.0}
+      trans_y: {p: 1.0, d: 0.0}
+      trans_z: {p: 1.0, d: 0.0}
+      rot_x:   {p: 5.0, d: 0.0}
+      rot_y:   {p: 5.0, d: 0.0}
+      rot_z:   {p: 5.0, d: 0.0}

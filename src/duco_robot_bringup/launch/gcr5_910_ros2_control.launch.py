@@ -116,7 +116,7 @@ def _launch_setup(context, *args, **kwargs):
 
     # Lazy import: surfaces any import error at launch time, not at
     # module import time of this launch file (which would mask it).
-    from duco_robot_bringup.urdf_loader import augment_urdf, run_xacro
+    from cct_common.urdf_loader import augment_urdf, run_xacro
 
     aux_frames = _load_aux_frames()
     urdf_xml = run_xacro(
@@ -227,7 +227,7 @@ def _launch_setup(context, *args, **kwargs):
 # Aux frames loader.
 #
 # Reads ``duco_robot_bringup.aux_frames`` from ``config/robot_config.yaml``
-# (via ``common.config_manager``) and returns a list of normalised
+# (via ``cct_common.config_manager``) and returns a list of normalised
 # entries. Each entry is a dict::
 #
 #   { "name": str, "parent": str, "xyz": [float, float, float],
@@ -240,7 +240,7 @@ def _launch_setup(context, *args, **kwargs):
 # ---------------------------------------------------------------------------
 def _load_aux_frames() -> List[Dict]:
     try:
-        from common.config_manager import get_config  # type: ignore
+        from cct_common.config_manager import get_config  # type: ignore
     except Exception:  # noqa: BLE001
         return []
     try:
@@ -289,10 +289,10 @@ def _triple(value, default, where: str) -> List[float]:
 
 def _defaults():
     try:
-        from common.config_manager import get_config  # type: ignore
+        from cct_common.config_manager import get_config  # type: ignore
     except Exception as exc:  # noqa: BLE001
         return (dict(_FALLBACKS),
-                f'FALLBACK (could not import common.config_manager: '
+                f'FALLBACK (could not import cct_common.config_manager: '
                 f'{type(exc).__name__}: {exc})')
 
     try:

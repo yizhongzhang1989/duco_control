@@ -317,7 +317,7 @@ This is the default because:
    need; sending the same point through JTC's spline is redundant work
    that adds ~1 tick of lag.
 3. It's the same write pattern used by the rest of this workspace
-   (`duco_cartesian_control`), so the controller-switching machinery is
+   (`cartesian_control_manager`), so the controller-switching machinery is
    shared.
 
 ### 5.2 `trajectory`

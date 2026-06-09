@@ -15,7 +15,7 @@
   <depend>controller_manager_msgs</depend>
   <depend>alicia_duo_leader_driver</depend>
   <depend>alicia_duo_leader_dashboard</depend>
-  <depend>common</depend>
+  <depend>cct_common</depend>
 
   <test_depend>ament_python</test_depend>
 

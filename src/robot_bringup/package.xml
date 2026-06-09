@@ -1,0 +1,48 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>robot_bringup</name>
+  <version>0.1.0</version>
+  <description>
+    Top-level "start all" meta-bringup for this workspace. Ships one launch
+    file per robot (duco_bringup.launch.py, ur15_bringup.launch.py) that
+    brings up the COMPLETE hand-guidance / Cartesian-compliance stack with a
+    single command: robot ros2_control bringup, F/T sensing + gravity
+    compensation, the cartesian_control_manager orchestrator, and the optional
+    web dashboards. Each launch pins ROBOT_CONFIG_PATH to its robot's config so
+    the robot-agnostic toolkit packages load the right settings.
+  </description>
+
+  <maintainer email="yizhongzhang1989@gmail.com">yizhongzhang</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- shared config loader -->
+  <exec_depend>cct_common</exec_depend>
+
+  <!-- toolkit stack (robot-agnostic) -->
+  <exec_depend>ft_sensor_gravity_compensation</exec_depend>
+  <exec_depend>cartesian_control_manager</exec_depend>
+  <exec_depend>cartesian_controller_dashboard</exec_depend>
+
+  <!-- Duco stack -->
+  <exec_depend>duco_robot_bringup</exec_depend>
+  <exec_depend>duco_ft_sensor</exec_depend>
+  <exec_depend>duco_dashboard</exec_depend>
+
+  <!-- UR15 stack -->
+  <exec_depend>ur15_robot_bringup</exec_depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

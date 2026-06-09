@@ -1,20 +1,22 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>duco_ft_sensor</name>
+  <name>ur15_robot_bringup</name>
   <version>0.1.0</version>
-  <description>ROS 2 driver for the Duco 6-DoF force/torque sensor (RS-422, 460800 8N1, 28-byte float frames).</description>
+  <description>UR15 bringup wrapper: includes ur_robot_driver's
+    ur_control.launch.py, exposes the per-robot FZI controller preset,
+    and feeds defaults from the workspace-level robot_config.yaml.</description>
 
   <maintainer email="yizhongzhang1989@gmail.com">yizhongzhang</maintainer>
   <license>MIT</license>
 
-  <exec_depend>python3-serial</exec_depend>
-  <exec_depend>rclpy</exec_depend>
-  <exec_depend>geometry_msgs</exec_depend>
-  <exec_depend>std_msgs</exec_depend>
-  <exec_depend>std_srvs</exec_depend>
-  <exec_depend>ros2launch</exec_depend>
+  <buildtool_depend>ament_python</buildtool_depend>
+
   <exec_depend>cct_common</exec_depend>
+  <exec_depend>ur_robot_driver</exec_depend>
+  <exec_depend>ur_description</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

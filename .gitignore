@@ -14,3 +14,4 @@ __pycache__/
 # Local (machine-specific) configuration; copy from
 # config/robot_config.example.yaml and edit. The template *is* committed.
 config/robot_config.yaml
+config/robot_config.ur15.yaml
