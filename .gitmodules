@@ -12,3 +12,9 @@
 [submodule "external/cartesian_controllers_toolkit"]
 	path = external/cartesian_controllers_toolkit
 	url = https://github.com/yizhongzhang1989/cartesian_controllers_toolkit.git
+[submodule "external/inverse_kinematics_toolkit"]
+	path = external/inverse_kinematics_toolkit
+	url = https://github.com/yizhongzhang1989/inverse_kinematics_toolkit.git
+[submodule "external/3dconnexion_ros2"]
+	path = external/3dconnexion_ros2
+	url = https://github.com/yizhongzhang1989/3dconnexion_ros2.git
