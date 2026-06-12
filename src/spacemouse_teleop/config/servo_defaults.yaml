@@ -1,0 +1,40 @@
+# spacemouse_teleop — spacemouse_servo defaults.
+#
+# This bridge publishes a PoseStamped target; it does NOT command the robot
+# directly. Defaults are deliberately slow/conservative. Override per robot in
+# the workspace's config/robots/<id>.yaml or via launch args.
+#
+# base_frame / tip_frame are intentionally EMPTY here — they are robot-specific
+# and MUST be provided (launch arg or per-robot YAML); the node refuses to start
+# without them.
+/**:
+  ros__parameters:
+    # ---- I/O ----------------------------------------------------------
+    input_topic: "spacenav/twist"
+    joy_topic: "spacenav/joy"
+    target_pose_topic: "~/target_pose"
+    base_frame: ""        # e.g. base_link  (REQUIRED)
+    tip_frame: ""         # e.g. tool0 / flange  (REQUIRED)
+    rate_hz: 50.0
+
+    # ---- shaping (per-axis [x, y, z]) ---------------------------------
+    linear_scale: [0.05, 0.05, 0.05]    # m/s per unit twist
+    angular_scale: [0.3, 0.3, 0.3]      # rad/s per unit twist
+    deadband_lin: 0.0                   # driver already deadbands
+    deadband_ang: 0.0
+    max_linear_speed: 0.05              # m/s hard clamp
+    max_angular_speed: 0.3              # rad/s hard clamp
+    jog_frame: "tool"                   # tool | base
+    input_timeout: 0.2                  # s — twist staleness -> zero
+
+    # ---- buttons ------------------------------------------------------
+    deadman_button: 0
+    deadman_mode: "hold"                # hold | toggle
+    button1_index: 1
+    button1_action: "speed"             # speed | position_only | none
+    speed_scales: [0.25, 1.0, 2.0]
+
+    # ---- downstream commander (optional) ------------------------------
+    enable_commander: true
+    commander_enable_srv: "ikt_pose_commander/enable"
+    commander_disable_srv: "ikt_pose_commander/disable"
