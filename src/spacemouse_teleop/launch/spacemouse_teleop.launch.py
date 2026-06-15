@@ -58,7 +58,7 @@ def _setup(context, *_, **__):
         % (base_frame, tip_frame, output, jog_frame)))]
 
     # --- SpaceMouse driver (global hardware; not namespaced) --------------
-    sm_pkg = get_package_share_directory("spacemouse_dashboard")
+    sm_pkg = get_package_share_directory("spacemouse")
     actions.append(IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(sm_pkg, "launch", "spacemouse.launch.py")),

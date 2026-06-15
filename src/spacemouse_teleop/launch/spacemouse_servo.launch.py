@@ -48,7 +48,7 @@ def generate_launch_description():
 
     spacenav_driver = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(
-            get_package_share_directory('spacemouse_dashboard'),
+            get_package_share_directory('spacemouse'),
             'launch', 'spacemouse.launch.py')),
         condition=IfCondition(launch_driver),
     )
