@@ -109,9 +109,10 @@ class SpaceMouseServo(Node):
 
         self._deadman_button = int(gp("deadman_button").value)
         self._deadman_mode = str(gp("deadman_mode").value).strip().lower()
-        if self._deadman_mode not in ("hold", "toggle"):
-            raise ValueError("deadman_mode must be 'hold' or 'toggle', got %r"
-                             % self._deadman_mode)
+        if self._deadman_mode not in ("hold", "toggle", "none"):
+            raise ValueError(
+                "deadman_mode must be 'hold', 'toggle' or 'none', got %r"
+                % self._deadman_mode)
         self._button1_index = int(gp("button1_index").value)
         self._button1_action = str(gp("button1_action").value).strip().lower()
         self._speed_scales = [float(s) for s in gp("speed_scales").value] or [1.0]
@@ -152,15 +153,23 @@ class SpaceMouseServo(Node):
 
         self.create_timer(self._dt, self._on_timer)
 
+        dm = ("none (touch-to-move, no button)" if self._deadman_mode == "none"
+              else "button%d(%s)" % (self._deadman_button, self._deadman_mode))
         self.get_logger().info(
             "spacemouse_servo up: %s<-%s, %.0f Hz, jog_frame=%s, "
-            "lin<=%.3f m/s ang<=%.3f rad/s, deadman=button%d(%s), "
+            "lin<=%.3f m/s ang<=%.3f rad/s, deadman=%s, "
             "enable_commander=%s -> %s"
             % (self._base_frame, self._tip_frame, self._rate, self._jog_frame,
-               self._max_lin, self._max_ang, self._deadman_button,
-               self._deadman_mode, self._enable_commander, target_topic))
-        self.get_logger().info(
-            "DISENGAGED. Hold/toggle the dead-man button to jog the robot.")
+               self._max_lin, self._max_ang, dm,
+               self._enable_commander, target_topic))
+        if self._deadman_mode == "none":
+            self.get_logger().info(
+                "ENGAGED by default (deadman_mode=none): touch the puck to move "
+                "the target. Centre the puck to hold position.")
+        else:
+            self.get_logger().info(
+                "DISENGAGED. %s the dead-man button to jog the robot."
+                % ("Hold" if self._deadman_mode == "hold" else "Toggle"))
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -235,7 +244,9 @@ class SpaceMouseServo(Node):
 
     def _update_engagement(self) -> None:
         deadman = self._read_button(self._deadman_button)
-        if self._deadman_mode == "hold":
+        if self._deadman_mode == "none":
+            new_engaged = True            # always engaged: touch-to-move
+        elif self._deadman_mode == "hold":
             new_engaged = deadman
         else:  # toggle on rising edge
             new_engaged = self._engaged

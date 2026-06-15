@@ -29,7 +29,13 @@
 
     # ---- buttons ------------------------------------------------------
     deadman_button: 0
-    deadman_mode: "hold"                # hold | toggle
+    # Engagement mode:
+    #   none   -> ALWAYS engaged: touch the puck to move, centre it to hold.
+    #             No button needed (the driver zeroes a static puck, so a
+    #             centred puck simply holds the last target — no drift).
+    #   hold   -> only while the dead-man button is held.
+    #   toggle -> press the dead-man button to engage / disengage.
+    deadman_mode: "none"                # none | hold | toggle
     button1_index: 1
     button1_action: "speed"             # speed | position_only | none
     speed_scales: [0.25, 1.0, 2.0]
