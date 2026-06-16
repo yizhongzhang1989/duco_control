@@ -73,6 +73,24 @@ def call_disable(ns: str, timeout: float = 5.0) -> bool:
         return False
 
 
+def switch_to_hold(deactivate: str, activate: str, timeout: float = 5.0) -> bool:
+    """Abort by switching controllers back to a JTC hold.
+
+    For a raw FZI cartesian controller (no commander ``disable`` service) the
+    fail-safe is to deactivate it and activate the trajectory controller, which
+    holds the current measured pose. Uses ``ros2 control switch_controllers``.
+    """
+    try:
+        out = subprocess.run(
+            ["ros2", "control", "switch_controllers",
+             "--deactivate", deactivate, "--activate", activate],
+            capture_output=True, text=True, timeout=timeout)
+        return out.returncode == 0
+    except Exception as exc:  # noqa: BLE001
+        print("  !! switch_controllers error: %r" % exc, file=sys.stderr)
+        return False
+
+
 class SafetyWatchdog:
     """Breach detector with injectable read/disable functions (testable core)."""
 
@@ -184,6 +202,14 @@ def main(argv=None) -> int:
                     help="poll rate Hz (>=5)")
     ap.add_argument("--reader", default=None,
                     help="path to read_tcp_pose (default tools/read_tcp_pose)")
+    ap.add_argument("--abort-mode", choices=("disable", "switch"),
+                    default="disable",
+                    help="breach action: call <ns>/disable, or switch "
+                         "controllers back to a JTC hold")
+    ap.add_argument("--abort-deactivate", default="cartesian_motion_controller",
+                    help="(switch mode) controller to deactivate on breach")
+    ap.add_argument("--abort-activate", default="arm_1_controller",
+                    help="(switch mode) JTC hold controller to activate on breach")
     ap.add_argument("--self-test", action="store_true",
                     help="run offline self-test and exit")
     args = ap.parse_args(argv)
@@ -201,10 +227,15 @@ def main(argv=None) -> int:
                   file=sys.stderr)
             return 1
 
+    if args.abort_mode == "switch":
+        abort_fn = lambda: switch_to_hold(args.abort_deactivate, args.abort_activate)  # noqa: E731
+    else:
+        abort_fn = lambda: call_disable(args.ns)  # noqa: E731
+
     wd = SafetyWatchdog(
         args.center_xyz, args.radius,
         read_fn=lambda: read_tcp_xyz(args.ip, args.reader),
-        disable_fn=lambda: call_disable(args.ns),
+        disable_fn=abort_fn,
         rate_hz=args.rate)
     return wd.run()
 
