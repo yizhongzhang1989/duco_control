@@ -82,6 +82,9 @@ def generate_launch_description():
             'cartesian_dashboard_port', default_value='8120',
             description='cartesian_controller_dashboard web UI port.'),
         DeclareLaunchArgument(
+            'aux_frame_dashboard_port', default_value='',
+            description='aux_frame_manager 3D web UI port (empty = disabled).'),
+        DeclareLaunchArgument(
             'launch_cartesian_dashboard', default_value='true',
             description='Start the cartesian_controller_dashboard web UI.'),
         DeclareLaunchArgument(
@@ -97,7 +100,19 @@ def generate_launch_description():
     stage0 = [
         include('duco_robot_bringup', 'gcr5_910_ros2_control.launch.py',
                 use_fake_hardware=LaunchConfiguration('use_fake_hardware'),
-                use_rviz=LaunchConfiguration('use_rviz')),
+                use_rviz=LaunchConfiguration('use_rviz'),
+                apply_aux_frames='false'),
+        # aux_frame_manager owns the aux frames (ft_sensor_link, compliance_link
+        # from robot_config.yaml::duco_robot_bringup.aux_frames) now that the
+        # bringup publishes the bare manufacturer URDF. It serves the canonical
+        # augmented URDF on /cartesian/robot_description for the FZI controllers
+        # (urdf_from_topic) and mirrors it to robot_state_publisher for TF. The
+        # guard verifies the end-effector chain before the controllers engage.
+        include('aux_frame_manager', 'cartesian_urdf_source.launch.py',
+                aux_frames_section='duco_robot_bringup',
+                robot_base_link='base_link',
+                end_effector_link='compliance_link',
+                dashboard_port=LaunchConfiguration('aux_frame_dashboard_port')),
         include('duco_ft_sensor', 'ft_sensor.launch.py'),
         include('ft_sensor_gravity_compensation', 'compensation.launch.py',
                 dashboard_port=LaunchConfiguration('ft_dashboard_port')),

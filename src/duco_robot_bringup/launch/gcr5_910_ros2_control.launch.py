@@ -81,6 +81,13 @@ def generate_launch_description():
             'publish_frequency',
             default_value=str(defaults['publish_frequency']),
             description='robot_state_publisher TF rate in Hz'),
+        DeclareLaunchArgument(
+            'apply_aux_frames',
+            default_value='true',
+            description='Append the config aux_frames (ft_sensor_link, '
+                        'compliance_link, ...) to the URDF at bringup. Set '
+                        'false to publish the bare manufacturer URDF and let '
+                        'aux_frame_manager own the aux frames instead.'),
     ]
 
     info = LogInfo(msg=(
@@ -113,12 +120,17 @@ def _launch_setup(context, *args, **kwargs):
     publish_frequency = LaunchConfiguration('publish_frequency').perform(context)
     use_rviz = LaunchConfiguration('use_rviz').perform(context).lower() == 'true'
     use_db = LaunchConfiguration('db').perform(context).lower() == 'true'
+    apply_aux = (LaunchConfiguration('apply_aux_frames')
+                 .perform(context).lower() == 'true')
 
     # Lazy import: surfaces any import error at launch time, not at
     # module import time of this launch file (which would mask it).
     from cct_common.urdf_loader import augment_urdf, run_xacro
 
-    aux_frames = _load_aux_frames()
+    # When apply_aux_frames is false the bringup publishes the bare
+    # manufacturer URDF; aux_frame_manager then owns the aux frames and
+    # serves the augmented URDF on its own topic (and mirrors it to RSP).
+    aux_frames = _load_aux_frames() if apply_aux else []
     urdf_xml = run_xacro(
         str(xacro_path),
         {
@@ -127,7 +139,8 @@ def _launch_setup(context, *args, **kwargs):
             'use_fake_hardware': use_fake_hardware,
         },
     )
-    urdf_xml = augment_urdf(urdf_xml, aux_frames)
+    if aux_frames:
+        urdf_xml = augment_urdf(urdf_xml, aux_frames)
 
     robot_description_param = {
         'robot_description': ParameterValue(urdf_xml, value_type=str),
@@ -136,7 +149,8 @@ def _launch_setup(context, *args, **kwargs):
     actions: List = [
         LogInfo(msg=(
             f'[duco_robot_bringup] robot_description built '
-            f'({len(urdf_xml)} chars, aux_frames={len(aux_frames)})')),
+            f'({len(urdf_xml)} chars, aux_frames={len(aux_frames)}'
+            f'{"" if apply_aux else ", apply_aux_frames=false"})')),
     ]
 
     # static_virtual_joint_tfs (optional, from upstream)
