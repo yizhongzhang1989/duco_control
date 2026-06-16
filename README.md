@@ -24,6 +24,7 @@ dashboards.
 | [`duco_ft_sensor`](src/duco_ft_sensor) | serial driver + ROS publisher for the Duco F/T sensor | -- |
 | [`ft_sensor_dashboard`](external/cartesian_controllers_toolkit/ft_sensor_dashboard) | optional web UI for any `WrenchStamped` topic *(from the toolkit submodule)* | `8080` |
 | [`ft_sensor_gravity_compensation`](external/cartesian_controllers_toolkit/ft_sensor_gravity_compensation) | subscribes to the raw wrench + `/tf`, publishes a gravity-compensated wrench, has its own calibration UI *(from the toolkit submodule)* | `8100` |
+| [`aux_frame_manager`](external/cartesian_controllers_toolkit/aux_frame_manager) | single writer of the canonical augmented `robot_description`: appends the configured aux frames (`ft_sensor_link`, `compliance_link`) and serves them on the latched topic `/cartesian/robot_description` that the FZI controllers read; mirrors to TF via `robot_state_publisher`; optional 3D web view + live frame editor *(from the toolkit submodule)* | `8160` |
 | [`cartesian_control_manager`](external/cartesian_controllers_toolkit/cartesian_control_manager) | spawns FZI's `cartesian_force_controller` / `cartesian_motion_controller` / `cartesian_compliance_controller` (all inactive), relays the wrench, optionally publishes a zero target_wrench heartbeat, runs the engage / disengage Trigger services and a safety supervisor *(from the toolkit submodule)* | -- |
 | [`cartesian_controller_dashboard`](external/cartesian_controllers_toolkit/cartesian_controller_dashboard) | optional web UI for engage / disengage, controller selection (force / motion / compliance), and live-tuning of the active controller's gains *(from the toolkit submodule)* | `8120` |
 | [`duco_dashboard`](src/duco_dashboard) | optional web UI for joint / controller / TCP state | `8090` |
@@ -56,13 +57,16 @@ Key knobs:
 * `duco_ft_sensor.port`, `baud` -- serial device for the F/T sensor.
 * `cartesian_control_manager.max_wrench_force`, `max_wrench_torque`,
   `engage_max_joint_velocity` -- safety supervisor trip thresholds.
-* `duco_robot_bringup.aux_frames` -- list of fixed-joint TF frames the
-  bringup appends to the URDF (default chain
+* `duco_robot_bringup.aux_frames` -- list of fixed-joint TF frames
+  appended to the URDF (default chain
   `link_6 -> ft_sensor_link -> compliance_link`). `ft_sensor_link` is
   the gravity-compensation sensor frame; `compliance_link` is the FZI
-  `end_effector_link`. Edit xyz/rpy by hand or via the cartesian
-  dashboard's "Tool frames" panel; changes take effect on the next
-  `duco_robot_bringup` launch.
+  `end_effector_link`. In the full-stack / topic-sourced flow these are
+  owned by `aux_frame_manager` (the bringup publishes the bare URDF with
+  `apply_aux_frames:=false`); edit xyz/rpy by hand or via the cartesian
+  dashboard's "Tool frames" panel and the change is applied **live** (the
+  manager republishes the canonical URDF and the engaged controller swaps
+  its chain -- no relaunch needed).
 
 Anything declared in a launch file's `_FALLBACKS` block can be overridden
 on the CLI as well, e.g. `port:=9120`.
@@ -115,7 +119,7 @@ What each launch starts:
 
 | stage | Duco (`duco_bringup.launch.py`) | UR15 (`ur15_bringup.launch.py`) |
 |---|---|---|
-| 0 (now) | `duco_robot_bringup` + `duco_ft_sensor` + `ft_sensor_gravity_compensation` | `ur15_robot_bringup` (incl. FT broadcaster) + `ft_sensor_gravity_compensation` |
+| 0 (now) | `duco_robot_bringup` (bare URDF) + `aux_frame_manager` (+ guard) + `duco_ft_sensor` + `ft_sensor_gravity_compensation` | `ur15_robot_bringup` (incl. FT broadcaster) + `ft_sensor_gravity_compensation` |
 | 1 (after `cartesian_delay`, default 8 s) | `cartesian_control_manager` (real-HW limits) + `cartesian_controller_dashboard` (`8120`) + `duco_dashboard` (`8090`) | `cartesian_control_manager` (real-HW limits) + `cartesian_controller_dashboard` (`8120`) |
 
 Common overrides (forwarded to the sub-launches):
@@ -129,6 +133,9 @@ ros2 launch robot_bringup ur15_bringup.launch.py use_fake_hardware:=true robot_i
 ros2 launch robot_bringup duco_bringup.launch.py \
     ft_dashboard_port:=0 launch_cartesian_dashboard:=false \
     launch_robot_state_dashboard:=false
+
+# Enable the aux-frame 3D dashboard (off by default) on :8160
+ros2 launch robot_bringup duco_bringup.launch.py aux_frame_dashboard_port:=8160
 
 # Select a robot config explicitly (otherwise the per-robot default is used)
 ROBOT_CONFIG_PATH=$PWD/config/robot_config.ur15.yaml \
@@ -159,8 +166,16 @@ is assumed.
 ### 1. Robot bringup -- `controller_manager` + JTC
 
 ```bash
-ros2 launch duco_robot_bringup gcr5_910_ros2_control.launch.py use_rviz:=false
+ros2 launch duco_robot_bringup gcr5_910_ros2_control.launch.py \
+    use_rviz:=false apply_aux_frames:=false
 ```
+
+`apply_aux_frames:=false` makes the bringup publish the **bare**
+manufacturer URDF on `/robot_description`; `aux_frame_manager` (step 2)
+becomes the sole owner of the `ft_sensor_link` / `compliance_link` aux
+frames and serves the augmented URDF on its own topic.  (Omit the arg --
+default `true` -- only if running the bringup standalone *without*
+`aux_frame_manager`, which bakes the frames straight into the URDF.)
 
 This brings up `controller_manager`, loads the URDF, and activates
 `joint_state_broadcaster` and `arm_1_controller` (the
@@ -173,7 +188,40 @@ ros2 control list_controllers
 ros2 topic echo /joint_states --once
 ```
 
-### 2. F/T sensor driver
+### 2. Canonical URDF source -- `aux_frame_manager`
+
+```bash
+ros2 launch aux_frame_manager cartesian_urdf_source.launch.py \
+    aux_frames_section:=duco_robot_bringup \
+    end_effector_link:=compliance_link \
+    dashboard_port:=8160
+```
+
+`aux_frame_manager` is the **single writer** of the augmented URDF.  It
+reads the bare `/robot_description`, appends the
+`duco_robot_bringup.aux_frames` entries (`ft_sensor_link`,
+`compliance_link`) from `config/robot_config.yaml`, and:
+
+* publishes the canonical URDF on the latched topic
+  `/cartesian/robot_description` -- the FZI controllers read their chain
+  from here (`urdf_from_topic: true` in
+  [`config/fzi_preset.yaml`](src/duco_robot_bringup/config/fzi_preset.yaml)),
+  so tool-frame edits swap their chain **live**;
+* mirrors it to `robot_state_publisher` so `/tf` (and RViz) get the aux
+  frames too;
+* runs a **guard** that latches `/cartesian/robot_description_ready`
+  once `compliance_link` is present and in the `base_link -> ee` chain,
+  and prints an actionable error otherwise.
+
+`dashboard_port:=8160` also serves a 3D view + live frame editor on
+<http://localhost:8160/> (omit it to run headless).  Verify:
+
+```bash
+ros2 topic echo /cartesian/robot_description --once | head -c 120  # canonical URDF present
+ros2 run tf2_ros tf2_echo base_link compliance_link               # aux frame in TF
+```
+
+### 3. F/T sensor driver
 
 ```bash
 ros2 launch duco_ft_sensor ft_sensor.launch.py
@@ -189,7 +237,7 @@ Optional raw-wrench web plot on <http://localhost:8080/>:
 ros2 launch ft_sensor_dashboard dashboard.launch.py topic:=/duco_ft_sensor/wrench_raw port:=8080
 ```
 
-### 3. Gravity compensation
+### 4. Gravity compensation
 
 ```bash
 ros2 launch ft_sensor_gravity_compensation compensation.launch.py dashboard_port:=8100
@@ -201,7 +249,7 @@ the **gravity-compensated** wrench on `/duco_ft_sensor/wrench_compensated`
 (BEST_EFFORT).  Passing `dashboard_port:=8100` also serves the
 calibration UI on <http://localhost:8100/> (omit it to run headless).
 
-### 4. Cartesian-controller orchestrator
+### 5. Cartesian-controller orchestrator
 
 ```bash
 # Conservative real-HW limits + dashboard-friendly defaults.
@@ -239,6 +287,11 @@ This:
 Use `cartesian_control.launch.py` instead of `_real` when running
 against fake hardware (no conservative-limit overlay).
 
+> Requires step 2 (`aux_frame_manager`) to be up: the FZI controllers
+> read their chain from `/cartesian/robot_description`
+> (`urdf_from_topic: true`), so without that topic they load but stay
+> deferred and never reach `inactive`.
+
 Verify:
 
 ```bash
@@ -257,7 +310,7 @@ ros2 topic hz /cartesian_force_controller/target_wrench   # ~10 Hz
 ros2 param set /cartesian_control_manager active_controller_name cartesian_compliance_controller
 ```
 
-### 5. Cartesian dashboard (optional but recommended)
+### 6. Cartesian dashboard (optional but recommended)
 
 ```bash
 ros2 launch cartesian_controller_dashboard dashboard.launch.py port:=8120
@@ -276,13 +329,15 @@ Open <http://localhost:8120/>.  The dashboard:
 * has a **Tool frames** panel for editing the xyz / rpy of each
   `duco_robot_bringup.aux_frames` entry (e.g. `ft_sensor_link`,
   `compliance_link`).  Saving writes back to `config/robot_config.yaml`
-  preserving comments; the new values take effect on the next
-  `duco_robot_bringup` launch.
+  preserving comments **and** routes the change through
+  `aux_frame_manager`, which republishes the canonical URDF so the
+  engaged FZI controller swaps its KDL chain **live** (no relaunch
+  needed).
 
 The dashboard is purely a UI; closing it does **not** stop the
 orchestrator, the controller, or the safety supervisor.
 
-### 6. Robot-state dashboard (optional)
+### 7. Robot-state dashboard (optional)
 
 ```bash
 ros2 launch duco_dashboard dashboard.launch.py
@@ -472,14 +527,20 @@ For a contained sanity check without the real Duco controller:
 
 ```bash
 # In config/robot_config.yaml: duco_robot_bringup.use_fake_hardware: true
-ros2 launch duco_robot_bringup gcr5_910_ros2_control.launch.py use_rviz:=false
+ros2 launch duco_robot_bringup gcr5_910_ros2_control.launch.py \
+    use_rviz:=false apply_aux_frames:=false
+ros2 launch aux_frame_manager cartesian_urdf_source.launch.py \
+    aux_frames_section:=duco_robot_bringup end_effector_link:=compliance_link
 ros2 launch cartesian_control_manager cartesian_control.launch.py
 ros2 launch cartesian_controller_dashboard dashboard.launch.py     # optional
 ```
 
 The FT pipeline isn't needed for fake-hardware sanity (FZI just sees a
-silent topic and won't move).  The orchestrator, dashboard, and
-controller-switching paths are exercised end-to-end.
+silent topic and won't move).  `aux_frame_manager` **is** still required:
+the FZI controllers read their chain from `/cartesian/robot_description`
+(`urdf_from_topic: true`), so without it they stay deferred and never
+activate.  The orchestrator, dashboard, and controller-switching paths
+are exercised end-to-end.
 
 ---
 
@@ -544,6 +605,29 @@ around `pd_gains.trans p = 0.2`, `error_scale = 0.05`.
 `controller_manager`'s `switch_controller` service.  All UIs (dashboards)
 talk through standard topics + Trigger services, so they're optional and
 swappable.
+
+### Canonical URDF flow
+
+The URDF has a single owner.  `duco_robot_bringup` publishes the **bare**
+manufacturer URDF on `/robot_description` (launched with
+`apply_aux_frames:=false`); `aux_frame_manager` appends the configured
+aux frames and publishes the **canonical** URDF on the latched topic
+`/cartesian/robot_description`.  The FZI controllers read their kinematic
+chain from that topic (`urdf_from_topic: true` in `fzi_preset.yaml`), and
+the manager mirrors the same URDF to `robot_state_publisher` so `/tf` and
+RViz stay consistent.  This makes tool-frame offsets editable at runtime:
+the manager republishes and each engaged controller atomically swaps its
+KDL chain in the RT loop -- no relaunch.
+
+```
+duco_robot_bringup --/robot_description (bare)--> aux_frame_manager
+                                                    |  append aux frames
+                       /cartesian/robot_description |  (latched, single writer)
+        +-------------------------+-----------------+--------------------+
+        v                         v                                      v
+  FZI controllers          robot_state_publisher                    aux_frame
+  (urdf_from_topic)         --> /tf, /tf_static                     dashboard :8160
+```
 
 ---
 
@@ -698,7 +782,8 @@ duco_control/
 │   ├── duco_ros2_driver/             # submodule (upstream Duco driver)
 │   ├── cartesian_controllers/        # submodule (FZI fork w/ Duco mods)
 │   └── cartesian_controllers_toolkit/  # submodule: robot-agnostic Cartesian stack
-│       ├── common/                   #   shared config loader + URDF helpers
+│       ├── cct_common/               #   shared config loader + URDF helpers
+│       ├── aux_frame_manager/        #   single-writer of the canonical URDF (+ 3D dashboard)
 │       ├── cartesian_control_manager/  # FZI orchestrator + safety supervisor
 │       ├── cartesian_controller_dashboard/  # optional web UI
 │       ├── ft_sensor_gravity_compensation/  # gravity-compensated wrench
