@@ -57,16 +57,17 @@ Key knobs:
 * `duco_ft_sensor.port`, `baud` -- serial device for the F/T sensor.
 * `cartesian_control_manager.max_wrench_force`, `max_wrench_torque`,
   `engage_max_joint_velocity` -- safety supervisor trip thresholds.
-* `duco_robot_bringup.aux_frames` -- list of fixed-joint TF frames
+* `aux_frame_manager.aux_frames` -- list of fixed-joint TF frames
   appended to the URDF (default chain
   `link_6 -> ft_sensor_link -> compliance_link`). `ft_sensor_link` is
   the gravity-compensation sensor frame; `compliance_link` is the FZI
-  `end_effector_link`. In the full-stack / topic-sourced flow these are
-  owned by `aux_frame_manager` (the bringup publishes the bare URDF with
-  `apply_aux_frames:=false`); edit xyz/rpy by hand or via the cartesian
-  dashboard's "Tool frames" panel and the change is applied **live** (the
-  manager republishes the canonical URDF and the engaged controller swaps
-  its chain -- no relaunch needed).
+  `end_effector_link`. `aux_frame_manager` reads this list from its
+  **own** config section and is the sole owner of the frames (the
+  bringup publishes the bare URDF with `apply_aux_frames:=false`); edit
+  xyz/rpy by hand or via the cartesian dashboard's "Tool frames" panel
+  and the change is applied **live** (the manager republishes the
+  canonical URDF and the engaged controller swaps its chain -- no
+  relaunch needed).
 
 Anything declared in a launch file's `_FALLBACKS` block can be overridden
 on the CLI as well, e.g. `port:=9120`.
@@ -119,7 +120,7 @@ What each launch starts:
 
 | stage | Duco (`duco_bringup.launch.py`) | UR15 (`ur15_bringup.launch.py`) |
 |---|---|---|
-| 0 (now) | `duco_robot_bringup` (bare URDF) + `aux_frame_manager` (+ guard) + `duco_ft_sensor` + `ft_sensor_gravity_compensation` | `ur15_robot_bringup` (incl. FT broadcaster) + `ft_sensor_gravity_compensation` |
+| 0 (now) | `duco_robot_bringup` (bare URDF) + `aux_frame_manager` (+ guard, dashboard `8160`) + `duco_ft_sensor` + `ft_sensor_gravity_compensation` | `ur15_robot_bringup` (incl. FT broadcaster) + `ft_sensor_gravity_compensation` |
 | 1 (after `cartesian_delay`, default 8 s) | `cartesian_control_manager` (real-HW limits) + `cartesian_controller_dashboard` (`8120`) + `duco_dashboard` (`8090`) | `cartesian_control_manager` (real-HW limits) + `cartesian_controller_dashboard` (`8120`) |
 
 Common overrides (forwarded to the sub-launches):
@@ -132,10 +133,10 @@ ros2 launch robot_bringup ur15_bringup.launch.py use_fake_hardware:=true robot_i
 # Headless (no web dashboards), and move the gravity-comp UI off 8100
 ros2 launch robot_bringup duco_bringup.launch.py \
     ft_dashboard_port:=0 launch_cartesian_dashboard:=false \
-    launch_robot_state_dashboard:=false
+    launch_robot_state_dashboard:=false aux_frame_dashboard_port:=''
 
-# Enable the aux-frame 3D dashboard (off by default) on :8160
-ros2 launch robot_bringup duco_bringup.launch.py aux_frame_dashboard_port:=8160
+# Disable the aux-frame 3D dashboard (on by default on :8160)
+ros2 launch robot_bringup duco_bringup.launch.py aux_frame_dashboard_port:=''
 
 # Select a robot config explicitly (otherwise the per-robot default is used)
 ROBOT_CONFIG_PATH=$PWD/config/robot_config.ur15.yaml \
@@ -192,15 +193,15 @@ ros2 topic echo /joint_states --once
 
 ```bash
 ros2 launch aux_frame_manager cartesian_urdf_source.launch.py \
-    aux_frames_section:=duco_robot_bringup \
     end_effector_link:=compliance_link \
     dashboard_port:=8160
 ```
 
 `aux_frame_manager` is the **single writer** of the augmented URDF.  It
 reads the bare `/robot_description`, appends the
-`duco_robot_bringup.aux_frames` entries (`ft_sensor_link`,
-`compliance_link`) from `config/robot_config.yaml`, and:
+`aux_frame_manager.aux_frames` entries (`ft_sensor_link`,
+`compliance_link`) from `config/robot_config.yaml` (its **own** config
+section -- no selector argument needed), and:
 
 * publishes the canonical URDF on the latched topic
   `/cartesian/robot_description` -- the FZI controllers read their chain
@@ -327,7 +328,7 @@ Open <http://localhost:8120/>.  The dashboard:
   (`pd_gains.trans_*.p`, `pd_gains.rot_*.p`, `solver.error_scale`,
   `solver.iterations`) without restarting anything,
 * has a **Tool frames** panel for editing the xyz / rpy of each
-  `duco_robot_bringup.aux_frames` entry (e.g. `ft_sensor_link`,
+  `aux_frame_manager.aux_frames` entry (e.g. `ft_sensor_link`,
   `compliance_link`).  Saving writes back to `config/robot_config.yaml`
   preserving comments **and** routes the change through
   `aux_frame_manager`, which republishes the canonical URDF so the
@@ -530,7 +531,7 @@ For a contained sanity check without the real Duco controller:
 ros2 launch duco_robot_bringup gcr5_910_ros2_control.launch.py \
     use_rviz:=false apply_aux_frames:=false
 ros2 launch aux_frame_manager cartesian_urdf_source.launch.py \
-    aux_frames_section:=duco_robot_bringup end_effector_link:=compliance_link
+    end_effector_link:=compliance_link
 ros2 launch cartesian_control_manager cartesian_control.launch.py
 ros2 launch cartesian_controller_dashboard dashboard.launch.py     # optional
 ```

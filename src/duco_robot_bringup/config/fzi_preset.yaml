@@ -19,7 +19,7 @@
 #     canonical URDF served by aux_frame_manager (urdf_from_topic).
 #   * The KDL chain runs base_link -> link_1..link_6 -> ft_sensor_link
 #     -> compliance_link (the latter two are aux frames declared in
-#     ``robot_config.yaml::duco_robot_bringup.aux_frames`` and appended
+#     ``robot_config.yaml::aux_frame_manager.aux_frames`` and appended
 #     to the canonical URDF by ``aux_frame_manager``, which serves it on
 #     ``/cartesian/robot_description``). With zero offsets the tip pose
 #     is identical to link_6 -- so JTC behaviour is unchanged -- but
@@ -45,7 +45,7 @@
 # ``ft_sensor_ref_link`` is the URDF frame in which the FT measurement is
 # expressed.  It must exist in the KDL chain seen by the controller; the
 # ``ft_sensor_link`` aux frame is appended to the canonical URDF by
-# ``aux_frame_manager`` from ``robot_config.yaml::duco_robot_bringup.aux_frames``.
+# ``aux_frame_manager`` from ``robot_config.yaml::aux_frame_manager.aux_frames``.
 cartesian_force_controller:
   ros__parameters:
     # URDF source: read the canonical (aux-frame-augmented) URDF from the
@@ -297,7 +297,7 @@ cartesian_motion_controller:
 # (e.g. 50-100 N/m) at the cost of stiffer "feel".
 #
 # Both ``ft_sensor_ref_link`` and ``compliance_ref_link`` resolve to aux
-# frames declared in ``robot_config.yaml::duco_robot_bringup.aux_frames``
+# frames declared in ``robot_config.yaml::aux_frame_manager.aux_frames``
 # and appended to the canonical URDF by ``aux_frame_manager`` (served on
 # ``/cartesian/robot_description``).
 cartesian_compliance_controller:

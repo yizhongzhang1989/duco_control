@@ -89,11 +89,6 @@ cartesian_controller_dashboard:
   # for UR15 the end-effector frame is tool0 (or wrist_3_link / flange).
   base_frame:          "base_link"
   tool_frame:          "tool0"
-  # Top-level robot_config.yaml key whose aux_frames list the
-  # dashboard's "Tool frames" panel reads / writes.  Stock UR15 has
-  # the chain base_link -> ... -> tool0 with no aux frames needed,
-  # so this is left pointing at our (empty) ur15_robot_bringup section.
-  aux_frames_section:  "ur15_robot_bringup"
   service_timeout_sec: 2.0
   host: "0.0.0.0"
   port: 8120
@@ -114,15 +109,21 @@ ur15_robot_bringup:
   reverse_ip: "0.0.0.0"         # auto-detect host IP for URScript
   initial_joint_controller: "scaled_joint_trajectory_controller"
   activate_joint_controller: true
-  # Stock UR15 has the chain base_link -> ... -> tool0 directly, so we
-  # do not need any auxiliary frames for the FZI Cartesian solver.
-  # If you ever mount a tool plate, append entries here:
-  #   - name: tool_plate
-  #     parent: tool0
-  #     xyz: [0.0, 0.0, 0.020]
-  #     rpy: [0.0, 0.0, 0.0]
-  # and a static_transform_publisher (or a custom URDF) to make them
-  # actually visible to controller_manager.  This bringup launch
-  # currently does NOT append aux frames to the URDF (unlike Duco) --
-  # add that later if the tool stack grows.
+  # Stock UR15 has the chain base_link -> ... -> tool0 directly, so no
+  # auxiliary frames are needed for the FZI Cartesian solver (see the
+  # `aux_frame_manager:` section below).
+
+# ============================================================================
+# aux_frame_manager (single-writer of the canonical augmented URDF)
+# ============================================================================
+# Auxiliary frames appended to the robot URDF as fixed-joint children of an
+# existing link, read from this node's OWN section. Stock UR15 reaches tool0
+# directly, so the list is empty. If you mount a tool plate, append entries:
+#   - name: tool_plate
+#     parent: tool0
+#     xyz: [0.0, 0.0, 0.020]
+#     rpy: [0.0, 0.0, 0.0]
+# and set end_effector_link to the new tip so the FZI guard verifies it in-chain.
+aux_frame_manager:
+  end_effector_link: "tool0"
   aux_frames: []

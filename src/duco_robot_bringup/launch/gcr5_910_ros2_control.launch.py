@@ -240,7 +240,7 @@ def _launch_setup(context, *args, **kwargs):
 # ---------------------------------------------------------------------------
 # Aux frames loader.
 #
-# Reads ``duco_robot_bringup.aux_frames`` from ``config/robot_config.yaml``
+# Reads ``aux_frame_manager.aux_frames`` from ``config/robot_config.yaml``
 # (via ``cct_common.config_manager``) and returns a list of normalised
 # entries. Each entry is a dict::
 #
@@ -261,14 +261,14 @@ def _load_aux_frames() -> List[Dict]:
         cfg = get_config()
     except Exception:  # noqa: BLE001
         return []
-    if not cfg.has('duco_robot_bringup.aux_frames'):
+    if not cfg.has('aux_frame_manager.aux_frames'):
         return []
-    raw = cfg.get('duco_robot_bringup.aux_frames')
+    raw = cfg.get('aux_frame_manager.aux_frames')
     if raw is None:
         return []
     if not isinstance(raw, list):
         raise ValueError(
-            f"'duco_robot_bringup.aux_frames' must be a list, got "
+            f"'aux_frame_manager.aux_frames' must be a list, got "
             f"{type(raw).__name__}")
 
     out: List[Dict] = []

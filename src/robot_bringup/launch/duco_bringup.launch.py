@@ -4,14 +4,16 @@ Brings up the COMPLETE Duco hand-guidance / Cartesian-compliance stack with
 a single command:
 
   Stage 0 (immediately):
-    1. duco_robot_bringup   -- controller_manager + URDF + arm_1_controller (JTC)
-    2. duco_ft_sensor       -- serial F/T sensor driver (raw wrench)
-    3. ft_sensor_gravity_compensation -- gravity-compensated wrench (+ optional UI)
+    1. duco_robot_bringup   -- controller_manager + bare URDF + arm_1_controller (JTC)
+    2. aux_frame_manager    -- single writer of the canonical augmented URDF on
+                               /cartesian/robot_description (+ guard, + 3D web UI on :8160)
+    3. duco_ft_sensor       -- serial F/T sensor driver (raw wrench)
+    4. ft_sensor_gravity_compensation -- gravity-compensated wrench (+ optional UI)
 
   Stage 1 (after ``cartesian_delay`` seconds, so controller_manager is up):
-    4. cartesian_control_manager (real-HW conservative limits) -- FZI orchestrator
-    5. cartesian_controller_dashboard -- engage / tune web UI   (optional)
-    6. duco_dashboard       -- robot-state web UI                (optional)
+    5. cartesian_control_manager (real-HW conservative limits) -- FZI orchestrator
+    6. cartesian_controller_dashboard -- engage / tune web UI   (optional)
+    7. duco_dashboard       -- robot-state web UI                (optional)
 
 The Cartesian layer is staged after a short delay because its FZI spawners
 need a live ``controller_manager`` (they also wait for the service, so the
@@ -66,6 +68,11 @@ def generate_launch_description():
 
     use_fake_default = str(
         config_value('duco_robot_bringup', 'use_fake_hardware', False)).lower()
+    # aux-frame 3D dashboard port: single source of truth is the
+    # aux_frame_manager.dashboard_port config key (like the other dashboard
+    # ports); fall back to 8160 if the key is absent.
+    aux_frame_dashboard_default = str(
+        config_value('aux_frame_manager', 'dashboard_port', '8160'))
 
     args = [
         DeclareLaunchArgument(
@@ -82,8 +89,9 @@ def generate_launch_description():
             'cartesian_dashboard_port', default_value='8120',
             description='cartesian_controller_dashboard web UI port.'),
         DeclareLaunchArgument(
-            'aux_frame_dashboard_port', default_value='',
-            description='aux_frame_manager 3D web UI port (empty = disabled).'),
+            'aux_frame_dashboard_port', default_value=aux_frame_dashboard_default,
+            description='aux_frame_manager 3D web UI port (empty disables it; '
+                        'default from aux_frame_manager.dashboard_port in config).'),
         DeclareLaunchArgument(
             'launch_cartesian_dashboard', default_value='true',
             description='Start the cartesian_controller_dashboard web UI.'),
@@ -103,13 +111,12 @@ def generate_launch_description():
                 use_rviz=LaunchConfiguration('use_rviz'),
                 apply_aux_frames='false'),
         # aux_frame_manager owns the aux frames (ft_sensor_link, compliance_link
-        # from robot_config.yaml::duco_robot_bringup.aux_frames) now that the
-        # bringup publishes the bare manufacturer URDF. It serves the canonical
-        # augmented URDF on /cartesian/robot_description for the FZI controllers
-        # (urdf_from_topic) and mirrors it to robot_state_publisher for TF. The
-        # guard verifies the end-effector chain before the controllers engage.
+        # from robot_config.yaml::aux_frame_manager.aux_frames -- its OWN section)
+        # now that the bringup publishes the bare manufacturer URDF. It serves the
+        # canonical augmented URDF on /cartesian/robot_description for the FZI
+        # controllers (urdf_from_topic) and mirrors it to robot_state_publisher for
+        # TF. The guard verifies the end-effector chain before controllers engage.
         include('aux_frame_manager', 'cartesian_urdf_source.launch.py',
-                aux_frames_section='duco_robot_bringup',
                 robot_base_link='base_link',
                 end_effector_link='compliance_link',
                 dashboard_port=LaunchConfiguration('aux_frame_dashboard_port')),
