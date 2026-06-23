@@ -18,13 +18,13 @@
     rate_hz: 50.0
 
     # ---- shaping (per-axis [x, y, z]) ---------------------------------
-    linear_scale: [0.05, 0.05, 0.05]    # m/s per unit twist
-    angular_scale: [0.3, 0.3, 0.3]      # rad/s per unit twist
+    linear_scale: [0.15, 0.15, 0.15]    # m/s per unit twist
+    angular_scale: [0.6, 0.6, 0.6]      # rad/s per unit twist
     deadband_lin: 0.0                   # driver already deadbands
     deadband_ang: 0.0
-    max_linear_speed: 0.05              # m/s hard clamp
-    max_angular_speed: 0.3              # rad/s hard clamp
-    jog_frame: "tool"                   # tool | base
+    max_linear_speed: 0.30              # m/s hard clamp
+    max_angular_speed: 1.0              # rad/s hard clamp
+    jog_frame: "base"                   # base | tool
     input_timeout: 0.2                  # s — twist staleness -> zero
 
     # ---- buttons ------------------------------------------------------
@@ -38,7 +38,7 @@
     deadman_mode: "none"                # none | hold | toggle
     button1_index: 1
     button1_action: "speed"             # speed | position_only | none
-    speed_scales: [0.25, 1.0, 2.0]
+    speed_scales: [0.5, 1.0, 2.0]
 
     # ---- downstream commander (optional) ------------------------------
     enable_commander: true

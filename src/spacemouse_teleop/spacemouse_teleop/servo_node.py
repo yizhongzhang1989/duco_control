@@ -129,7 +129,7 @@ class SpaceMouseServo(Node):
         self._prev_deadman = False
         self._prev_button1 = False
         self._engaged = False
-        self._speed_idx = 0
+        self._speed_idx = min(1, len(self._speed_scales) - 1)  # start at speed_scales[1] (1.0x), not the slow preset
         self._position_only = False
         self._target_pos = None     # np.ndarray(3,) or None
         self._target_quat = None    # np.ndarray(4,) or None
