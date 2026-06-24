@@ -539,9 +539,11 @@ ros2 launch robot_bringup duco_bringup.launch.py use_fake_hardware:=false
 ros2 launch ikt_pose_commander commander.launch.py \
     dashboard_port:=8180 controlled_frame:=compliance_link command_mode:=fpc
 
-# 3. SpaceMouse driver + jog bridge + On/Off dashboard on :8200.
-ros2 launch spacemouse_teleop spacemouse_servo.launch.py \
-    launch_driver:=true dashboard_port:=8200
+# 3. SpaceMouse driver (shared hardware; launched on its own).
+ros2 launch spacemouse spacemouse.launch.py
+
+# 4. Jog bridge + On/Off dashboard on :8200.
+ros2 launch spacemouse_teleop spacemouse_servo.launch.py dashboard_port:=8200
 ```
 
 * **Pose-commander dashboard** <http://localhost:8180/> &mdash; 3D gizmo,
@@ -549,7 +551,8 @@ ros2 launch spacemouse_teleop spacemouse_servo.launch.py \
 * **SpaceMouse On/Off dashboard** <http://localhost:8200/> &mdash; gate the
   sender: **On** jogs with the puck; **Off** releases the commander so you can
   drive from the :8180 dashboard instead (they share one target topic &mdash; use
-  one source at a time).
+  one source at a time). Also shows the live device status &mdash; axis bars, a 3D
+  preview, and buttons.
 
 Teleop defaults (`base_frame`, `tip_frame`, `jog_frame`, speeds, `dashboard_port`)
 live under `spacemouse_teleop:` in

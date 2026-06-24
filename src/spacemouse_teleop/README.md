@@ -72,10 +72,12 @@ ros2 launch robot_bringup duco_bringup.launch.py use_fake_hardware:=false
 ros2 launch ikt_pose_commander commander.launch.py \
     dashboard_port:=8180 controlled_frame:=compliance_link command_mode:=fpc
 
-# 3. SpaceMouse driver + jog bridge + On/Off dashboard on :8200
+# 3. SpaceMouse driver (shared hardware; launched on its own).
+ros2 launch spacemouse spacemouse.launch.py
+
+# 4. Jog bridge + On/Off dashboard on :8200
 #    (base_frame/tip_frame/jog_frame default from robot_config.yaml).
-ros2 launch spacemouse_teleop spacemouse_servo.launch.py \
-    launch_driver:=true dashboard_port:=8200
+ros2 launch spacemouse_teleop spacemouse_servo.launch.py dashboard_port:=8200
 ```
 
 * **Pose-commander dashboard** &rarr; <http://localhost:8180/> (3D gizmo,
@@ -83,16 +85,19 @@ ros2 launch spacemouse_teleop spacemouse_servo.launch.py \
 * **SpaceMouse On/Off dashboard** &rarr; <http://localhost:8200/> &mdash; switch
   the sender **On** (jog with the puck) / **Off** (release the commander so you
   can drive from the :8180 dashboard instead). The two share one target topic, so
-  use one source at a time.
+  use one source at a time. It also shows the **live device status** &mdash; axis
+  bars, a 3D preview cube, and button indicators (from `spacenav/twist` +
+  `spacenav/joy`).
 
 With `deadman_mode: none` (the default) the bridge auto-enables the commander and
 jogs as soon as you touch the puck &mdash; centre it to hold.
 
-### One-command full chain (its own commander instance)
+### One-command commander + bridge (its own commander instance)
 
-When you don't need a separate commander/dashboard, this starts the `spacenav`
-driver, a private `ikt_pose_commander` instance pinned to `tip_frame` (joints +
-controllers auto-derive), and the bridge wired to it:
+When you don't need a separate commander/dashboard, this starts a private
+`ikt_pose_commander` instance pinned to `tip_frame` (joints + controllers
+auto-derive) and the bridge wired to it. Launch the `spacenav` driver
+separately first (`ros2 launch spacemouse spacemouse.launch.py`):
 
 ```bash
 ros2 launch spacemouse_teleop spacemouse_teleop.launch.py \
@@ -108,10 +113,15 @@ ros2 launch spacemouse_teleop spacemouse_teleop.launch.py \
 # (bring up the FZI controller via cartesian_control_manager separately)
 ```
 
-### Bridge node only (no driver / dashboard)
+### Bridge node only
+
+The servo never starts the driver &mdash; launch the `spacenav` driver
+separately (`ros2 launch spacemouse spacemouse.launch.py`). The On/Off dashboard
+comes up only when `dashboard_port` is non-empty (default `8200` from
+`robot_config.yaml`; set it to `""` there to run headless):
 
 ```bash
-ros2 launch spacemouse_teleop spacemouse_servo.launch.py launch_driver:=false
+ros2 launch spacemouse_teleop spacemouse_servo.launch.py
 ```
 
 ## ROS interface

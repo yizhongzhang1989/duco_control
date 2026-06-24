@@ -3,18 +3,17 @@
 Defaults to driving ``ikt_pose_commander`` (publishes to
 ``ikt_pose_commander/target_pose``). Set ``target_pose_topic`` to a FZI
 controller's ``target_frame`` to use the cartesian_motion_controller path
-instead. Optionally also starts the ``spacenav`` driver (``launch_driver``).
+instead.
+
+The ``spacenav`` driver is launched SEPARATELY (it is shared hardware):
+``ros2 launch spacemouse spacemouse.launch.py``.
 
 ``base_frame`` and ``tip_frame`` are REQUIRED (the node refuses to start
 without them).
 """
-import os
-
-from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogInfo
+from launch.actions import DeclareLaunchArgument, LogInfo
 from launch.conditions import IfCondition
-from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -32,7 +31,6 @@ def generate_launch_description():
     target_pose_topic = LaunchConfiguration('target_pose_topic')
     jog_frame = LaunchConfiguration('jog_frame')
     enable_commander = LaunchConfiguration('enable_commander')
-    launch_driver = LaunchConfiguration('launch_driver')
     dashboard_port = LaunchConfiguration('dashboard_port')
 
     args = [
@@ -48,18 +46,9 @@ def generate_launch_description():
         DeclareLaunchArgument('enable_commander',
                               default_value=str(d['enable_commander']).lower(),
                               description='Call the commander enable/disable on engage/release.'),
-        DeclareLaunchArgument('launch_driver', default_value='false',
-                              description='Also start the spacenav driver.'),
         DeclareLaunchArgument('dashboard_port', default_value=str(d['dashboard_port']),
                               description='If set (e.g. 8200), also launch the on/off dashboard.'),
     ]
-
-    spacenav_driver = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(os.path.join(
-            get_package_share_directory('spacemouse'),
-            'launch', 'spacemouse.launch.py')),
-        condition=IfCondition(launch_driver),
-    )
 
     servo = Node(
         package='spacemouse_teleop',
@@ -103,10 +92,12 @@ def generate_launch_description():
         parameters=[{
             'port': ParameterValue(dashboard_port, value_type=int),
             'servo_ns': '/spacemouse_servo',
+            'twist_topic': d['input_topic'],
+            'joy_topic': d['joy_topic'],
         }],
         condition=IfCondition(PythonExpression(["'", dashboard_port, "' != ''"])),
     )
 
     return LaunchDescription(
         args + [LogInfo(msg='[spacemouse_teleop] config: ' + source),
-                spacenav_driver, servo, dashboard])
+                servo, dashboard])

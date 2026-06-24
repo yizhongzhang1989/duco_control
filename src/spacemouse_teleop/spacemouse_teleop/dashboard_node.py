@@ -17,6 +17,8 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import rclpy
 from rclpy.node import Node
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import Joy
 from std_msgs.msg import String
 from std_srvs.srv import SetBool
 
@@ -57,6 +59,70 @@ _PAGE = r"""<!DOCTYPE html>
   .pill.ok { color:var(--on); border-color:var(--on); }
   .pill.bad { color:var(--off); border-color:var(--off); }
   .msg { color:var(--mut); font-size:12px; min-height:16px; margin-top:10px; }
+  /* device viz (axes + 3D preview) */
+  .dev-head { display:flex; align-items:center; gap:10px; font-weight:600;
+              font-size:15px; margin-bottom:4px; }
+  .dev-note { color:var(--mut); font-size:11px; margin-bottom:12px; }
+  .dev-grid { display:grid; grid-template-columns:190px 1fr; gap:16px;
+              align-items:center; }
+  @media (max-width:540px){ .dev-grid{ grid-template-columns:1fr; } }
+  .scene { height:190px; perspective:700px; display:flex; align-items:center;
+           justify-content:center; }
+  /* camera: true right-handed Z-up view. This matrix replicates the 3dconnexion
+     reference camera (Z up, +Y left, +X into the screen). Its determinant is -1,
+     which is REQUIRED: CSS's basis (x-right, y-down, z-out) is left-handed, so a
+     right-handed world must be reflected into it for the frame to read right-handed.
+     (A plain rotateX/rotateZ can never fix handedness -- rotations are det +1.) */
+  .view { transform-style:preserve-3d;
+          transform:matrix3d(0.2402,-0.4746,-0.8468,0, -0.9707,-0.1174,-0.2095,0,
+                             0,-0.8723,0.4889,0, 0,0,0,1); }
+  .cube { position:relative; width:84px; height:84px; transform-style:preserve-3d;
+          cursor:pointer; }
+  .face { position:absolute; width:84px; height:84px;
+          border:1px solid rgba(255,255,255,.4); display:flex; align-items:center;
+          justify-content:center; font-weight:700; font-size:13px;
+          color:#0d1117; opacity:.55; }
+  .f-px{ background:#e5534b; transform:rotateY(90deg) translateZ(42px); }
+  .f-nx{ background:#9e3d37; transform:rotateY(-90deg) translateZ(42px); }
+  .f-py{ background:#3fb950; transform:rotateX(-90deg) translateZ(42px); }
+  .f-ny{ background:#2c8038; transform:rotateX(90deg) translateZ(42px); }
+  .f-pz{ background:#2f81f7; transform:translateZ(42px); }
+  .f-nz{ background:#2059b0; transform:rotateY(180deg) translateZ(42px); }
+  /* FIXED reference frame (does NOT rotate) -- align the SpaceMouse base to it */
+  .refframe { position:absolute; left:50%; top:50%; width:0; height:0;
+              transform-style:preserve-3d; pointer-events:none; }
+  .rf { position:absolute; left:0; top:-1px; height:2px; width:96px;
+        transform-origin:0 50%; }
+  .rf::after { content:''; position:absolute; right:-1px; top:50%; width:0; height:0;
+               transform:translateY(-50%); border-top:5px solid transparent;
+               border-bottom:5px solid transparent; border-left:9px solid currentColor; }
+  .rf.x { color:#ff6b61;
+          background:repeating-linear-gradient(90deg,#ff6b61 0 7px,transparent 7px 12px);
+          transform:rotateY(0deg); }
+  .rf.y { color:#56d364;
+          background:repeating-linear-gradient(90deg,#56d364 0 7px,transparent 7px 12px);
+          transform:rotateZ(90deg); }
+  .rf.z { color:#58a6ff;
+          background:repeating-linear-gradient(90deg,#58a6ff 0 7px,transparent 7px 12px);
+          transform:rotateY(-90deg); }
+  .triad-legend { font-size:11px; color:var(--mut); text-align:center;
+                  margin-top:6px; }
+  .axes { display:flex; flex-direction:column; gap:7px; }
+  .arow { display:flex; align-items:center; gap:8px; }
+  .alabel { width:42px; font-size:11px; color:var(--mut); text-align:right; }
+  .atrack { flex:1; height:14px; background:#21262d; border-radius:4px;
+            position:relative; overflow:hidden; }
+  .acenter { position:absolute; left:50%; top:0; bottom:0; width:1px;
+             background:var(--bd); }
+  .afill { position:absolute; top:2px; bottom:2px; border-radius:3px;
+           transition:left .05s, width .05s; }
+  .aval { width:46px; font-family:monospace; font-size:11px; }
+  .btns-dev { display:flex; gap:6px; flex-wrap:wrap; margin-top:14px; }
+  .bdot { min-width:30px; height:24px; padding:0 6px; border-radius:6px;
+          background:#21262d; border:1px solid var(--bd); color:var(--mut);
+          font-family:monospace; font-size:11px; line-height:24px;
+          text-align:center; }
+  .bdot.on { background:var(--on); color:#0d1117; border-color:var(--on); }
 </style>
 </head>
 <body>
@@ -86,6 +152,33 @@ _PAGE = r"""<!DOCTYPE html>
       <div class="k">base &rarr; tip</div><div id="frames">—</div>
       <div class="k">input</div><div id="fresh">—</div>
     </div>
+  </div>
+
+  <div class="card">
+    <div class="dev-head">SpaceMouse device
+      <span id="devhz" class="pill bad">— Hz</span></div>
+    <div class="dev-note">The dashed frame is the SpaceMouse base / operating frame
+      (Z&nbsp;up, right-handed). The cube starts aligned with it &mdash; push or twist
+      the puck to translate and rotate the cube within this frame. Click the cube to
+      recentre.</div>
+    <div class="dev-grid">
+      <div>
+        <div class="scene"><div class="view">
+          <div class="refframe"><div class="rf x"></div><div class="rf y"></div>
+            <div class="rf z"></div></div>
+          <div class="cube" id="cube">
+            <div class="face f-px"></div><div class="face f-nx"></div>
+            <div class="face f-py"></div><div class="face f-ny"></div>
+            <div class="face f-pz"></div><div class="face f-nz"></div>
+          </div>
+        </div></div>
+        <div class="triad-legend"><b style="color:#e5534b">X</b>
+          <b style="color:#3fb950">Y</b> <b style="color:#2f81f7">Z</b> &mdash; dashed
+          = SpaceMouse operating frame; the cube moves &amp; rotates within it</div>
+      </div>
+      <div class="axes" id="axisGroup"></div>
+    </div>
+    <div class="btns-dev" id="btnGrid"></div>
   </div>
 </div>
 <script>
@@ -133,10 +226,118 @@ async function setEnabled(v) {
 }
 poll();
 setInterval(poll, 400);
+
+// ---- SpaceMouse device status: axis bars + 3D preview ----
+window.dev = null;
+async function pollDev() {
+  try { const r = await fetch('/api/device'); window.dev = await r.json(); }
+  catch (e) { /* keep last sample */ }
+}
+setInterval(pollDev, 40); pollDev();
+
+const AX = [['lx', 'Lin X', '#e5534b'], ['ly', 'Lin Y', '#3fb950'],
+            ['lz', 'Lin Z', '#2f81f7'], ['ax', 'Ang X', '#e5534b'],
+            ['ay', 'Ang Y', '#3fb950'], ['az', 'Ang Z', '#2f81f7']];
+const axEls = {};
+AX.forEach(([k, l, c]) => {
+  const row = document.createElement('div'); row.className = 'arow';
+  row.innerHTML = '<span class="alabel">' + l + '</span>'
+    + '<div class="atrack"><div class="acenter"></div>'
+    + '<div class="afill" id="bar_' + k + '" style="background:' + c + '"></div></div>'
+    + '<span class="aval" id="val_' + k + '">0.000</span>';
+  $('axisGroup').appendChild(row);
+  axEls[k] = {bar: row.querySelector('#bar_' + k), val: row.querySelector('#val_' + k)};
+});
+function updAxes(t) {
+  for (const a of AX) {
+    const k = a[0], v = +(t[k] || 0), pct = Math.min(Math.abs(v), 1) * 50;
+    const b = axEls[k].bar;
+    b.style.left = v >= 0 ? '50%' : (50 - pct) + '%';
+    b.style.width = pct + '%';
+    axEls[k].val.textContent = v.toFixed(3);
+  }
+}
+function updBtns(btns) {
+  const g = $('btnGrid');
+  while (g.children.length < btns.length) {
+    const d = document.createElement('div'); d.className = 'bdot';
+    d.textContent = 'B' + g.children.length; g.appendChild(d);
+  }
+  for (let i = 0; i < g.children.length; i++)
+    g.children[i].classList.toggle('on', btns[i] === 1);
+}
+
+const cube = $('cube');
+let q = {x: 0, y: 0, z: 0, w: 1}, px = 0, py = 0, pz = 0;
+const ROT = 2.5, POS = 70, DECAY = 0.9, DT = 1 / 30;
+function qmul(a, b) {
+  return {
+    w: a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z,
+    x: a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+    y: a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+    z: a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w};
+}
+function dq(wx, wy, wz) {
+  const a = Math.hypot(wx, wy, wz);
+  if (a < 1e-9) return {x: 0, y: 0, z: 0, w: 1};
+  const s = Math.sin(a / 2) / a;
+  return {x: wx*s, y: wy*s, z: wz*s, w: Math.cos(a / 2)};
+}
+function mat(r, tx, ty, tz) {
+  const x = r.x, y = r.y, z = r.z, w = r.w, x2 = x+x, y2 = y+y, z2 = z+z;
+  const xx = x*x2, xy = x*y2, xz = x*z2, yy = y*y2, yz = y*z2, zz = z*z2,
+        wx = w*x2, wy = w*y2, wz = w*z2;
+  return 'matrix3d(' + [1-(yy+zz), xy+wz, xz-wy, 0,
+                        xy-wz, 1-(xx+zz), yz+wx, 0,
+                        xz+wy, yz-wx, 1-(xx+yy), 0, tx, ty, tz, 1].join(',') + ')';
+}
+cube.addEventListener('click', () => { q = {x: 0, y: 0, z: 0, w: 1}; px = py = pz = 0; });
+(function spin() {
+  requestAnimationFrame(spin);
+  const d = window.dev, t = (d && d.twist) || {lx: 0, ly: 0, lz: 0, ax: 0, ay: 0, az: 0};
+  q = qmul(dq((t.ax||0)*ROT*DT, (t.ay||0)*ROT*DT, (t.az||0)*ROT*DT), q);
+  const n = Math.hypot(q.x, q.y, q.z, q.w) || 1;
+  q = {x: q.x/n, y: q.y/n, z: q.z/n, w: q.w/n};
+  px = (px + (t.lx||0)*POS*DT) * DECAY;
+  py = (py + (t.ly||0)*POS*DT) * DECAY;
+  pz = (pz + (t.lz||0)*POS*DT) * DECAY;
+  cube.style.transform = mat(q, px, py, pz);
+  if (d) {
+    updAxes(t); updBtns(d.buttons || []);
+    const hz = $('devhz');
+    hz.textContent = (d.hz != null ? d.hz : '—') + ' Hz';
+    hz.className = 'pill ' + (d.age != null && d.age < 1.0 ? 'ok' : 'bad');
+  }
+})();
 </script>
 </body>
 </html>
 """
+
+
+class _HzTracker:
+    """Rolling 1-second message-rate estimate (thread-safe)."""
+
+    def __init__(self):
+        self._count = 0
+        self._hz = 0.0
+        self._t0 = time.monotonic()
+        self._lock = threading.Lock()
+
+    def tick(self):
+        with self._lock:
+            self._count += 1
+            now = time.monotonic()
+            dt = now - self._t0
+            if dt >= 1.0:
+                self._hz = self._count / dt
+                self._count = 0
+                self._t0 = now
+
+    @property
+    def hz(self):
+        with self._lock:
+            return round(self._hz, 1)
 
 
 class ServoDashboard(Node):
@@ -158,6 +359,22 @@ class ServoDashboard(Node):
         self.create_subscription(String, self._status_topic, self._on_status, 10)
         self._set_cli = self.create_client(SetBool, self._set_srv_name)
 
+        # Raw SpaceMouse device feed (same topics as the 3dconnexion dashboard)
+        # so the page can show axis bars + a 3D preview of the live input.
+        self.declare_parameter("twist_topic", "spacenav/twist")
+        self.declare_parameter("joy_topic", "spacenav/joy")
+        twist_topic = str(self.get_parameter("twist_topic").value)
+        joy_topic = str(self.get_parameter("joy_topic").value)
+        self._device = {
+            "twist": {"lx": 0.0, "ly": 0.0, "lz": 0.0,
+                      "ax": 0.0, "ay": 0.0, "az": 0.0},
+            "buttons": [], "axes": [],
+        }
+        self._dev_stamp = 0.0
+        self._hz_twist = _HzTracker()
+        self.create_subscription(Twist, twist_topic, self._on_twist, 10)
+        self.create_subscription(Joy, joy_topic, self._on_joy, 10)
+
         self._start_http()
         self.get_logger().info(
             "spacemouse teleop dashboard on http://0.0.0.0:%d  "
@@ -178,6 +395,31 @@ class ServoDashboard(Node):
         with self._lock:
             return dict(self._status), (time.monotonic() - self._stamp
                                         if self._stamp else 1e9)
+
+    def _on_twist(self, msg: Twist) -> None:
+        self._hz_twist.tick()
+        with self._lock:
+            self._device["twist"] = {
+                "lx": msg.linear.x, "ly": msg.linear.y, "lz": msg.linear.z,
+                "ax": msg.angular.x, "ay": msg.angular.y, "az": msg.angular.z,
+            }
+            self._dev_stamp = time.monotonic()
+
+    def _on_joy(self, msg: Joy) -> None:
+        with self._lock:
+            self._device["buttons"] = list(msg.buttons)
+            self._device["axes"] = list(msg.axes)
+            self._dev_stamp = time.monotonic()
+
+    def _device_snapshot(self):
+        with self._lock:
+            d = {"twist": dict(self._device["twist"]),
+                 "buttons": list(self._device["buttons"]),
+                 "axes": list(self._device["axes"])}
+        d["hz"] = self._hz_twist.hz
+        d["age"] = (time.monotonic() - self._dev_stamp
+                    if self._dev_stamp else 1e9)
+        return d
 
     def _set_enabled(self, enabled: bool):
         if not self._set_cli.service_is_ready():
@@ -222,6 +464,8 @@ class ServoDashboard(Node):
                         "service_ready": node._set_cli.service_is_ready(),
                         "status": s,
                     }))
+                elif path == "/api/device":
+                    self._send(200, json.dumps(node._device_snapshot()))
                 else:
                     self._send(404, json.dumps({"ok": False, "message": "not found"}))
 

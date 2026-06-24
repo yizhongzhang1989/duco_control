@@ -1,15 +1,17 @@
-"""One-command SpaceMouse Cartesian teleop: driver + IK commander + bridge.
+"""One-command SpaceMouse Cartesian teleop: IK commander + bridge.
 
-Brings up the full primary path from the plan:
+Brings up the application path:
 
-    spacenav driver  ->  spacemouse_servo (twist->PoseStamped)  ->
+    spacemouse_servo (twist->PoseStamped)  ->
     ikt_pose_commander (IK + safety gate)  ->  ros2_control  ->  robot
 
-The robot bringup (publishing ``/robot_description`` + ``/joint_states`` and
-loading the controllers) must already be running. ``base_frame`` and
-``tip_frame`` are REQUIRED; the commander is pinned to ``tip_frame`` so joints
-and controllers auto-derive, and the servo is wired to that commander
-instance's target topic + enable/disable services.
+The ``spacenav`` driver is launched SEPARATELY (shared hardware):
+``ros2 launch spacemouse spacemouse.launch.py``. The robot bringup (publishing
+``/robot_description`` + ``/joint_states`` and loading the controllers) must
+also already be running. ``base_frame`` and ``tip_frame`` are REQUIRED; the
+commander is pinned to ``tip_frame`` so joints and controllers auto-derive, and
+the servo is wired to that commander instance's target topic + enable/disable
+services.
 
 Examples::
 
@@ -31,7 +33,6 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (DeclareLaunchArgument, IncludeLaunchDescription,
                             LogInfo, OpaqueFunction)
-from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -47,7 +48,6 @@ def _setup(context, *_, **__):
     jog_frame = LaunchConfiguration("jog_frame").perform(context)
     output = LaunchConfiguration("output").perform(context).strip().lower()
     fzi_target = LaunchConfiguration("fzi_target_topic").perform(context)
-    launch_driver = LaunchConfiguration("launch_driver").perform(context)
     dashboard_port = LaunchConfiguration("dashboard_port").perform(context)
 
     if not base_frame or not tip_frame:
@@ -59,14 +59,6 @@ def _setup(context, *_, **__):
     actions = [LogInfo(msg=(
         "[spacemouse_teleop] base=%s tip=%s output=%s jog_frame=%s"
         % (base_frame, tip_frame, output, jog_frame)))]
-
-    # --- SpaceMouse driver (global hardware; not namespaced) --------------
-    sm_pkg = get_package_share_directory("spacemouse")
-    actions.append(IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(sm_pkg, "launch", "spacemouse.launch.py")),
-        condition=IfCondition(launch_driver),
-    ))
 
     # --- Output sink: IK commander (default) or FZI controller ----------
     if output == "ikt":
@@ -139,7 +131,9 @@ def _setup(context, *_, **__):
             name="spacemouse_servo_dashboard",
             output="screen",
             parameters=[{"port": int(dashboard_port),
-                         "servo_ns": "/spacemouse_servo"}],
+                         "servo_ns": "/spacemouse_servo",
+                         "twist_topic": d["input_topic"],
+                         "joy_topic": d["joy_topic"]}],
         ))
     return actions
 
@@ -162,8 +156,6 @@ def generate_launch_description():
         DeclareLaunchArgument("fzi_target_topic",
                               default_value="/cartesian_motion_controller/target_frame",
                               description="PoseStamped sink when output:=fzi."),
-        DeclareLaunchArgument("launch_driver", default_value="true",
-                              description="Also start the spacenav driver."),
         DeclareLaunchArgument("dashboard_port", default_value="",
                               description="If set (e.g. 8200), also launch the on/off dashboard."),
         OpaqueFunction(function=_setup),
