@@ -30,9 +30,11 @@ idle re-capture, input-staleness zeroing, and conservative speed clamps.
 
 ## Safety model
 
-* **Dead-man gated.** No target is published unless the dead-man button is held
-  (`deadman_mode: hold`) or toggled on (`deadman_mode: toggle`). On release the
-  optional downstream commander is disabled.
+* **Engagement gate.** With `deadman_mode: none` (default) the puck is always
+  engaged &mdash; touch to move, centre to hold. Set `hold` (publish only while
+  the dead-man button is held) or `toggle` (press to engage / disengage) for a
+  button-gated workflow. On disengage the optional downstream commander is
+  disabled. The dashboard's **On/Off** (`~/set_enabled`) gates the whole sender.
 * **Idle re-capture.** While disengaged, the target is continuously reset to the
   current end-effector pose (via TF), so engaging never produces a jump.
 * **Input staleness.** If no twist arrives within `input_timeout`, the puck is
@@ -52,37 +54,64 @@ Depends on `rclpy`, `geometry_msgs`, `sensor_msgs`, `std_msgs`, `std_srvs`,
 
 ## Run
 
-### One-command full chain (driver + IK commander + bridge)
+Defaults (`base_frame`, `tip_frame`, `jog_frame`, speeds, `dashboard_port`, …)
+come from the `spacemouse_teleop:` section of
+[`config/robot_config.yaml`](../../config/robot_config.yaml); every value below is
+a CLI override. A robot bringup must already publish `/robot_description` +
+`/joint_states` and load the controllers.
 
-A robot bringup must already publish `/robot_description` + `/joint_states` and
-load the controllers. Then:
+### Recommended: standalone pose commander + dashboards
+
+The full SpaceMouse teleop stack on the real Duco (each line in its own terminal):
 
 ```bash
-# Duco mock (streaming fpc), tool-frame jog:
-ros2 launch spacemouse_teleop spacemouse_teleop.launch.py \
-    base_frame:=base_link tip_frame:=compliance_link command_mode:=fpc
+# 1. Robot bringup (real hardware).
+ros2 launch robot_bringup duco_bringup.launch.py use_fake_hardware:=false
+
+# 2. Pose commander, pinned to the tip link, web dashboard on :8180.
+ros2 launch ikt_pose_commander commander.launch.py \
+    dashboard_port:=8180 controlled_frame:=compliance_link command_mode:=fpc
+
+# 3. SpaceMouse driver + jog bridge + On/Off dashboard on :8200
+#    (base_frame/tip_frame/jog_frame default from robot_config.yaml).
+ros2 launch spacemouse_teleop spacemouse_servo.launch.py \
+    launch_driver:=true dashboard_port:=8200
 ```
 
-This starts the `spacenav` driver, an `ikt_pose_commander` instance pinned to
-`tip_frame` (joints + controllers auto-derive), and the bridge wired to that
-commander's target topic + enable/disable services. The commander starts
-**DISABLED**; hold the dead-man button to jog.
+* **Pose-commander dashboard** &rarr; <http://localhost:8180/> (3D gizmo,
+  Read/Send mode, live params).
+* **SpaceMouse On/Off dashboard** &rarr; <http://localhost:8200/> &mdash; switch
+  the sender **On** (jog with the puck) / **Off** (release the commander so you
+  can drive from the :8180 dashboard instead). The two share one target topic, so
+  use one source at a time.
+
+With `deadman_mode: none` (the default) the bridge auto-enables the commander and
+jogs as soon as you touch the puck &mdash; centre it to hold.
+
+### One-command full chain (its own commander instance)
+
+When you don't need a separate commander/dashboard, this starts the `spacenav`
+driver, a private `ikt_pose_commander` instance pinned to `tip_frame` (joints +
+controllers auto-derive), and the bridge wired to it:
+
+```bash
+ros2 launch spacemouse_teleop spacemouse_teleop.launch.py \
+    command_mode:=fpc dashboard_port:=8200
+```
 
 Use the FZI motion controller instead of the IK commander:
 
 ```bash
 ros2 launch spacemouse_teleop spacemouse_teleop.launch.py \
-    base_frame:=base_link tip_frame:=tool0 output:=fzi \
+    tip_frame:=tool0 output:=fzi \
     fzi_target_topic:=/cartesian_motion_controller/target_frame
 # (bring up the FZI controller via cartesian_control_manager separately)
 ```
 
-### Bridge node only
+### Bridge node only (no driver / dashboard)
 
 ```bash
-ros2 launch spacemouse_teleop spacemouse_servo.launch.py \
-    base_frame:=base_link tip_frame:=tool0 \
-    target_pose_topic:=/ikt_pose_commander_arm/target_pose launch_driver:=true
+ros2 launch spacemouse_teleop spacemouse_servo.launch.py launch_driver:=false
 ```
 
 ## ROS interface
@@ -98,7 +127,11 @@ ros2 launch spacemouse_teleop spacemouse_servo.launch.py \
 | Topic | Type | Purpose |
 |---|---|---|
 | `~/target_pose` (remap to the sink) | `geometry_msgs/PoseStamped` | integrated jog target |
-| `~/status` | `std_msgs/String` (JSON) | engaged?, jog_frame, speed_scale, position_only, has_target, twist_fresh |
+| `~/status` | `std_msgs/String` (JSON) | sender_enabled, engaged?, jog_frame, speed_scale, position_only, has_target, twist_fresh |
+
+**Service servers** — `~/set_enabled` (`std_srvs/SetBool`): master On/Off for the
+sender (used by the On/Off dashboard, `dashboard_port:=8200`). Off stops
+publishing + disables the commander; On re-captures the live pose + re-enables.
 
 **Service clients (optional)** — `commander_enable_srv` / `commander_disable_srv`
 (`std_srvs/Trigger`), called on engage / release when `enable_commander:=true`.

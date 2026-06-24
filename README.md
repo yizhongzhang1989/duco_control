@@ -31,6 +31,7 @@ dashboards.
 | [`alicia_teleop`](src/alicia_teleop) | leader-follower teleop bridge: maps Alicia-D joint angles to the Duco follower with a per-joint velocity- and acceleration-limited interpolator; auto-switches `arm_1_controller` ↔ `forward_position_controller` at launch / shutdown | -- |
 | [`alicia_duo_leader_driver`](src/alicia_leader/alicia_duo_leader_driver) | serial driver for the Alicia-D 6-DoF leader arm (publishes `/arm_joint_state`) | -- |
 | [`alicia_duo_leader_dashboard`](src/alicia_leader/alicia_duo_leader_dashboard) | optional web UI for the leader arm (button / joint state) | `8130` |
+| [`spacemouse_teleop`](src/spacemouse_teleop) | SpaceMouse Cartesian jog bridge: integrates the `spacenav` velocity twist into a streaming `PoseStamped` target (captured from TF) that drives `ikt_pose_commander`; ships an On/Off web dashboard. See [SpaceMouse teleoperation](#teleoperation-spacemouse-cartesian-jog). | `8200` |
 | [`cct_common`](external/cartesian_controllers_toolkit/cct_common) | centralised config loader (reads `config/robot_config.yaml`) + shared URDF/XML helpers *(from the toolkit submodule)* |
 
 The official Duco ROS 2 driver is tracked as a git submodule at
@@ -519,6 +520,43 @@ ros2 launch alicia_teleop alicia_teleop.launch.py auto_switch_controller:=false
 On engage, the bridge logs `Rate limiter seeded from /joint_states; max
 initial gap = X.XXX rad ...` so you can confirm the limiter is starting
 from the robot's actual pose.
+
+---
+
+## Teleoperation (SpaceMouse Cartesian jog)
+
+A third teleop workflow: jog the end-effector in real time with a 3Dconnexion
+SpaceMouse. [`spacemouse_teleop`](src/spacemouse_teleop) integrates the
+`spacenav` velocity twist into a streaming `PoseStamped` target (captured from
+TF) that drives `ikt_pose_commander` &mdash; which owns the IK and all hard
+safety gates (reachability / jump / speed / staleness).
+
+```bash
+# 1. Robot bringup (same as the Cartesian flow above).
+ros2 launch robot_bringup duco_bringup.launch.py use_fake_hardware:=false
+
+# 2. Pose commander pinned to the tip link, web dashboard on :8180.
+ros2 launch ikt_pose_commander commander.launch.py \
+    dashboard_port:=8180 controlled_frame:=compliance_link command_mode:=fpc
+
+# 3. SpaceMouse driver + jog bridge + On/Off dashboard on :8200.
+ros2 launch spacemouse_teleop spacemouse_servo.launch.py \
+    launch_driver:=true dashboard_port:=8200
+```
+
+* **Pose-commander dashboard** <http://localhost:8180/> &mdash; 3D gizmo,
+  Read / Send mode, live IK / motion params.
+* **SpaceMouse On/Off dashboard** <http://localhost:8200/> &mdash; gate the
+  sender: **On** jogs with the puck; **Off** releases the commander so you can
+  drive from the :8180 dashboard instead (they share one target topic &mdash; use
+  one source at a time).
+
+Teleop defaults (`base_frame`, `tip_frame`, `jog_frame`, speeds, `dashboard_port`)
+live under `spacemouse_teleop:` in
+[`config/robot_config.yaml`](config/robot_config.yaml); CLI args override. With
+`deadman_mode: none` (default) the puck is touch-to-move (centre to hold). See
+[`src/spacemouse_teleop/README.md`](src/spacemouse_teleop/README.md) for the full
+interface and the all-in-one `spacemouse_teleop.launch.py`.
 
 ---
 
