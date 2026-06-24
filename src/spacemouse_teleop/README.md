@@ -113,19 +113,23 @@ ros2 launch spacemouse_teleop spacemouse_servo.launch.py \
 
 ## Parameters
 
-See [`config/servo_defaults.yaml`](config/servo_defaults.yaml). Most-used:
+Defaults live in the `spacemouse_teleop:` section of
+[`config/robot_config.yaml`](../../config/robot_config.yaml) (like the other
+packages); package fallbacks are in `spacemouse_teleop/teleop_defaults.py`.
+CLI args still override. Most-used:
 
 | Param | Default | Notes |
 |---|---|---|
-| `base_frame` / `tip_frame` | "" | **REQUIRED** TF frames (node refuses to start without them) |
+| `base_frame` / `tip_frame` | `base_link` / `compliance_link` | **REQUIRED** TF frames (node refuses to start without them) |
 | `rate_hz` | 50 | integration / publish rate |
-| `linear_scale` / `angular_scale` | `[0.05…]` / `[0.3…]` | per-axis m/s, rad/s per unit twist |
-| `max_linear_speed` / `max_angular_speed` | 0.05 / 0.3 | hard clamps (m/s, rad/s) |
-| `jog_frame` | `tool` | `tool` (body-frame jog) or `base` |
-| `deadman_button` / `deadman_mode` | 0 / `hold` | dead-man config |
-| `speed_scales` | `[0.25,1,2]` | button-1 speed cycle multipliers |
+| `linear_scale` / `angular_scale` | `[0.15…]` / `[0.6…]` | per-axis m/s, rad/s per unit twist |
+| `max_linear_speed` / `max_angular_speed` | 0.30 / 1.0 | hard clamps (m/s, rad/s) |
+| `jog_frame` | `base` | `base` (base-frame jog) or `tool` |
+| `deadman_button` / `deadman_mode` | 0 / `none` | dead-man config (`none` = always on) |
+| `speed_scales` | `[0.5,1,2]` | button-1 speed cycle multipliers (starts at 1.0×) |
 | `input_timeout` | 0.2 | s — twist staleness → zero |
-| `enable_commander` | true | drive commander enable/disable from dead-man |
+| `enable_commander` | true | drive commander enable/disable from engage |
+| `dashboard_port` | "" | set e.g. 8200 for the on/off web dashboard |
 
 > **Tip (from the driver README):** align the SpaceMouse axes with the
 > end-effector and use `jog_frame: tool` for the most intuitive control —

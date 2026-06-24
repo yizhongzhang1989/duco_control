@@ -36,6 +36,8 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
+from spacemouse_teleop.teleop_defaults import load_defaults
+
 
 def _setup(context, *_, **__):
     base_frame = LaunchConfiguration("base_frame").perform(context)
@@ -46,6 +48,7 @@ def _setup(context, *_, **__):
     output = LaunchConfiguration("output").perform(context).strip().lower()
     fzi_target = LaunchConfiguration("fzi_target_topic").perform(context)
     launch_driver = LaunchConfiguration("launch_driver").perform(context)
+    dashboard_port = LaunchConfiguration("dashboard_port").perform(context)
 
     if not base_frame or not tip_frame:
         raise RuntimeError(
@@ -95,14 +98,16 @@ def _setup(context, *_, **__):
             % fzi_target)))
 
     # --- The bridge node -------------------------------------------------
-    servo_pkg = get_package_share_directory("spacemouse_teleop")
-    servo_defaults = os.path.join(servo_pkg, "config", "servo_defaults.yaml")
+    # Servo tunables come from config/robot_config.yaml (spacemouse_teleop);
+    # the topic / enable wiring below is computed per output sink + instance.
+    d, source = load_defaults()
+    actions.append(LogInfo(msg="[spacemouse_teleop] config: " + source))
     actions.append(Node(
         package="spacemouse_teleop",
         executable="servo_node",
         name="spacemouse_servo",
         output="screen",
-        parameters=[servo_defaults, {
+        parameters=[{
             "base_frame": base_frame,
             "tip_frame": tip_frame,
             "jog_frame": jog_frame,
@@ -110,23 +115,48 @@ def _setup(context, *_, **__):
             "enable_commander": enable_commander,
             "commander_enable_srv": enable_srv,
             "commander_disable_srv": disable_srv,
+            "input_topic": d["input_topic"],
+            "joy_topic": d["joy_topic"],
+            "rate_hz": d["rate_hz"],
+            "linear_scale": d["linear_scale"],
+            "angular_scale": d["angular_scale"],
+            "deadband_lin": d["deadband_lin"],
+            "deadband_ang": d["deadband_ang"],
+            "max_linear_speed": d["max_linear_speed"],
+            "max_angular_speed": d["max_angular_speed"],
+            "input_timeout": d["input_timeout"],
+            "deadman_button": d["deadman_button"],
+            "deadman_mode": d["deadman_mode"],
+            "button1_index": d["button1_index"],
+            "button1_action": d["button1_action"],
+            "speed_scales": d["speed_scales"],
         }],
     ))
+    if dashboard_port:
+        actions.append(Node(
+            package="spacemouse_teleop",
+            executable="dashboard_node",
+            name="spacemouse_servo_dashboard",
+            output="screen",
+            parameters=[{"port": int(dashboard_port),
+                         "servo_ns": "/spacemouse_servo"}],
+        ))
     return actions
 
 
 def generate_launch_description():
+    d, _ = load_defaults()
     return LaunchDescription([
-        DeclareLaunchArgument("base_frame",
+        DeclareLaunchArgument("base_frame", default_value=str(d["base_frame"]),
                               description="TF base frame for targets (REQUIRED)."),
-        DeclareLaunchArgument("tip_frame",
+        DeclareLaunchArgument("tip_frame", default_value=str(d["tip_frame"]),
                               description="End-effector link to jog (REQUIRED)."),
         DeclareLaunchArgument("instance_name", default_value="arm",
                               description="ikt_pose_commander instance suffix."),
         DeclareLaunchArgument("command_mode", default_value="fpc",
                               description="ikt commander mode: jtc | fpc."),
-        DeclareLaunchArgument("jog_frame", default_value="base",
-                              description="'base' (base-frame jog, default) or 'tool' (body-frame)."),
+        DeclareLaunchArgument("jog_frame", default_value=str(d["jog_frame"]),
+                              description="'base' (base-frame jog) or 'tool'."),
         DeclareLaunchArgument("output", default_value="ikt",
                               description="Target sink: 'ikt' or 'fzi'."),
         DeclareLaunchArgument("fzi_target_topic",
@@ -134,5 +164,7 @@ def generate_launch_description():
                               description="PoseStamped sink when output:=fzi."),
         DeclareLaunchArgument("launch_driver", default_value="true",
                               description="Also start the spacenav driver."),
+        DeclareLaunchArgument("dashboard_port", default_value="",
+                              description="If set (e.g. 8200), also launch the on/off dashboard."),
         OpaqueFunction(function=_setup),
     ])

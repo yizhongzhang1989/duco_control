@@ -45,7 +45,7 @@ from rclpy.node import Node
 from rclpy.time import Time as RclpyTime
 from sensor_msgs.msg import Joy
 from std_msgs.msg import String
-from std_srvs.srv import Trigger
+from std_srvs.srv import SetBool, Trigger
 
 from spacemouse_teleop.twist_integrator import integrate_pose, shape_twist
 
@@ -129,7 +129,8 @@ class SpaceMouseServo(Node):
         self._prev_deadman = False
         self._prev_button1 = False
         self._engaged = False
-        self._speed_idx = min(1, len(self._speed_scales) - 1)  # start at speed_scales[1] (1.0x), not the slow preset
+        self._sender_enabled = True   # master on/off gate (dashboard set_enabled)
+        self._speed_idx = min(1, len(self._speed_scales) - 1)  # start at 1.0x, not slow preset
         self._position_only = False
         self._target_pos = None     # np.ndarray(3,) or None
         self._target_quat = None    # np.ndarray(4,) or None
@@ -150,6 +151,8 @@ class SpaceMouseServo(Node):
             Trigger, str(gp("commander_enable_srv").value))
         self._disable_cli = self.create_client(
             Trigger, str(gp("commander_disable_srv").value))
+        # Master on/off for the whole teleop sender (toggled by the dashboard).
+        self.create_service(SetBool, "~/set_enabled", self._on_set_enabled)
 
         self.create_timer(self._dt, self._on_timer)
 
@@ -244,7 +247,9 @@ class SpaceMouseServo(Node):
 
     def _update_engagement(self) -> None:
         deadman = self._read_button(self._deadman_button)
-        if self._deadman_mode == "none":
+        if not self._sender_enabled:
+            new_engaged = False           # master OFF (dashboard) overrides everything
+        elif self._deadman_mode == "none":
             new_engaged = True            # always engaged: touch-to-move
         elif self._deadman_mode == "hold":
             new_engaged = deadman
@@ -274,6 +279,21 @@ class SpaceMouseServo(Node):
                 % (label, client.srv_name), throttle_duration_sec=5.0)
             return
         client.call_async(Trigger.Request())
+
+    def _on_set_enabled(self, req, resp):
+        """Master on/off for the teleop sender (called by the dashboard).
+
+        OFF -> the main loop disengages: it stops publishing target_pose and
+        releases the commander (~/disable). ON -> it re-engages on the next tick,
+        which re-captures the live pose (jumpless) and re-enables the commander.
+        The actual transition runs in _update_engagement.
+        """
+        with self._lock:
+            self._sender_enabled = bool(req.data)
+        resp.success = True
+        resp.message = "spacemouse sender " + ("ON" if req.data else "OFF")
+        self.get_logger().info("set_enabled: " + resp.message)
+        return resp
 
     # ------------------------------------------------------------------ #
     # Main loop
@@ -327,6 +347,7 @@ class SpaceMouseServo(Node):
 
     def _publish_status(self, twist_fresh: bool) -> None:
         status = {
+            "sender_enabled": self._sender_enabled,
             "engaged": self._engaged,
             "jog_frame": self._jog_frame,
             "speed_scale": self._speed_scales[self._speed_idx],
