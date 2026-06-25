@@ -86,8 +86,8 @@ ros2 launch spacemouse_teleop spacemouse_servo.launch.py dashboard_port:=8200
   the sender **On** (jog with the puck) / **Off** (release the commander so you
   can drive from the :8180 dashboard instead). The two share one target topic, so
   use one source at a time. It also shows the **live device status** &mdash; axis
-  bars, a 3D preview cube, and button indicators (from `spacenav/twist` +
-  `spacenav/joy`).
+  bars, a 3D preview cube, and the 15 named SpaceMouse Pro button indicators
+  (from `spacenav/twist` + `spacenav/joy`).
 
 With `deadman_mode: none` (the default) the bridge auto-enables the commander and
 jogs as soon as you touch the puck &mdash; centre it to hold.
@@ -173,13 +173,22 @@ delta` to seed the commander's goal onto the current pose.
   `spacemouse_teleop.launch.py output_mode:=delta` wires this end-to-end (it also
   sets the commander's `target_mode` + `delta_frame`).
 
-## Button mapping (default 2-button puck)
+## Button mapping (SpaceMouse Pro)
+
+`spacenav/joy` reports a fixed 15-button array; see the
+[3dconnexion_ros2 README](../../external/3dconnexion_ros2/README.md#buttons-spacemouse-pro)
+for the full index &rarr; name table. This bridge uses two of them:
 
 | Input | Action |
 |---|---|
-| Button `deadman_button` (0) | **Dead-man**: hold-to-move (`deadman_mode: hold`) or toggle |
-| Button `button1_index` (1) | `button1_action`: cycle **speed** scale, or toggle **position_only**, or none |
+| Button `deadman_button` (0 &mdash; the **`1`** function key) | **Dead-man**: hold-to-move (`deadman_mode: hold`) or toggle |
+| Button `button1_index` (1 &mdash; the **`2`** function key) | `button1_action`: cycle **speed** scale, or toggle **position_only**, or none |
 | no twist for `input_timeout` | puck treated as centred (zero velocity) |
+
+> The On/Off dashboard's device card shows all 15 named buttons. The device
+> **ghosts** with 3+ simultaneous presses (a phantom button appears) &mdash; a
+> hardware limitation; the dead-man / speed keys are read individually so they
+> are unaffected.
 
 ## Parameters
 

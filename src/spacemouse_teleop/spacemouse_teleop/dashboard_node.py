@@ -123,6 +123,7 @@ _PAGE = r"""<!DOCTYPE html>
           font-family:monospace; font-size:11px; line-height:24px;
           text-align:center; }
   .bdot.on { background:var(--on); color:#0d1117; border-color:var(--on); }
+  .dev-warn { font-size:11px; color:#e3b341; margin-top:8px; text-align:center; }
 </style>
 </head>
 <body>
@@ -179,6 +180,8 @@ _PAGE = r"""<!DOCTYPE html>
       <div class="axes" id="axisGroup"></div>
     </div>
     <div class="btns-dev" id="btnGrid"></div>
+    <div class="dev-warn">&#9888; Avoid pressing 3+ buttons at once &mdash; the
+      device may report a phantom button (matrix ghosting).</div>
   </div>
 </div>
 <script>
@@ -257,11 +260,17 @@ function updAxes(t) {
     axEls[k].val.textContent = v.toFixed(3);
   }
 }
+// SpaceMouse Pro button names (matches the 3dconnexion_ros2 buttons[] mapping)
+const SMP_NAMES = ['1', '2', '3', '4', 'Menu', 'Fit', 'T', 'R', 'F', 'Roll',
+                   '\u27F3', 'Esc', 'Alt', 'Shift', 'Ctrl'];
 function updBtns(btns) {
   const g = $('btnGrid');
-  while (g.children.length < btns.length) {
+  while (g.children.length < SMP_NAMES.length) {
+    const i = g.children.length;
     const d = document.createElement('div'); d.className = 'bdot';
-    d.textContent = 'B' + g.children.length; g.appendChild(d);
+    d.textContent = SMP_NAMES[i];
+    d.title = SMP_NAMES[i] + ' \u2014 buttons[' + i + ']';
+    g.appendChild(d);
   }
   for (let i = 0; i < g.children.length; i++)
     g.children[i].classList.toggle('on', btns[i] === 1);

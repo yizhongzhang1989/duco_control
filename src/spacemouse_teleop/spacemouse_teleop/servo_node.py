@@ -83,9 +83,14 @@ class SpaceMouseServo(Node):
         self.declare_parameter("input_timeout", 0.2)        # s — twist staleness
 
         # ---- buttons ------------------------------------------------------
-        self.declare_parameter("deadman_button", 0)
+        # Button indices follow the spacenav/joy buttons[] mapping documented in
+        # the 3dconnexion_ros2 submodule. On the SpaceMouse Pro: index 0 = the
+        # "1" function key, index 1 = the "2" function key (see that README's
+        # "Buttons" table). These are read individually, so the device's
+        # 3+-button ghosting does not affect the dead-man / speed keys.
+        self.declare_parameter("deadman_button", 0)         # Pro "1" function key
         self.declare_parameter("deadman_mode", "hold")      # hold | toggle
-        self.declare_parameter("button1_index", 1)
+        self.declare_parameter("button1_index", 1)          # Pro "2" function key
         self.declare_parameter("button1_action", "speed")   # speed | position_only | none
         self.declare_parameter("speed_scales", [0.25, 1.0, 2.0])
 
