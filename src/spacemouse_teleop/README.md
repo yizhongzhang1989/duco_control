@@ -104,6 +104,16 @@ ros2 launch spacemouse_teleop spacemouse_teleop.launch.py \
     command_mode:=fpc dashboard_port:=8200
 ```
 
+Jog by **deltas** instead of absolute targets (the commander owns the goal and is
+seeded from the current pose on engage; no TF capture on the servo side):
+
+```bash
+ros2 launch spacemouse_teleop spacemouse_teleop.launch.py \
+    command_mode:=fpc output_mode:=delta dashboard_port:=8200
+# sets the servo's output_mode AND the commander's target_mode=delta +
+# delta_frame=jog_frame in one switch (requires output:=ikt).
+```
+
 Use the FZI motion controller instead of the IK commander:
 
 ```bash
@@ -131,20 +141,37 @@ ros2 launch spacemouse_teleop spacemouse_servo.launch.py
 |---|---|---|
 | `spacenav/twist` | `geometry_msgs/Twist` | puck 6-DOF velocity |
 | `spacenav/joy` | `sensor_msgs/Joy` | buttons (dead-man, mode/speed) |
-| TF `base_frame`←`tip_frame` | — | capture the live EE pose |
+| TF `base_frame`←`tip_frame` | — | capture the live EE pose (`output_mode: absolute` only) |
 
 **Publishes**
 | Topic | Type | Purpose |
 |---|---|---|
-| `~/target_pose` (remap to the sink) | `geometry_msgs/PoseStamped` | integrated jog target |
-| `~/status` | `std_msgs/String` (JSON) | sender_enabled, engaged?, jog_frame, speed_scale, position_only, has_target, twist_fresh |
+| `~/target_pose` (remap to the sink) | `geometry_msgs/PoseStamped` | integrated **absolute** jog target (`output_mode: absolute`) |
+| `~/target_delta` (→ commander `~/target_delta`) | `geometry_msgs/PoseStamped` | per-tick **incremental** pose (`output_mode: delta`) |
+| `~/status` | `std_msgs/String` (JSON) | sender_enabled, engaged?, output_mode, jog_frame, speed_scale, position_only, has_target, twist_fresh |
 
 **Service servers** — `~/set_enabled` (`std_srvs/SetBool`): master On/Off for the
 sender (used by the On/Off dashboard, `dashboard_port:=8200`). Off stops
 publishing + disables the commander; On re-captures the live pose + re-enables.
 
 **Service clients (optional)** — `commander_enable_srv` / `commander_disable_srv`
-(`std_srvs/Trigger`), called on engage / release when `enable_commander:=true`.
+(`std_srvs/Trigger`), called on engage / release when `enable_commander:=true`;
+`commander_snap_srv` (`std_srvs/Trigger`), called on engage in `output_mode:
+delta` to seed the commander's goal onto the current pose.
+
+### Absolute vs delta output
+
+* **`output_mode: absolute`** (default) — the servo captures the live EE pose over
+  TF and **integrates** the puck twist into an **absolute** `PoseStamped` on
+  `target_pose_topic`. The commander runs in `target_mode: absolute`.
+* **`output_mode: delta`** — the servo streams **per-tick incremental** poses on
+  `target_delta_topic`; the commander (`target_mode: delta`) composes them onto
+  its own goal, which it seeds from the current pose via `~/snap_target` on
+  engage. No TF capture is needed on this side. Centre the puck to hold (identity
+  deltas), release to let another source (e.g. the dashboard) take over.
+  `jog_frame` must match the commander's `delta_frame` (both default `base`).
+  `spacemouse_teleop.launch.py output_mode:=delta` wires this end-to-end (it also
+  sets the commander's `target_mode` + `delta_frame`).
 
 ## Button mapping (default 2-button puck)
 
@@ -164,14 +191,17 @@ CLI args still override. Most-used:
 | Param | Default | Notes |
 |---|---|---|
 | `base_frame` / `tip_frame` | `base_link` / `compliance_link` | **REQUIRED** TF frames (node refuses to start without them) |
+| `output_mode` | `absolute` | `absolute` (integrate → `target_pose_topic`) or `delta` (stream increments → `target_delta_topic`) |
+| `target_delta_topic` | `ikt_pose_commander/target_delta` | where deltas go in `output_mode: delta` |
 | `rate_hz` | 50 | integration / publish rate |
 | `linear_scale` / `angular_scale` | `[0.15…]` / `[0.6…]` | per-axis m/s, rad/s per unit twist |
 | `max_linear_speed` / `max_angular_speed` | 0.30 / 1.0 | hard clamps (m/s, rad/s) |
-| `jog_frame` | `base` | `base` (base-frame jog) or `tool` |
+| `jog_frame` | `base` | `base` (base-frame jog) or `tool` (match the commander's `delta_frame`) |
 | `deadman_button` / `deadman_mode` | 0 / `none` | dead-man config (`none` = always on) |
 | `speed_scales` | `[0.5,1,2]` | button-1 speed cycle multipliers (starts at 1.0×) |
 | `input_timeout` | 0.2 | s — twist staleness → zero |
 | `enable_commander` | true | drive commander enable/disable from engage |
+| `commander_snap_srv` | `ikt_pose_commander/snap_target` | seeds the goal on engage (`output_mode: delta`) |
 | `dashboard_port` | "" | set e.g. 8200 for the on/off web dashboard |
 
 > **Tip (from the driver README):** align the SpaceMouse axes with the

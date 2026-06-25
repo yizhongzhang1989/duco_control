@@ -46,6 +46,7 @@ def _setup(context, *_, **__):
     instance = LaunchConfiguration("instance_name").perform(context)
     command_mode = LaunchConfiguration("command_mode").perform(context)
     jog_frame = LaunchConfiguration("jog_frame").perform(context)
+    output_mode = LaunchConfiguration("output_mode").perform(context).strip().lower()
     output = LaunchConfiguration("output").perform(context).strip().lower()
     fzi_target = LaunchConfiguration("fzi_target_topic").perform(context)
     dashboard_port = LaunchConfiguration("dashboard_port").perform(context)
@@ -55,17 +56,28 @@ def _setup(context, *_, **__):
             "spacemouse_teleop.launch.py requires base_frame:= and tip_frame:=")
     if output not in ("ikt", "fzi"):
         raise RuntimeError("output must be 'ikt' or 'fzi', got %r" % output)
+    if output_mode not in ("absolute", "delta"):
+        raise RuntimeError("output_mode must be 'absolute' or 'delta', got %r"
+                           % output_mode)
 
     actions = [LogInfo(msg=(
-        "[spacemouse_teleop] base=%s tip=%s output=%s jog_frame=%s"
-        % (base_frame, tip_frame, output, jog_frame)))]
+        "[spacemouse_teleop] base=%s tip=%s output=%s output_mode=%s jog_frame=%s"
+        % (base_frame, tip_frame, output, output_mode, jog_frame)))]
+
+    # Servo wiring (topics + commander services). Defaults to the IK commander;
+    # the delta path adds a delta topic + snap service.
+    d, source = load_defaults()
+    delta_topic = d["target_delta_topic"]
+    snap_srv = d["commander_snap_srv"]
 
     # --- Output sink: IK commander (default) or FZI controller ----------
     if output == "ikt":
         node_ns = "ikt_pose_commander_%s" % instance
         target_topic = "/%s/target_pose" % node_ns
+        delta_topic = "/%s/target_delta" % node_ns
         enable_srv = "/%s/enable" % node_ns
         disable_srv = "/%s/disable" % node_ns
+        snap_srv = "/%s/snap_target" % node_ns
         cmd_pkg = get_package_share_directory("ikt_pose_commander")
         actions.append(IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
@@ -74,6 +86,11 @@ def _setup(context, *_, **__):
                 "instance_name": instance,
                 "controlled_frame": tip_frame,   # pin -> auto-derive joints/ctrls
                 "command_mode": command_mode,
+                # Tie the commander's target_mode to the servo's output_mode and
+                # its delta_frame to the jog_frame, so the delta path is coherent
+                # end-to-end with one switch.
+                "target_mode": output_mode,
+                "delta_frame": jog_frame,
                 "base_frame": base_frame,
                 "start_enabled": "false",         # SAFETY: servo enables on engage
             }.items(),
@@ -83,7 +100,12 @@ def _setup(context, *_, **__):
         target_topic = fzi_target
         enable_srv = ""
         disable_srv = ""
+        snap_srv = ""
         enable_commander = "false"   # FZI controller has no enable/disable srv
+        if output_mode == "delta":
+            raise RuntimeError(
+                "output_mode:=delta requires output:=ikt (the FZI controller "
+                "takes an absolute target_frame, not deltas)")
         actions.append(LogInfo(msg=(
             "[spacemouse_teleop] FZI mode: publishing targets to %s; ensure the "
             "cartesian_motion_controller is active (cartesian_control_manager)."
@@ -92,7 +114,6 @@ def _setup(context, *_, **__):
     # --- The bridge node -------------------------------------------------
     # Servo tunables come from config/robot_config.yaml (spacemouse_teleop);
     # the topic / enable wiring below is computed per output sink + instance.
-    d, source = load_defaults()
     actions.append(LogInfo(msg="[spacemouse_teleop] config: " + source))
     actions.append(Node(
         package="spacemouse_teleop",
@@ -103,10 +124,13 @@ def _setup(context, *_, **__):
             "base_frame": base_frame,
             "tip_frame": tip_frame,
             "jog_frame": jog_frame,
+            "output_mode": output_mode,
             "target_pose_topic": target_topic,
+            "target_delta_topic": delta_topic,
             "enable_commander": enable_commander,
             "commander_enable_srv": enable_srv,
             "commander_disable_srv": disable_srv,
+            "commander_snap_srv": snap_srv,
             "input_topic": d["input_topic"],
             "joy_topic": d["joy_topic"],
             "rate_hz": d["rate_hz"],
@@ -151,6 +175,10 @@ def generate_launch_description():
                               description="ikt commander mode: jtc | fpc."),
         DeclareLaunchArgument("jog_frame", default_value=str(d["jog_frame"]),
                               description="'base' (base-frame jog) or 'tool'."),
+        DeclareLaunchArgument("output_mode", default_value=str(d["output_mode"]),
+                              description="'absolute' (target_pose) or 'delta' "
+                                          "(jog by deltas; sets the commander's "
+                                          "target_mode too). delta requires output:=ikt."),
         DeclareLaunchArgument("output", default_value="ikt",
                               description="Target sink: 'ikt' or 'fzi'."),
         DeclareLaunchArgument("fzi_target_topic",

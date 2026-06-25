@@ -30,6 +30,7 @@ def generate_launch_description():
     tip_frame = LaunchConfiguration('tip_frame')
     target_pose_topic = LaunchConfiguration('target_pose_topic')
     jog_frame = LaunchConfiguration('jog_frame')
+    output_mode = LaunchConfiguration('output_mode')
     enable_commander = LaunchConfiguration('enable_commander')
     dashboard_port = LaunchConfiguration('dashboard_port')
 
@@ -43,6 +44,8 @@ def generate_launch_description():
                               description='Where to publish the PoseStamped target.'),
         DeclareLaunchArgument('jog_frame', default_value=str(d['jog_frame']),
                               description="'base' (base-frame jog) or 'tool'."),
+        DeclareLaunchArgument('output_mode', default_value=str(d['output_mode']),
+                              description="'absolute' (target_pose) or 'delta' (jog)."),
         DeclareLaunchArgument('enable_commander',
                               default_value=str(d['enable_commander']).lower(),
                               description='Call the commander enable/disable on engage/release.'),
@@ -61,8 +64,10 @@ def generate_launch_description():
             'tip_frame': tip_frame,
             'target_pose_topic': target_pose_topic,
             'jog_frame': jog_frame,
+            'output_mode': output_mode,
             'enable_commander': enable_commander,
             # the rest straight from config/robot_config.yaml (spacemouse_teleop)
+            'target_delta_topic': d['target_delta_topic'],
             'input_topic': d['input_topic'],
             'joy_topic': d['joy_topic'],
             'rate_hz': d['rate_hz'],
@@ -80,6 +85,7 @@ def generate_launch_description():
             'speed_scales': d['speed_scales'],
             'commander_enable_srv': d['commander_enable_srv'],
             'commander_disable_srv': d['commander_disable_srv'],
+            'commander_snap_srv': d['commander_snap_srv'],
         }],
     )
 

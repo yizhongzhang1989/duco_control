@@ -14,6 +14,10 @@ FALLBACKS = {
     "base_frame": "",
     "tip_frame": "",
     "target_pose_topic": "ikt_pose_commander/target_pose",
+    # Delta path (output_mode 'delta'): per-tick incremental poses go here and
+    # the commander composes them onto its own goal (snapped on engage).
+    "target_delta_topic": "ikt_pose_commander/target_delta",
+    "output_mode": "absolute",          # 'absolute' (target_pose) | 'delta'
     "jog_frame": "base",                # 'base' (base-frame jog) or 'tool'
     "rate_hz": 50.0,
     "linear_scale": [0.15, 0.15, 0.15],
@@ -31,6 +35,7 @@ FALLBACKS = {
     "enable_commander": True,
     "commander_enable_srv": "ikt_pose_commander/enable",
     "commander_disable_srv": "ikt_pose_commander/disable",
+    "commander_snap_srv": "ikt_pose_commander/snap_target",
     "input_topic": "spacenav/twist",
     "joy_topic": "spacenav/joy",
     "dashboard_port": "",               # "" = no dashboard; e.g. 8200 to enable

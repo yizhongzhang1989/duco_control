@@ -47,7 +47,8 @@ from sensor_msgs.msg import Joy
 from std_msgs.msg import String
 from std_srvs.srv import SetBool, Trigger
 
-from spacemouse_teleop.twist_integrator import integrate_pose, shape_twist
+from spacemouse_teleop.twist_integrator import (integrate_pose,
+                                                quat_from_rotvec, shape_twist)
 
 
 class SpaceMouseServo(Node):
@@ -58,6 +59,15 @@ class SpaceMouseServo(Node):
         self.declare_parameter("input_topic", "spacenav/twist")
         self.declare_parameter("joy_topic", "spacenav/joy")
         self.declare_parameter("target_pose_topic", "~/target_pose")
+        # Where to publish DELTA poses in output_mode 'delta' (incremental
+        # transforms the commander composes onto its internal goal).
+        self.declare_parameter("target_delta_topic",
+                               "ikt_pose_commander/target_delta")
+        # output_mode: 'absolute' = integrate the puck into an absolute
+        # PoseStamped on target_pose_topic (the classic path, needs TF capture);
+        # 'delta' = stream per-tick incremental poses on target_delta_topic and
+        # let the commander own the goal (no TF needed; snap on engage).
+        self.declare_parameter("output_mode", "absolute")
         self.declare_parameter("base_frame", "")   # frame targets are expressed in
         self.declare_parameter("tip_frame", "")    # EE link to capture / jog
         self.declare_parameter("rate_hz", 50.0)
@@ -83,6 +93,9 @@ class SpaceMouseServo(Node):
         self.declare_parameter("enable_commander", True)
         self.declare_parameter("commander_enable_srv", "ikt_pose_commander/enable")
         self.declare_parameter("commander_disable_srv", "ikt_pose_commander/disable")
+        # Called on engage in output_mode 'delta' to seed the commander's goal
+        # onto the current EE pose (so deltas accumulate from there, no jump).
+        self.declare_parameter("commander_snap_srv", "ikt_pose_commander/snap_target")
 
         gp = self.get_parameter
         self._base_frame = str(gp("base_frame").value or "")
@@ -105,6 +118,10 @@ class SpaceMouseServo(Node):
         if self._jog_frame not in ("tool", "base"):
             raise ValueError("jog_frame must be 'tool' or 'base', got %r"
                              % self._jog_frame)
+        self._output_mode = str(gp("output_mode").value).strip().lower()
+        if self._output_mode not in ("absolute", "delta"):
+            raise ValueError("output_mode must be 'absolute' or 'delta', got %r"
+                             % self._output_mode)
         self._input_timeout = max(0.0, float(gp("input_timeout").value))
 
         self._deadman_button = int(gp("deadman_button").value)
@@ -119,6 +136,7 @@ class SpaceMouseServo(Node):
 
         self._enable_commander = bool(gp("enable_commander").value)
         target_topic = str(gp("target_pose_topic").value)
+        delta_topic = str(gp("target_delta_topic").value)
 
         # ---- state (guarded by _lock) ------------------------------------
         self._lock = threading.Lock()
@@ -142,6 +160,7 @@ class SpaceMouseServo(Node):
 
         # ---- pubs / subs / services --------------------------------------
         self._target_pub = self.create_publisher(PoseStamped, target_topic, 10)
+        self._delta_pub = self.create_publisher(PoseStamped, delta_topic, 10)
         self._status_pub = self.create_publisher(String, "~/status", 10)
         self.create_subscription(Twist, str(gp("input_topic").value),
                                  self._on_twist, 10)
@@ -151,6 +170,8 @@ class SpaceMouseServo(Node):
             Trigger, str(gp("commander_enable_srv").value))
         self._disable_cli = self.create_client(
             Trigger, str(gp("commander_disable_srv").value))
+        self._snap_cli = self.create_client(
+            Trigger, str(gp("commander_snap_srv").value))
         # Master on/off for the whole teleop sender (toggled by the dashboard).
         self.create_service(SetBool, "~/set_enabled", self._on_set_enabled)
 
@@ -158,13 +179,14 @@ class SpaceMouseServo(Node):
 
         dm = ("none (touch-to-move, no button)" if self._deadman_mode == "none"
               else "button%d(%s)" % (self._deadman_button, self._deadman_mode))
+        sink = (delta_topic if self._output_mode == "delta" else target_topic)
         self.get_logger().info(
-            "spacemouse_servo up: %s<-%s, %.0f Hz, jog_frame=%s, "
+            "spacemouse_servo up: %s<-%s, %.0f Hz, output_mode=%s, jog_frame=%s, "
             "lin<=%.3f m/s ang<=%.3f rad/s, deadman=%s, "
             "enable_commander=%s -> %s"
-            % (self._base_frame, self._tip_frame, self._rate, self._jog_frame,
-               self._max_lin, self._max_ang, dm,
-               self._enable_commander, target_topic))
+            % (self._base_frame, self._tip_frame, self._rate, self._output_mode,
+               self._jog_frame, self._max_lin, self._max_ang, dm,
+               self._enable_commander, sink))
         if self._deadman_mode == "none":
             self.get_logger().info(
                 "ENGAGED by default (deadman_mode=none): touch the puck to move "
@@ -262,9 +284,19 @@ class SpaceMouseServo(Node):
         self._handle_button1()
 
         if new_engaged and not self._engaged:
-            self._capture_pose()
-            if self._enable_commander:
-                self._call_trigger(self._enable_cli, "enable")
+            if self._output_mode == "delta":
+                # Delta mode: the commander owns the goal. Enable it, then snap
+                # its target onto the current EE pose so deltas accumulate from
+                # there (no TF capture needed on this side).
+                if self._enable_commander:
+                    self._call_trigger(self._enable_cli, "enable")
+                self._call_trigger(self._snap_cli, "snap")
+            else:
+                # Absolute mode: capture the live EE pose, then enable so the
+                # first integrated target equals the current pose (no jump).
+                self._capture_pose()
+                if self._enable_commander:
+                    self._call_trigger(self._enable_cli, "enable")
             self.get_logger().info("ENGAGED — jogging active.")
         elif not new_engaged and self._engaged:
             if self._enable_commander:
@@ -306,6 +338,26 @@ class SpaceMouseServo(Node):
 
             self._update_engagement()
 
+            # Shaped Cartesian velocity (m/s, rad/s), common to both modes.
+            speed = self._speed_scales[self._speed_idx]
+            v_lin, v_ang = shape_twist(
+                lin, ang, self._lin_scale * speed, self._ang_scale * speed,
+                deadband_lin=self._db_lin, deadband_ang=self._db_ang,
+                max_lin=self._max_lin, max_ang=self._max_ang)
+            if self._position_only:
+                v_ang = np.zeros(3)
+
+            if self._output_mode == "delta":
+                # Delta mode: the commander owns the goal. Stream per-tick
+                # incremental poses ONLY while engaged; publish nothing (and
+                # need no TF) while released, so the commander simply holds its
+                # last goal and another source (e.g. the dashboard) may take over.
+                if self._engaged:
+                    self._publish_delta(v_lin, v_ang)
+                self._publish_status(fresh)
+                return
+
+            # Absolute mode (classic): integrate the puck into an absolute target.
             if not self._engaged:
                 # Keep the target glued to the live pose so engaging is jumpless.
                 self._capture_pose()
@@ -317,20 +369,37 @@ class SpaceMouseServo(Node):
                 self._publish_status(fresh)
                 return
 
-            speed = self._speed_scales[self._speed_idx]
-            v_lin, v_ang = shape_twist(
-                lin, ang, self._lin_scale * speed, self._ang_scale * speed,
-                deadband_lin=self._db_lin, deadband_ang=self._db_ang,
-                max_lin=self._max_lin, max_ang=self._max_ang)
-            if self._position_only:
-                v_ang = np.zeros(3)
-
             self._target_pos, self._target_quat = integrate_pose(
                 self._target_pos, self._target_quat, v_lin, v_ang,
                 self._dt, frame=self._jog_frame)
 
             self._publish_target()
             self._publish_status(fresh)
+
+    def _publish_delta(self, v_lin, v_ang) -> None:
+        """Publish ONE incremental pose (delta) for the commander to compose.
+
+        Position = the translation increment ``v_lin * dt``; orientation = the
+        rotation increment from ``v_ang * dt`` (identity quaternion = no
+        rotation). ``frame_id`` records the frame the delta is expressed in
+        (``base_frame`` for a base jog, ``tip_frame`` for a tool jog) for
+        traceability; the commander applies it according to its ``delta_frame``.
+        A centred puck streams identity deltas, which leave the goal unchanged.
+        """
+        dp = v_lin * self._dt
+        dq = quat_from_rotvec(v_ang * self._dt)   # (x, y, z, w)
+        msg = PoseStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = (self._base_frame if self._jog_frame == "base"
+                               else self._tip_frame)
+        msg.pose.position.x = float(dp[0])
+        msg.pose.position.y = float(dp[1])
+        msg.pose.position.z = float(dp[2])
+        msg.pose.orientation.x = float(dq[0])
+        msg.pose.orientation.y = float(dq[1])
+        msg.pose.orientation.z = float(dq[2])
+        msg.pose.orientation.w = float(dq[3])
+        self._delta_pub.publish(msg)
 
     def _publish_target(self) -> None:
         msg = PoseStamped()
@@ -349,6 +418,7 @@ class SpaceMouseServo(Node):
         status = {
             "sender_enabled": self._sender_enabled,
             "engaged": self._engaged,
+            "output_mode": self._output_mode,
             "jog_frame": self._jog_frame,
             "speed_scale": self._speed_scales[self._speed_idx],
             "position_only": self._position_only,

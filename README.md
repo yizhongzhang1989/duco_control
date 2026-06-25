@@ -542,6 +542,15 @@ ros2 launch spacemouse_teleop spacemouse_servo.launch.py dashboard_port:=8200
   one source at a time). Also shows the live device status &mdash; axis bars, a 3D
   preview, and buttons.
 
+**Absolute vs delta jog.** By default the bridge sends an **absolute** target
+(integrated from TF). Set `output_mode:=delta` to instead stream **incremental**
+poses to the commander's `~/target_delta`; the commander (`target_mode: delta`)
+owns the goal, seeds it from the current pose via `~/snap_target` on engage, and
+needs no TF on the servo side. The :8180 dashboard exposes the same controls:
+a **Target mode** (Absolute / Delta) switch and a **Snap target → current pose**
+button (`~/snap_target`). `spacemouse_teleop.launch.py output_mode:=delta` wires
+the whole chain in one switch.
+
 Teleop defaults (`base_frame`, `tip_frame`, `jog_frame`, speeds, `dashboard_port`)
 live under `spacemouse_teleop:` in
 [`config/robot_config.yaml`](config/robot_config.yaml); CLI args override. With
