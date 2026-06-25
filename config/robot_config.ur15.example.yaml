@@ -123,7 +123,7 @@ ur15_robot_bringup:
 #     parent: tool0
 #     xyz: [0.0, 0.0, 0.020]
 #     rpy: [0.0, 0.0, 0.0]
-# and set end_effector_link to the new tip so the FZI guard verifies it in-chain.
+# and set fzi_preset.yaml's end_effector_link to the new tip (the FZI controller
+# validates that base->ee chain itself at on_configure).
 aux_frame_manager:
-  end_effector_link: "tool0"
   aux_frames: []

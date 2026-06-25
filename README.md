@@ -63,8 +63,7 @@ Key knobs:
   `link_6 -> ft_sensor_link -> compliance_link`). `ft_sensor_link` is
   the gravity-compensation sensor frame; `compliance_link` is the FZI
   `end_effector_link`. `aux_frame_manager` reads this list from its
-  **own** config section and is the sole owner of the frames (the
-  bringup publishes the bare URDF with `apply_aux_frames:=false`); edit
+  **own** config section and is the sole owner of the frames; edit
   xyz/rpy by hand or via the cartesian dashboard's "Tool frames" panel
   and the change is applied **live** (the manager republishes the
   canonical URDF and the engaged controller swaps its chain -- no
@@ -121,7 +120,7 @@ What each launch starts:
 
 | stage | Duco (`duco_bringup.launch.py`) | UR15 (`ur15_bringup.launch.py`) |
 |---|---|---|
-| 0 (now) | `duco_robot_bringup` (bare URDF) + `aux_frame_manager` (+ guard, dashboard `8160`) + `duco_ft_sensor` + `ft_sensor_gravity_compensation` | `ur15_robot_bringup` (incl. FT broadcaster) + `ft_sensor_gravity_compensation` |
+| 0 (now) | `duco_robot_bringup` (bare URDF) + `aux_frame_manager` (+ dashboard `8160`) + `duco_ft_sensor` + `ft_sensor_gravity_compensation` | `ur15_robot_bringup` (incl. FT broadcaster) + `ft_sensor_gravity_compensation` |
 | 1 (after `cartesian_delay`, default 8 s) | `cartesian_control_manager` (real-HW limits) + `cartesian_controller_dashboard` (`8120`) + `duco_dashboard` (`8090`) | `cartesian_control_manager` (real-HW limits) + `cartesian_controller_dashboard` (`8120`) |
 
 Common overrides (forwarded to the sub-launches):
@@ -168,20 +167,13 @@ is assumed.
 ### 1. Robot bringup -- `controller_manager` + JTC
 
 ```bash
-ros2 launch duco_robot_bringup gcr5_910_ros2_control.launch.py \
-    use_rviz:=false apply_aux_frames:=false
+ros2 launch duco_robot_bringup gcr5_910_ros2_control.launch.py
 ```
-
-`apply_aux_frames:=false` makes the bringup publish the **bare**
-manufacturer URDF on `/robot_description`; `aux_frame_manager` (step 2)
-becomes the sole owner of the `ft_sensor_link` / `compliance_link` aux
-frames and serves the augmented URDF on its own topic.  (Omit the arg --
-default `true` -- only if running the bringup standalone *without*
-`aux_frame_manager`, which bakes the frames straight into the URDF.)
 
 This brings up `controller_manager`, loads the URDF, and activates
 `joint_state_broadcaster` and `arm_1_controller` (the
-`JointTrajectoryController`).  Verify:
+`JointTrajectoryController`).  (Pass `use_rviz:=true` to also launch the
+MoveIt RViz UI -- it is off by default.)  Verify:
 
 ```bash
 ros2 control list_controllers
@@ -194,7 +186,6 @@ ros2 topic echo /joint_states --once
 
 ```bash
 ros2 launch aux_frame_manager cartesian_urdf_source.launch.py \
-    end_effector_link:=compliance_link \
     dashboard_port:=8160
 ```
 
@@ -210,10 +201,7 @@ section -- no selector argument needed), and:
   [`config/fzi_preset.yaml`](src/duco_robot_bringup/config/fzi_preset.yaml)),
   so tool-frame edits swap their chain **live**;
 * mirrors it to `robot_state_publisher` so `/tf` (and RViz) get the aux
-  frames too;
-* runs a **guard** that latches `/cartesian/robot_description_ready`
-  once `compliance_link` is present and in the `base_link -> ee` chain,
-  and prints an actionable error otherwise.
+  frames too.
 
 `dashboard_port:=8160` also serves a 3D view + live frame editor on
 <http://localhost:8160/> (omit it to run headless).  Verify:
@@ -476,7 +464,7 @@ mismatch closes smoothly instead of tripping the driver's
 
 ```bash
 # 1. Same robot bringup as the Cartesian flow above.
-ros2 launch duco_robot_bringup gcr5_910_ros2_control.launch.py use_rviz:=false
+ros2 launch duco_robot_bringup gcr5_910_ros2_control.launch.py
 
 # 2. Plug in the Alicia-D leader arm, then in a second terminal:
 ros2 launch alicia_teleop alicia_teleop.launch.py
@@ -569,10 +557,8 @@ For a contained sanity check without the real Duco controller:
 
 ```bash
 # In config/robot_config.yaml: duco_robot_bringup.use_fake_hardware: true
-ros2 launch duco_robot_bringup gcr5_910_ros2_control.launch.py \
-    use_rviz:=false apply_aux_frames:=false
-ros2 launch aux_frame_manager cartesian_urdf_source.launch.py \
-    end_effector_link:=compliance_link
+ros2 launch duco_robot_bringup gcr5_910_ros2_control.launch.py
+ros2 launch aux_frame_manager cartesian_urdf_source.launch.py
 ros2 launch cartesian_control_manager cartesian_control.launch.py
 ros2 launch cartesian_controller_dashboard dashboard.launch.py     # optional
 ```
@@ -651,10 +637,9 @@ swappable.
 ### Canonical URDF flow
 
 The URDF has a single owner.  `duco_robot_bringup` publishes the **bare**
-manufacturer URDF on `/robot_description` (launched with
-`apply_aux_frames:=false`); `aux_frame_manager` appends the configured
-aux frames and publishes the **canonical** URDF on the latched topic
-`/cartesian/robot_description`.  The FZI controllers read their kinematic
+manufacturer URDF on `/robot_description`; `aux_frame_manager` appends the
+configured aux frames and publishes the **canonical** URDF on the latched
+topic `/cartesian/robot_description`.  The FZI controllers read their kinematic
 chain from that topic (`urdf_from_topic: true` in `fzi_preset.yaml`), and
 the manager mirrors the same URDF to `robot_state_publisher` so `/tf` and
 RViz stay consistent.  This makes tool-frame offsets editable at runtime:
