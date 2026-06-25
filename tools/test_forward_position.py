@@ -23,7 +23,7 @@ Bring the robot up (any controller mode is fine -- the script will switch
 to forward_position_controller automatically):
 
     ros2 launch duco_robot_bringup gcr5_910_ros2_control.launch.py \\
-        use_fake_hardware:=false use_rviz:=false
+        use_fake_hardware:=false
 
 Then in another terminal, source the workspace and run this script:
 

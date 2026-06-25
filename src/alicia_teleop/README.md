@@ -582,7 +582,7 @@ Common follow-on work and where to make the edit:
 
 ```bash
 # 1. Start the follower (real hardware or fake).
-ros2 launch duco_robot_bringup gcr5_910_ros2_control.launch.py use_rviz:=false
+ros2 launch duco_robot_bringup gcr5_910_ros2_control.launch.py
 
 # 2. Plug in the Alicia leader and start the teleop in a second terminal.
 ros2 launch alicia_teleop alicia_teleop.launch.py

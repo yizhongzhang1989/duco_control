@@ -1,22 +1,26 @@
 """DUCO GCR5-910 bringup wrapper.
 
-Owns the canonical ``robot_description`` URDF for the project. This
-launch REPLACES the previous thin pass-through to the upstream
+Owns the base ``robot_description`` URDF for the project. This launch
+REPLACES the previous thin pass-through to the upstream
 ``demo_ros2_control.launch.py``: the wrapper now builds the URDF itself
-by running xacro on the manufacturer's ``gcr5_910.urdf.xacro`` (and, in
-later steps, augmenting it with aux frames declared in
-``config/robot_config.yaml``). The single URDF string is then handed to
-``robot_state_publisher`` and ``controller_manager`` so every downstream
-consumer sees the same kinematic tree.
+by running xacro on the manufacturer's ``gcr5_910.urdf.xacro``. The
+single URDF string is then handed to ``robot_state_publisher`` and
+``controller_manager`` so every downstream consumer sees the same
+kinematic tree.
+
+The bringup publishes the **bare** manufacturer URDF on
+``/robot_description``; ``aux_frame_manager`` is the sole owner of the
+aux frames (``ft_sensor_link`` / ``compliance_link``), appending them to
+the canonical URDF it serves on ``/cartesian/robot_description``.
 
 The wrapper still includes MoveIt's ``move_group`` and ``moveit_rviz``
 launches from the upstream package; those build their own URDF via
 ``MoveItConfigsBuilder`` and will be migrated to share the canonical
-URDF in a later step (currently they do not see aux frames).
+URDF in a later step.
 """
 
 from pathlib import Path
-from typing import Dict, List
+from typing import List
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -38,7 +42,7 @@ _FALLBACKS = {
     'robot_ip': '192.168.1.10',
     'robot_port': 7003,
     'use_fake_hardware': True,
-    'use_rviz': True,
+    'use_rviz': False,
     'db': False,
     'debug': False,
     'publish_frequency': 15.0,
@@ -116,9 +120,11 @@ def _launch_setup(context, *args, **kwargs):
 
     # Lazy import: surfaces any import error at launch time, not at
     # module import time of this launch file (which would mask it).
-    from cct_common.urdf_loader import augment_urdf, run_xacro
+    from cct_common.urdf_loader import run_xacro
 
-    aux_frames = _load_aux_frames()
+    # The bringup publishes the bare manufacturer URDF; aux_frame_manager
+    # is the sole owner of the aux frames and serves the augmented URDF on
+    # its own topic (and mirrors it to robot_state_publisher).
     urdf_xml = run_xacro(
         str(xacro_path),
         {
@@ -127,7 +133,6 @@ def _launch_setup(context, *args, **kwargs):
             'use_fake_hardware': use_fake_hardware,
         },
     )
-    urdf_xml = augment_urdf(urdf_xml, aux_frames)
 
     robot_description_param = {
         'robot_description': ParameterValue(urdf_xml, value_type=str),
@@ -136,7 +141,8 @@ def _launch_setup(context, *args, **kwargs):
     actions: List = [
         LogInfo(msg=(
             f'[duco_robot_bringup] robot_description built '
-            f'({len(urdf_xml)} chars, aux_frames={len(aux_frames)})')),
+            f'({len(urdf_xml)} chars, bare manufacturer URDF -- aux frames '
+            f'owned by aux_frame_manager)')),
     ]
 
     # static_virtual_joint_tfs (optional, from upstream)
@@ -145,7 +151,8 @@ def _launch_setup(context, *args, **kwargs):
         actions.append(IncludeLaunchDescription(
             PythonLaunchDescriptionSource(str(vj_launch))))
 
-    # robot_state_publisher (with the canonical URDF)
+    # robot_state_publisher (with the bare URDF; aux_frame_manager later
+    # mirrors the canonical augmented URDF here via SetParameters)
     rsp_node = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
@@ -173,7 +180,7 @@ def _launch_setup(context, *args, **kwargs):
             PythonLaunchDescriptionSource(
                 str(pkg_share / 'launch' / 'warehouse_db.launch.py'))))
 
-    # controller_manager (gets the same canonical URDF)
+    # controller_manager (gets the same bare URDF as robot_state_publisher)
     ros2_control_node = Node(
         package='controller_manager',
         executable='ros2_control_node',
@@ -221,70 +228,6 @@ def _launch_setup(context, *args, **kwargs):
             on_start=[forward_position_controller_spawner])))
 
     return actions
-
-
-# ---------------------------------------------------------------------------
-# Aux frames loader.
-#
-# Reads ``duco_robot_bringup.aux_frames`` from ``config/robot_config.yaml``
-# (via ``cct_common.config_manager``) and returns a list of normalised
-# entries. Each entry is a dict::
-#
-#   { "name": str, "parent": str, "xyz": [float, float, float],
-#     "rpy": [float, float, float] }
-#
-# Returns ``[]`` (URDF unchanged) when the config or the section is
-# missing, or when the loader encounters a malformed entry. A malformed
-# entry raises so the launch fails loudly rather than silently dropping
-# frames the controllers expect.
-# ---------------------------------------------------------------------------
-def _load_aux_frames() -> List[Dict]:
-    try:
-        from cct_common.config_manager import get_config  # type: ignore
-    except Exception:  # noqa: BLE001
-        return []
-    try:
-        cfg = get_config()
-    except Exception:  # noqa: BLE001
-        return []
-    if not cfg.has('duco_robot_bringup.aux_frames'):
-        return []
-    raw = cfg.get('duco_robot_bringup.aux_frames')
-    if raw is None:
-        return []
-    if not isinstance(raw, list):
-        raise ValueError(
-            f"'duco_robot_bringup.aux_frames' must be a list, got "
-            f"{type(raw).__name__}")
-
-    out: List[Dict] = []
-    for i, entry in enumerate(raw):
-        if not isinstance(entry, dict):
-            raise ValueError(
-                f"aux_frames[{i}] must be a mapping, got "
-                f"{type(entry).__name__}")
-        if 'name' not in entry or 'parent' not in entry:
-            raise ValueError(
-                f"aux_frames[{i}] requires 'name' and 'parent' keys; "
-                f"got keys {list(entry.keys())}")
-        out.append({
-            'name': str(entry['name']),
-            'parent': str(entry['parent']),
-            'xyz': _triple(entry.get('xyz'), default=(0.0, 0.0, 0.0),
-                           where=f"aux_frames[{i}].xyz"),
-            'rpy': _triple(entry.get('rpy'), default=(0.0, 0.0, 0.0),
-                           where=f"aux_frames[{i}].rpy"),
-        })
-    return out
-
-
-def _triple(value, default, where: str) -> List[float]:
-    if value is None:
-        return list(default)
-    if not isinstance(value, (list, tuple)) or len(value) != 3:
-        raise ValueError(
-            f"{where} must be a 3-element list, got {value!r}")
-    return [float(v) for v in value]
 
 
 def _defaults():

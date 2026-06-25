@@ -108,9 +108,6 @@ cartesian_controller_dashboard:
   # end-effector tip is the compliance_link aux frame added at bringup.
   base_frame:          "base_link"
   tool_frame:          "compliance_link"
-  # Top-level robot_config.yaml key whose aux_frames list the dashboard's
-  # "Tool frames" panel reads / writes; empty string disables the panel.
-  aux_frames_section:  "duco_robot_bringup"
   service_timeout_sec: 2.0
   host: "0.0.0.0"
   port: 8120
@@ -123,7 +120,7 @@ duco_dashboard:
   port: 8090
   joint_states_topic: "/joint_states"
   wrench_topic: "/duco_ft_sensor/wrench_raw"
-  controller_state_topic: "/arm_1_controller/state"
+  controller_state_topic: "/arm_1_controller/controller_state"
   push_rate: 20.0
   stale_after: 1.0
 
@@ -134,25 +131,38 @@ duco_robot_bringup:
   robot_ip: "192.168.1.10"  # Duco robot controller IP
   robot_port: 7003          # Duco controller TCP port (Thrift RPC)
   use_fake_hardware: true   # true = mock_components, false = real DucoHardwareInterface
-  use_rviz: true            # launch the MoveIt RViz UI
+  use_rviz: false           # launch the MoveIt RViz UI (off by default; set true to enable)
   db: false                 # mongo warehouse DB (off by default; can be huge)
   debug: false              # extra ros2_control / MoveIt verbosity
   publish_frequency: 15.0   # robot_state_publisher TF rate (Hz)
-  # Auxiliary frames appended to the robot URDF as fixed-joint children
-  # of an existing link. Used to give the FZI cartesian controllers and
-  # the F/T pipeline real, named TF frames to work with (the controllers
-  # require these frames to be in the URDF's KDL chain). Edit xyz/rpy to
-  # match the physical mount; defaults are zero offsets at the flange.
-  # xyz are meters, rpy are radians.
-  #
-  # IMPORTANT: FZI's robotChainContains(link) only walks the KDL chain
-  # from robot_base_link to end_effector_link. Aux frames are visible to
-  # the cartesian controllers ONLY IF they are chained in series from
-  # link_6 up to whatever the per-robot fzi_preset.yaml declares as
-  # end_effector_link. The default chain is
-  #   link_6 -> ft_sensor_link -> compliance_link
-  # with compliance_link as the end-effector tip; do not insert siblings
-  # of these two without also updating fzi_preset.yaml.
+  # NOTE: the robot's auxiliary fixed frames live in the `aux_frame_manager:`
+  # section below (the manager reads its OWN section and is the sole owner).
+
+# ============================================================================
+# aux_frame_manager (single-writer of the canonical augmented URDF)
+# ============================================================================
+# Auxiliary frames appended to the robot URDF as fixed-joint children of an
+# existing link. They give the FZI cartesian controllers and the F/T pipeline
+# real, named TF frames to work with (the controllers require these frames in
+# the URDF's KDL chain). Edit xyz/rpy to match the physical mount; defaults are
+# zero offsets at the flange. xyz are meters, rpy are radians.
+#
+# OWNERSHIP: aux_frame_manager reads this `aux_frames` list from its OWN section
+# and appends the frames to the canonical URDF it serves on
+# /cartesian/robot_description (mirrored to TF via RSP).
+#
+# IMPORTANT: FZI's robotChainContains(link) only walks the KDL chain from
+# robot_base_link to end_effector_link. Aux frames are visible to the cartesian
+# controllers ONLY IF chained in series from link_6 up to whatever the per-robot
+# fzi_preset.yaml declares as end_effector_link. The default chain is
+#   link_6 -> ft_sensor_link -> compliance_link
+# with compliance_link as the end-effector tip; do not insert siblings of these
+# two without also updating fzi_preset.yaml.
+aux_frame_manager:
+  # Optional 3D web dashboard (live frame viewer/editor): "" = off, else a port.
+  # The full-stack duco_bringup uses this as the default for its
+  # aux_frame_dashboard_port arg; the standalone manager launch reads it too.
+  dashboard_port: 8160
   aux_frames:
     - name: ft_sensor_link
       parent: link_6

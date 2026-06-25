@@ -6,7 +6,7 @@ Web dashboard for checking whether the Duco robot state is healthy while the
 It monitors:
 
 - `/joint_states`
-- `/arm_1_controller/state`
+- `/arm_1_controller/controller_state`
 - `/duco_ft_sensor/wrench_raw`
 - approximate GCR5-910 TCP pose from local forward kinematics
 
