@@ -25,6 +25,7 @@ so transport delay / dropped messages never corrupt the goal).
 """
 import json
 import threading
+import time
 
 import numpy as np
 import rclpy
@@ -104,6 +105,12 @@ class SpaceMousePoseBridge(Node):
         self._enabled = False
         self._tip_from_status = ""
         self._last_tip = ""            # control link last set_pose'd at
+        # Resume re-anchor: while the dashboard (or anything else) drives the
+        # arm, the puck sits idle and curr_pose stays stale, so the first jog
+        # after taking over would be a big jump off the OLD anchor and get
+        # rejected. Snap to the current EE when the puck resumes after a pause.
+        self._last_pos = None
+        self._last_move = 0.0
 
         # ---- TF ---------------------------------------------------------
         self._tf_buffer = tf2_ros.Buffer()
@@ -203,6 +210,27 @@ class SpaceMousePoseBridge(Node):
     def _on_curr_pose(self, msg: PoseStamped) -> None:
         if self._follow_enable and not self._enabled:
             return
+        # Re-anchor when the puck RESUMES after being idle: while another source
+        # (dashboard gizmo) moved the arm, curr_pose stayed put, so it is now a
+        # stale absolute target far from the EE. Snapping to the current EE makes
+        # the takeover jump-free; drop this first (stale) sample.
+        p = msg.pose.position
+        pos = np.array([p.x, p.y, p.z])
+        now = time.monotonic()
+        if self._last_pos is not None:
+            moving = float(np.linalg.norm(pos - self._last_pos)) > 1e-4
+            if moving and now - self._last_move > 0.4:
+                self._last_pos, self._last_move = pos, now
+                if self._reanchor()[0]:
+                    return
+            if moving:
+                self._last_move = now
+            elif now - self._last_move > 0.4:
+                # Puck idle: stay silent so the dashboard (or any other source)
+                # keeps the commander -- don't fight it with a stale held pose.
+                self._last_pos = pos
+                return
+        self._last_pos = pos
         # Forward pose ONLY; leave control_link/frame_link empty so the commander
         # reuses whatever owns the link (config / dashboard) -- the bridge never
         # fights the dashboard over the control link. Link changes re-anchor via
