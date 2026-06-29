@@ -29,6 +29,7 @@ import threading
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped
+from ikt_interfaces.msg import PoseCommand
 from rclpy.node import Node
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
@@ -68,8 +69,13 @@ class SpaceMousePoseBridge(Node):
 
         # ---- parameters -------------------------------------------------
         self.declare_parameter("input_pose_topic", "/spacemouse/curr_pose")
-        self.declare_parameter("output_pose_topic",
-                               "/ikt_pose_commander/target_pose")
+        self.declare_parameter("output_command_topic",
+                               "/ikt_pose_commander/pose_command")
+        # set_pose_topic: pose_node resets its accumulated curr_pose to whatever
+        # we publish here. We push the current EE on engage / link change so the
+        # next curr_pose == EE -> jog starts jump-free (the pose_node does the
+        # anchoring; the bridge stays a thin translator).
+        self.declare_parameter("set_pose_topic", "/spacemouse/set_pose")
         self.declare_parameter("commander_status_topic",
                                "/ikt_pose_commander/status")
         # base_frame: the robot root frame. Used BOTH as the TF anchor base and
@@ -87,38 +93,37 @@ class SpaceMousePoseBridge(Node):
 
         gp = self.get_parameter
         self._in_topic = str(gp("input_pose_topic").value)
-        self._out_topic = str(gp("output_pose_topic").value)
+        self._cmd_topic = str(gp("output_command_topic").value)
+        self._set_topic = str(gp("set_pose_topic").value)
         self._status_topic = str(gp("commander_status_topic").value)
         self._base_frame = str(gp("base_frame").value)
         self._tip_param = str(gp("tip_frame").value or "")
         self._follow_enable = bool(gp("follow_commander_enable").value)
 
         # ---- state ------------------------------------------------------
-        self._sm_latest = None        # (pos[3], quat[4]) latest curr_pose
-        self._robot_anchor = None     # (pos, quat) robot EE captured at engage
-        self._sm_anchor = None        # (pos, quat) curr_pose captured at engage
         self._enabled = False
         self._tip_from_status = ""
+        self._last_tip = ""            # control link last set_pose'd at
 
         # ---- TF ---------------------------------------------------------
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
 
         # ---- interfaces -------------------------------------------------
-        self._pub = self.create_publisher(PoseStamped, self._out_topic, 10)
+        self._pub = self.create_publisher(PoseCommand, self._cmd_topic, 10)
+        self._set_pub = self.create_publisher(PoseStamped, self._set_topic, 10)
         self.create_subscription(
             PoseStamped, self._in_topic, self._on_curr_pose, 10)
         self.create_subscription(
             String, self._status_topic, self._on_status, 10)
-        # Re-capture the anchor onto the current EE without disabling (e.g. to
-        # recentre after jogging to the edge of comfortable reach).
+        # Re-anchor: set pose_node's curr_pose to the current EE (no jump).
         self.create_service(Trigger, "~/reanchor", self._srv_reanchor)
 
         self.get_logger().info(
-            "spacemouse_teleop up: %s -> %s (base=%s tip=%s "
+            "spacemouse_teleop up: %s -> %s (set=%s base=%s tip=%s "
             "follow_commander_enable=%s)"
-            % (self._in_topic, self._out_topic, self._base_frame,
-               self._tip_param or "<from commander status>",
+            % (self._in_topic, self._cmd_topic, self._set_topic,
+               self._base_frame, self._tip_param or "<from commander status>",
                self._follow_enable))
 
     # ------------------------------------------------------------------ #
@@ -144,22 +149,31 @@ class SpaceMousePoseBridge(Node):
                 _quat_normalize([ro.w, ro.x, ro.y, ro.z]))
 
     def _reanchor(self):
-        """Capture the robot EE + the current curr_pose as the jog anchor."""
-        with self._lock:
-            sm = self._sm_latest
-        if sm is None:
-            return False, "no SpaceMouse curr_pose received yet"
+        """Set pose_node's curr_pose to the current EE so jogging is jump-free.
+
+        Pushes the controlled frame's current pose (TF base<-tip) to the
+        pose_node ``set_pose`` topic; the next curr_pose then equals the EE, so
+        the translated target starts where the arm is. pose_node owns the
+        accumulation -- the bridge just triggers the reset.
+        """
         ee = self._robot_ee_now()
         if ee is None:
             return False, "robot EE pose unavailable (TF / tip_frame not ready)"
-        with self._lock:
-            self._robot_anchor = ee
-            self._sm_anchor = (np.array(sm[0], dtype=float),
-                               np.array(sm[1], dtype=float))
+        pos, quat = ee
+        m = PoseStamped()
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.header.frame_id = self._base_frame
+        m.pose.position.x, m.pose.position.y, m.pose.position.z = (
+            float(pos[0]), float(pos[1]), float(pos[2]))
+        m.pose.orientation.w = float(quat[0])
+        m.pose.orientation.x = float(quat[1])
+        m.pose.orientation.y = float(quat[2])
+        m.pose.orientation.z = float(quat[3])
+        self._set_pub.publish(m)
         self.get_logger().info(
-            "anchored: EE [%.3f %.3f %.3f] tip=%s -- jogging from here"
-            % (ee[0][0], ee[0][1], ee[0][2], self._tip_frame()))
-        return True, "anchored to current EE"
+            "set_pose: EE [%.3f %.3f %.3f] tip=%s -- jogging from here"
+            % (pos[0], pos[1], pos[2], self._tip_frame()))
+        return True, "set_pose to current EE"
 
     def _srv_reanchor(self, request, response):
         ok, msg = self._reanchor()
@@ -179,56 +193,25 @@ class SpaceMousePoseBridge(Node):
             self._tip_from_status = tip
             was = self._enabled
             self._enabled = enabled
-        # On the enable rising edge, anchor at the current EE so jogging starts
-        # jump-free; on disable, drop the anchor so we stop feeding targets.
-        if self._follow_enable:
-            if enabled and not was:
-                self._reanchor()
-            elif was and not enabled:
-                with self._lock:
-                    self._robot_anchor = None
-                    self._sm_anchor = None
+        cur_tip = self._tip_frame()
+        # set_pose on the enable rising edge OR when the control link changed,
+        # so the next translated pose == EE (no jump on engage or link switch).
+        if self._follow_enable and enabled and (not was or cur_tip != self._last_tip):
+            if self._reanchor()[0]:
+                self._last_tip = cur_tip
 
     def _on_curr_pose(self, msg: PoseStamped) -> None:
-        p, o = msg.pose.position, msg.pose.orientation
-        sm = (np.array([p.x, p.y, p.z], dtype=float),
-              _quat_normalize([o.w, o.x, o.y, o.z]))
-        with self._lock:
-            self._sm_latest = sm
-            enabled = self._enabled
-            ra = self._robot_anchor
-            sa = self._sm_anchor
-        if self._follow_enable and not enabled:
+        if self._follow_enable and not self._enabled:
             return
-        if ra is None or sa is None:
-            # Not anchored yet: a TF lag at the enable edge, or standalone mode
-            # (follow_commander_enable=False) on the first pose. Retry now.
-            ok, _msg = self._reanchor()
-            if not ok:
-                return
-            with self._lock:
-                ra = self._robot_anchor
-                sa = self._sm_anchor
-
-        # World/base-frame composition: the puck's motion SINCE the anchor,
-        # applied onto the robot anchor. translation adds directly; rotation is a
-        # world-frame (left-multiplied) increment.
-        dp = sm[0] - sa[0]
-        dq = _quat_mul(sm[1], _quat_conj(sa[1]))
-        tgt_pos = ra[0] + dp
-        tgt_quat = _quat_normalize(_quat_mul(dq, ra[1]))
-
-        out = PoseStamped()
-        out.header.stamp = self.get_clock().now().to_msg()
-        out.header.frame_id = self._base_frame
-        out.pose.position.x = float(tgt_pos[0])
-        out.pose.position.y = float(tgt_pos[1])
-        out.pose.position.z = float(tgt_pos[2])
-        out.pose.orientation.w = float(tgt_quat[0])
-        out.pose.orientation.x = float(tgt_quat[1])
-        out.pose.orientation.y = float(tgt_quat[2])
-        out.pose.orientation.z = float(tgt_quat[3])
-        self._pub.publish(out)
+        # Forward pose ONLY; leave control_link/frame_link empty so the commander
+        # reuses whatever owns the link (config / dashboard) -- the bridge never
+        # fights the dashboard over the control link. Link changes re-anchor via
+        # set_pose (on enable / status link change) instead.
+        c = PoseCommand()
+        c.header.stamp = self.get_clock().now().to_msg()
+        c.has_pose = True
+        c.pose = msg.pose
+        self._pub.publish(c)
 
 
 def main(args=None):

@@ -1,40 +1,32 @@
 # spacemouse_teleop
 
-Translate the 3Dconnexion **SpaceMouse** pose into an absolute target pose for
+Translate the 3Dconnexion **SpaceMouse** pose into a unified command for
 [`ikt_pose_commander`](../../external/inverse_kinematics_toolkit/ikt_pose_commander).
 It is the single adapter between two packages that know nothing about each other:
 
 - the `spacemouse` package's `pose_node` is **robot-agnostic** — it publishes an
-  absolute, accumulated puck pose on `/spacemouse/curr_pose`
-  (`geometry_msgs/PoseStamped`) in its own abstract origin frame;
-- `ikt_pose_commander` is **device-agnostic** — it wants an absolute target pose
-  on `~/target_pose` expressed in a robot frame.
+  absolute, accumulated puck pose on `/spacemouse/curr_pose` and accepts a reset
+  on `/spacemouse/set_pose` (it owns the pose accumulation / anchoring);
+- `ikt_pose_commander` is **device-agnostic** — it wants an
+  `ikt_interfaces/PoseCommand` (frame_link + control_link + pose) on
+  `~/pose_command`.
 
 ```text
 spacemouse pose_node          spacemouse_teleop                 ikt_pose_commander
-/spacemouse/curr_pose ──▶ anchor + compose (TF base<-tip) ──▶ ~/target_pose ──▶ IK ──▶ robot
-                              ▲ status: enabled + controlled_frame
+/spacemouse/curr_pose ─────▶ translate 1:1 ──────────────▶ ~/pose_command ─▶ IK ─▶ robot
+      ▲ /spacemouse/set_pose ◀── EE on enable / link change  (control_link/frame_link)
 ```
 
 ## How it works
 
-- On **engage** (by default the commander's `enable` rising edge) it captures an
-  *anchor*: the robot's current end-effector pose (TF `base_frame` → `tip_frame`)
-  and the SpaceMouse's current `curr_pose`.
-- For every later `curr_pose` it composes the puck's motion **since the anchor**
-  onto the robot anchor and publishes an absolute target:
+The bridge is a **thin translator** — no anchoring math:
 
-  ```
-  target = robot_anchor  (+)  (curr_pose - sm_anchor)
-  ```
-
-  so the first target equals the current EE (**no jump**) and the arm jogs from
-  there. Puck motion is treated as a **world/base-frame** increment — match the
-  `pose_node` `integration_frame: world` (base-frame jog) setting.
-
-Every output is a **full absolute pose**, so the commander always tracks the
-**latest** one and intermediate poses may be dropped (no delta accumulation —
-transport delay or dropped messages never corrupt the goal).
+- **Forward**: each `/spacemouse/curr_pose` is republished as a `PoseCommand`
+  (`pose` = curr_pose, `frame_link` = base, `control_link` = tip) while enabled.
+- **Set**: on the commander's **enable** edge or a **control-link change**, the
+  bridge publishes the current EE (TF `base_frame` → `tip_frame`) to
+  `/spacemouse/set_pose`, so `pose_node` resets `curr_pose` to the EE → the next
+  forwarded pose equals the EE (**no jump**). The pose_node does the anchoring.
 
 ## Parameters
 
@@ -44,16 +36,17 @@ Defaults live in `config/robot_config.yaml` under `spacemouse_teleop:`
 | Param | Default | Description |
 |-------|---------|-------------|
 | `input_pose_topic` | `/spacemouse/curr_pose` | absolute puck pose from `pose_node` |
-| `output_pose_topic` | `/ikt_pose_commander/target_pose` | the commander's target |
+| `output_command_topic` | `/ikt_pose_commander/pose_command` | unified `PoseCommand` to the commander |
+| `set_pose_topic` | `/spacemouse/set_pose` | reset `pose_node` to the current EE (re-anchor) |
 | `commander_status_topic` | `/ikt_pose_commander/status` | source of `enabled` + `controlled_frame` |
-| `base_frame` | `base_link` | robot root: TF anchor base **and** output `frame_id` |
+| `base_frame` | `base_link` | robot root: `frame_link` + TF base for set_pose |
 | `tip_frame` | `""` | controlled EE link; empty = take `controlled_frame` from the commander status |
-| `follow_commander_enable` | `true` | anchor on the commander's enable edge and feed only while enabled; `false` = anchor once and feed continuously |
+| `follow_commander_enable` | `true` | set_pose on enable/link change, feed only while enabled; `false` = continuous |
 
 ## Service
 
-- `~/reanchor` (`std_srvs/Trigger`) — re-capture the anchor onto the current EE
-  without disabling (recentre after jogging far).
+- `~/reanchor` (`std_srvs/Trigger`) — push the current EE to `set_pose` so the
+  next pose starts at the EE (recentre after jogging far).
 
 ## Run
 
@@ -65,5 +58,5 @@ ros2 launch spacemouse spacemouse.launch.py \
     dashboard_port:=8080
 # 4) this bridge:
 ros2 launch spacemouse_teleop spacemouse_teleop.launch.py
-# then enable the commander; the bridge anchors at the current EE and jogs.
+# then enable the commander; the bridge set_poses to the current EE and jogs.
 ```
