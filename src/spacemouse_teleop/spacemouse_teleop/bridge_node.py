@@ -80,10 +80,12 @@ class SpaceMousePoseBridge(Node):
         self.declare_parameter("set_pose_topic", "/spacemouse/set_pose")
         self.declare_parameter("commander_status_topic",
                                "/ikt_pose_commander/status")
-        # base_frame: the robot root frame. Used BOTH as the TF anchor base and
-        # as the output pose header.frame_id, so the commander resolves it as
-        # identity into its solver frame (no robot frames leak to the SpaceMouse).
-        self.declare_parameter("base_frame", "base_link")
+        # base_frame: the reference frame. Used BOTH as the TF anchor base and
+        # as the output pose header.frame_id, so the commander resolves it into
+        # its solver frame. Empty = take it live from the commander status
+        # (``base_frame_resolved``) so the dashboard base-link change reaches the
+        # bridge -- exactly like tip_frame follows ``controlled_frame``.
+        self.declare_parameter("base_frame", "")
         # tip_frame: the controlled end-effector link. Empty = take it live from
         # the commander status (``controlled_frame``), so it always matches what
         # the commander drives.
@@ -103,7 +105,7 @@ class SpaceMousePoseBridge(Node):
         self._cmd_topic = str(gp("target_pose_topic").value)
         self._set_topic = str(gp("set_pose_topic").value)
         self._status_topic = str(gp("commander_status_topic").value)
-        self._base_frame = str(gp("base_frame").value)
+        self._base_param = str(gp("base_frame").value or "")
         self._tip_param = str(gp("tip_frame").value or "")
         self._follow_enable = bool(gp("follow_commander_enable").value)
         self._forward_enabled = bool(gp("start_forwarding").value)
@@ -111,7 +113,9 @@ class SpaceMousePoseBridge(Node):
         # ---- state ------------------------------------------------------
         self._enabled = False
         self._tip_from_status = ""
+        self._base_from_status = ""    # reference base from commander status
         self._last_tip = ""            # control link last set_pose'd at
+        self._last_base = ""           # base frame last anchored in
         # The bridge forwards EVERY curr_pose 1:1, EXCEPT while RESETTING: on
         # enable / control-link switch / a curr_pose DISCONTINUITY (e.g. the
         # pose_node restarting at the origin) it drops samples and re-anchors
@@ -152,12 +156,19 @@ class SpaceMousePoseBridge(Node):
             "spacemouse_teleop up: %s -> %s (set=%s base=%s tip=%s "
             "follow_commander_enable=%s)"
             % (self._in_topic, self._cmd_topic, self._set_topic,
-               self._base_frame, self._tip_param or "<from commander status>",
+               self._base_param or "<from commander status>",
+               self._tip_param or "<from commander status>",
                self._follow_enable))
 
     # ------------------------------------------------------------------ #
     def _tip_frame(self) -> str:
         return self._tip_param or self._tip_from_status
+
+    def _base_frame(self) -> str:
+        # Reference base: an explicit param wins, else follow the commander's
+        # base_frame (via status, so the dashboard base-link change reaches the
+        # bridge), else a safe default.
+        return self._base_param or self._base_from_status or "base_link"
 
     def _robot_ee_now(self):
         """(pos, quat_wxyz) of the controlled frame in base_frame, or None."""
@@ -166,10 +177,10 @@ class SpaceMousePoseBridge(Node):
             return None
         try:
             t = self._tf_buffer.lookup_transform(
-                self._base_frame, tip, rclpy.time.Time())
+                self._base_frame(), tip, rclpy.time.Time())
         except Exception as exc:  # noqa: BLE001
             self.get_logger().warn(
-                "TF %s<-%s unavailable: %r" % (self._base_frame, tip, exc),
+                "TF %s<-%s unavailable: %r" % (self._base_frame(), tip, exc),
                 throttle_duration_sec=2.0)
             return None
         tr = t.transform.translation
@@ -191,7 +202,7 @@ class SpaceMousePoseBridge(Node):
         pos, quat = ee
         m = PoseStamped()
         m.header.stamp = self.get_clock().now().to_msg()
-        m.header.frame_id = self._base_frame
+        m.header.frame_id = self._base_frame()
         m.pose.position.x, m.pose.position.y, m.pose.position.z = (
             float(pos[0]), float(pos[1]), float(pos[2]))
         m.pose.orientation.w = float(quat[0])
@@ -240,17 +251,24 @@ class SpaceMousePoseBridge(Node):
             return
         enabled = bool(d.get("enabled", False))
         tip = str(d.get("controlled_frame", "") or "")
+        base = str(d.get("base_frame_resolved", "") or "")
         with self._lock:
             self._tip_from_status = tip
+            self._base_from_status = base
             was = self._enabled
             self._enabled = enabled
         cur_tip = self._tip_frame()
-        # Re-anchor on the enable rising edge OR a control-link switch: the
-        # _on_curr_pose reset loop drops + set_poses curr_pose to the (new) EE
-        # before forwarding again, so jogging starts jump-free.
-        if self._follow_enable and enabled and (not was or cur_tip != self._last_tip):
+        cur_base = self._base_frame()
+        # Re-anchor on the enable rising edge OR a control-link switch OR a
+        # base-frame switch: the _on_curr_pose reset loop drops + set_poses
+        # curr_pose to the (new) EE before forwarding again, so jogging starts
+        # jump-free (the anchor is expressed in base, so changing it moves it).
+        if (self._follow_enable and enabled
+                and (not was or cur_tip != self._last_tip
+                     or cur_base != self._last_base)):
             self._resetting = True
             self._last_tip = cur_tip
+            self._last_base = cur_base
 
     def _on_curr_pose(self, msg: PoseStamped) -> None:
         if not self._forward_enabled:
@@ -289,7 +307,7 @@ class SpaceMousePoseBridge(Node):
         # Forward EVERY continuous curr_pose 1:1 as the absolute target.
         out = PoseStamped()
         out.header.stamp = self.get_clock().now().to_msg()
-        out.header.frame_id = self._base_frame  # pose is in the robot base frame
+        out.header.frame_id = self._base_frame()  # in the configured base frame
         out.pose = msg.pose
         self._pub.publish(out)
 

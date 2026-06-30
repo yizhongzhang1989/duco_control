@@ -17,7 +17,7 @@ _FALLBACKS = {
     "target_pose_topic": "/ikt_pose_commander/target_pose",
     "set_pose_topic": "/spacemouse/set_pose",
     "commander_status_topic": "/ikt_pose_commander/status",
-    "base_frame": "base_link",
+    "base_frame": "",
     "tip_frame": "",
     "follow_commander_enable": "true",
 }
