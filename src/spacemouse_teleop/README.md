@@ -7,16 +7,16 @@ It is the single adapter between two packages that know nothing about each other
 - the `spacemouse` package's `pose_node` is **robot-agnostic** — it publishes an
   absolute, accumulated puck pose on `/spacemouse/curr_pose` and accepts a reset
   on `/spacemouse/set_pose` (it owns the pose accumulation / anchoring);
-- `ikt_pose_commander` is **device-agnostic** — it wants an
-  `ikt_interfaces/PoseCommand` (`frame_link` + `control_link` + `pose`) on its
-  `pose_command` topic, solves IK in-process, and streams joints to the robot.
+- `ikt_pose_commander` is **device-agnostic** — it wants an absolute
+  `geometry_msgs/PoseStamped` target on its `target_pose` topic, solves IK
+  in-process, and streams joints to the robot.
 
 This package keeps both sides decoupled: the SpaceMouse never learns a robot
 link name, and the commander never learns a device exists.
 
 ```text
 spacemouse pose_node          spacemouse_teleop                 ikt_pose_commander
-/spacemouse/curr_pose ─────▶ translate 1:1 ──────────────▶ pose_command ─▶ IK ─▶ robot
+/spacemouse/curr_pose ─────▶ translate 1:1 ──────────────▶ target_pose ─▶ IK ─▶ robot
       ▲ /spacemouse/set_pose ◀── EE on enable / link change      ◀── status (enabled, link)
 ```
 
@@ -25,10 +25,9 @@ spacemouse pose_node          spacemouse_teleop                 ikt_pose_command
 The bridge is a **thin translator** — it carries no anchoring math of its own:
 
 - **Forward** — each `/spacemouse/curr_pose` is republished verbatim as a
-  `PoseCommand` with `has_pose=true` and `pose = curr_pose`. `frame_link` and
-  `control_link` are left **empty**, so the commander reuses whatever the config
-  or dashboard already set (base root and the controlled tip). The bridge thus
-  never fights the dashboard for the control link.
+  `PoseStamped` on `target_pose` (`pose = curr_pose`, `frame_id = base_frame`).
+  The bridge never touches the controlled link — the commander reuses whatever
+  the config or dashboard already set — so it never fights the dashboard for it.
 - **Anchor (no jump)** — on the commander's **enable** rising edge or a
   **control-link change**, the bridge reads the robot's current EE (TF
   `base_frame → tip_frame`) and publishes it to `/spacemouse/set_pose`. The
@@ -46,7 +45,7 @@ a lost message never corrupts the goal.
 |-----------|----------------|------|---------|
 | sub | `/spacemouse/curr_pose` | `geometry_msgs/PoseStamped` | absolute puck pose to translate |
 | sub | `/ikt_pose_commander/status` | `std_msgs/String` (JSON) | `enabled` + `controlled_frame` |
-| pub | `/ikt_pose_commander/pose_command` | `ikt_interfaces/PoseCommand` | target pose for the commander |
+| pub | `/ikt_pose_commander/target_pose` | `geometry_msgs/PoseStamped` | absolute target pose for the commander |
 | pub | `/spacemouse/set_pose` | `geometry_msgs/PoseStamped` | re-anchor `pose_node` to the EE |
 | srv | `~/reanchor` | `std_srvs/Trigger` | push current EE to `set_pose` (recentre) |
 
@@ -60,7 +59,7 @@ Defaults live in `config/robot_config.yaml` under `spacemouse_teleop:`
 | Param | Default | Description |
 |-------|---------|-------------|
 | `input_pose_topic` | `/spacemouse/curr_pose` | absolute puck pose from `pose_node` |
-| `output_command_topic` | `/ikt_pose_commander/pose_command` | unified `PoseCommand` to the commander |
+| `target_pose_topic` | `/ikt_pose_commander/target_pose` | absolute target pose to the commander |
 | `set_pose_topic` | `/spacemouse/set_pose` | reset `pose_node` to the current EE (re-anchor) |
 | `commander_status_topic` | `/ikt_pose_commander/status` | source of `enabled` + `controlled_frame` |
 | `base_frame` | `base_link` | robot root: TF base for set_pose / EE lookup |

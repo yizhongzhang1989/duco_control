@@ -2,26 +2,27 @@
 """spacemouse_teleop -- translate a SpaceMouse pose into commander targets.
 
 The 3Dconnexion ``spacemouse`` package's ``pose_node`` publishes an ABSOLUTE,
-accumulated puck pose on ``/spacemouse/curr_pose`` (``geometry_msgs/PoseStamped``)
-in its own abstract origin frame. ``ikt_pose_commander`` wants an ABSOLUTE target
-pose on ``~/target_pose`` expressed in a robot frame. This node is the single
-adapter between the two, coupling neither side to the other:
+accumulated puck pose on ``/spacemouse/curr_pose`` (``geometry_msgs/PoseStamped``).
+``ikt_pose_commander`` wants an ABSOLUTE target pose on ``~/target_pose`` expressed
+in a robot frame. This node is the single adapter between the two:
 
-* It captures an ANCHOR when teleop engages (by default, when the commander is
-  enabled): the robot's current end-effector pose (via TF ``base_frame`` ->
-  ``tip_frame``) and the SpaceMouse's current ``curr_pose``.
-* For every subsequent ``curr_pose`` it composes the puck's motion SINCE the
-  anchor onto the robot anchor and publishes the result as an absolute target::
-
-      target = robot_anchor  (+)  (sm_now  -  sm_anchor)
-
-  so the first target equals the current EE (no jump) and the arm jogs from
-  there. The puck motion is treated as a WORLD/base-frame increment, matching the
-  ``pose_node`` ``integration_frame: world`` (base-frame jog) setting.
+* It forwards EVERY ``curr_pose`` 1:1 as a target on ``~/target_pose`` (frame_id =
+  ``base_frame``) -- nothing is dropped, so slow/gentle jogs reach the robot too.
+* It RESETS the puck -- pushes the robot's current EE (via TF ``base_frame`` ->
+  ``tip_frame``) to the pose_node's ``set_pose`` so ``curr_pose`` snaps to the EE,
+  dropping samples until it lands -- whenever it must NOT forward the raw pose: on
+  enable, on a control-link switch, AND on a curr_pose DISCONTINUITY (a big jump
+  between samples, e.g. the pose_node restarting at the origin). That last guard is
+  critical: forwarding a stale/identity pose would teleport the robot, and the
+  commander does NOT jump-reject in FPC rate mode (-> self-collision). These resets
+  are the ONLY case the bridge ever drops a sample.
+* It can HAND OFF control: ``~/set_forwarding`` (SetBool) gates forwarding so an
+  operator switches between SpaceMouse control (ON) and dashboard-gizmo control
+  (OFF -> bridge silent, dashboard owns target_pose). The latched ``~/forwarding``
+  (Bool) topic mirrors the state.
 
 Because every output is a FULL absolute pose, the commander always tracks the
-LATEST one and intermediate poses may be dropped freely (no delta accumulation,
-so transport delay / dropped messages never corrupt the goal).
+LATEST one (no delta accumulation, so transport delay never corrupts the goal).
 """
 import json
 import threading
@@ -30,10 +31,10 @@ import time
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped
-from ikt_interfaces.msg import PoseCommand
 from rclpy.node import Node
-from std_msgs.msg import String
-from std_srvs.srv import Trigger
+from rclpy.qos import DurabilityPolicy, QoSProfile
+from std_msgs.msg import Bool, String
+from std_srvs.srv import SetBool, Trigger
 
 import tf2_ros
 
@@ -70,8 +71,8 @@ class SpaceMousePoseBridge(Node):
 
         # ---- parameters -------------------------------------------------
         self.declare_parameter("input_pose_topic", "/spacemouse/curr_pose")
-        self.declare_parameter("output_command_topic",
-                               "/ikt_pose_commander/pose_command")
+        self.declare_parameter("target_pose_topic",
+                               "/ikt_pose_commander/target_pose")
         # set_pose_topic: pose_node resets its accumulated curr_pose to whatever
         # we publish here. We push the current EE on engage / link change so the
         # next curr_pose == EE -> jog starts jump-free (the pose_node does the
@@ -91,33 +92,44 @@ class SpaceMousePoseBridge(Node):
         # and only feed targets while it is enabled. False = anchor once on the
         # first pose and feed continuously (standalone, no commander status).
         self.declare_parameter("follow_commander_enable", True)
+        # start_forwarding: whether the bridge forwards curr_pose -> target_pose
+        # at startup. Toggled at runtime via ``~/set_forwarding`` (SetBool) so an
+        # operator can hand control between the SpaceMouse and the dashboard
+        # gizmo (both drive target_pose); state mirrored on ``~/forwarding``.
+        self.declare_parameter("start_forwarding", True)
 
         gp = self.get_parameter
         self._in_topic = str(gp("input_pose_topic").value)
-        self._cmd_topic = str(gp("output_command_topic").value)
+        self._cmd_topic = str(gp("target_pose_topic").value)
         self._set_topic = str(gp("set_pose_topic").value)
         self._status_topic = str(gp("commander_status_topic").value)
         self._base_frame = str(gp("base_frame").value)
         self._tip_param = str(gp("tip_frame").value or "")
         self._follow_enable = bool(gp("follow_commander_enable").value)
+        self._forward_enabled = bool(gp("start_forwarding").value)
 
         # ---- state ------------------------------------------------------
         self._enabled = False
         self._tip_from_status = ""
         self._last_tip = ""            # control link last set_pose'd at
-        # Resume re-anchor: while the dashboard (or anything else) drives the
-        # arm, the puck sits idle and curr_pose stays stale, so the first jog
-        # after taking over would be a big jump off the OLD anchor and get
-        # rejected. Snap to the current EE when the puck resumes after a pause.
-        self._last_pos = None
-        self._last_move = 0.0
+        # The bridge forwards EVERY curr_pose 1:1, EXCEPT while RESETTING: on
+        # enable / control-link switch / a curr_pose DISCONTINUITY (e.g. the
+        # pose_node restarting at the origin) it drops samples and re-anchors
+        # curr_pose to the current EE, resuming only once curr_pose == EE. This
+        # is what stops a stale/identity pose from teleporting the robot (the
+        # commander does NOT jump-reject in FPC rate mode -> self-collision).
+        self._resetting = self._follow_enable   # anchor before forwarding
+        self._last_curr = None         # last curr_pose seen (jump detection)
+        self._last_reanchor = 0.0      # throttle set_pose re-issue while resetting
+        self._jump_thresh = 0.10       # m: bigger curr_pose step = teleport, drop
+        self._anchor_tol = 0.01        # m: "curr_pose anchored to EE" tolerance
 
         # ---- TF ---------------------------------------------------------
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
 
         # ---- interfaces -------------------------------------------------
-        self._pub = self.create_publisher(PoseCommand, self._cmd_topic, 10)
+        self._pub = self.create_publisher(PoseStamped, self._cmd_topic, 10)
         self._set_pub = self.create_publisher(PoseStamped, self._set_topic, 10)
         self.create_subscription(
             PoseStamped, self._in_topic, self._on_curr_pose, 10)
@@ -125,6 +137,16 @@ class SpaceMousePoseBridge(Node):
             String, self._status_topic, self._on_status, 10)
         # Re-anchor: set pose_node's curr_pose to the current EE (no jump).
         self.create_service(Trigger, "~/reanchor", self._srv_reanchor)
+        # Forwarding gate: hand control between the SpaceMouse and the dashboard.
+        # ``~/forwarding`` (latched Bool) mirrors the state; ``~/set_forwarding``
+        # (SetBool) toggles it. OFF = bridge stays silent so the dashboard owns
+        # target_pose; ON re-anchors to the current EE then resumes forwarding.
+        latched = QoSProfile(depth=1)
+        latched.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self._fwd_pub = self.create_publisher(Bool, "~/forwarding", latched)
+        self.create_service(SetBool, "~/set_forwarding",
+                            self._srv_set_forwarding)
+        self._publish_forwarding()
 
         self.get_logger().info(
             "spacemouse_teleop up: %s -> %s (set=%s base=%s tip=%s "
@@ -179,13 +201,35 @@ class SpaceMousePoseBridge(Node):
         self._set_pub.publish(m)
         self.get_logger().info(
             "set_pose: EE [%.3f %.3f %.3f] tip=%s -- jogging from here"
-            % (pos[0], pos[1], pos[2], self._tip_frame()))
+            % (pos[0], pos[1], pos[2], self._tip_frame()),
+            throttle_duration_sec=1.0)
         return True, "set_pose to current EE"
 
     def _srv_reanchor(self, request, response):
+        self._resetting = True   # drop + re-anchor curr_pose to the EE
         ok, msg = self._reanchor()
         response.success = ok
         response.message = msg
+        return response
+
+    def _publish_forwarding(self) -> None:
+        m = Bool()
+        m.data = bool(self._forward_enabled)
+        self._fwd_pub.publish(m)
+
+    def _srv_set_forwarding(self, request, response):
+        enable = bool(request.data)
+        was = self._forward_enabled
+        self._forward_enabled = enable
+        if enable and not was:
+            self._resetting = True    # re-anchor to the EE before resuming
+        self._publish_forwarding()
+        response.success = True
+        response.message = (
+            "SpaceMouse forwarding ENABLED (SpaceMouse drives target_pose)"
+            if enable else
+            "SpaceMouse forwarding DISABLED (dashboard drives target_pose)")
+        self.get_logger().info(response.message)
         return response
 
     # ------------------------------------------------------------------ #
@@ -201,45 +245,53 @@ class SpaceMousePoseBridge(Node):
             was = self._enabled
             self._enabled = enabled
         cur_tip = self._tip_frame()
-        # set_pose on the enable rising edge OR when the control link changed,
-        # so the next translated pose == EE (no jump on engage or link switch).
+        # Re-anchor on the enable rising edge OR a control-link switch: the
+        # _on_curr_pose reset loop drops + set_poses curr_pose to the (new) EE
+        # before forwarding again, so jogging starts jump-free.
         if self._follow_enable and enabled and (not was or cur_tip != self._last_tip):
-            if self._reanchor()[0]:
-                self._last_tip = cur_tip
+            self._resetting = True
+            self._last_tip = cur_tip
 
     def _on_curr_pose(self, msg: PoseStamped) -> None:
+        if not self._forward_enabled:
+            return                      # dashboard control: bridge stays silent
         if self._follow_enable and not self._enabled:
             return
-        # Re-anchor when the puck RESUMES after being idle: while another source
-        # (dashboard gizmo) moved the arm, curr_pose stayed put, so it is now a
-        # stale absolute target far from the EE. Snapping to the current EE makes
-        # the takeover jump-free; drop this first (stale) sample.
         p = msg.pose.position
         pos = np.array([p.x, p.y, p.z])
-        now = time.monotonic()
-        if self._last_pos is not None:
-            moving = float(np.linalg.norm(pos - self._last_pos)) > 1e-4
-            if moving and now - self._last_move > 0.4:
-                self._last_pos, self._last_move = pos, now
-                if self._reanchor()[0]:
-                    return
-            if moving:
-                self._last_move = now
-            elif now - self._last_move > 0.4:
-                # Puck idle: stay silent so the dashboard (or any other source)
-                # keeps the commander -- don't fight it with a stale held pose.
-                self._last_pos = pos
+        # DISCONTINUITY guard: a large step between consecutive curr_pose samples
+        # is NOT puck motion (e.g. the pose_node restarted at the origin).
+        # Forwarding it would teleport the robot -- the commander does NOT
+        # jump-reject in FPC rate mode -> self-collision. Trigger a reset.
+        if (self._last_curr is not None and not self._resetting
+                and float(np.linalg.norm(pos - self._last_curr))
+                > self._jump_thresh):
+            self.get_logger().warn(
+                "curr_pose jumped %.2f m (pose_node reset?) -- holding & "
+                "re-anchoring to the EE, NOT forwarding"
+                % float(np.linalg.norm(pos - self._last_curr)))
+            self._resetting = True
+        self._last_curr = pos
+        # RESETTING (enable / link switch / jump): drop curr_pose and re-anchor
+        # it to the current EE; resume forwarding only once it has landed.
+        if self._resetting:
+            ee = self._robot_ee_now()
+            if ee is None:
+                return                                  # TF not ready -> drop
+            if float(np.linalg.norm(pos - ee[0])) <= self._anchor_tol:
+                self._resetting = False                 # anchored -> forward now
+            else:
+                now = time.monotonic()
+                if now - self._last_reanchor > 0.15:    # throttle set_pose
+                    self._last_reanchor = now
+                    self._reanchor()
                 return
-        self._last_pos = pos
-        # Forward pose ONLY; leave control_link/frame_link empty so the commander
-        # reuses whatever owns the link (config / dashboard) -- the bridge never
-        # fights the dashboard over the control link. Link changes re-anchor via
-        # set_pose (on enable / status link change) instead.
-        c = PoseCommand()
-        c.header.stamp = self.get_clock().now().to_msg()
-        c.has_pose = True
-        c.pose = msg.pose
-        self._pub.publish(c)
+        # Forward EVERY continuous curr_pose 1:1 as the absolute target.
+        out = PoseStamped()
+        out.header.stamp = self.get_clock().now().to_msg()
+        out.header.frame_id = self._base_frame  # pose is in the robot base frame
+        out.pose = msg.pose
+        self._pub.publish(out)
 
 
 def main(args=None):

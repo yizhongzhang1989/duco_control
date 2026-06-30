@@ -14,7 +14,7 @@ from launch_ros.parameter_descriptions import ParameterValue
 
 _FALLBACKS = {
     "input_pose_topic": "/spacemouse/curr_pose",
-    "output_command_topic": "/ikt_pose_commander/pose_command",
+    "target_pose_topic": "/ikt_pose_commander/target_pose",
     "set_pose_topic": "/spacemouse/set_pose",
     "commander_status_topic": "/ikt_pose_commander/status",
     "base_frame": "base_link",
@@ -42,8 +42,8 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument("input_pose_topic",
                               default_value=str(d["input_pose_topic"])),
-        DeclareLaunchArgument("output_command_topic",
-                              default_value=str(d["output_command_topic"])),
+        DeclareLaunchArgument("target_pose_topic",
+                              default_value=str(d["target_pose_topic"])),
         DeclareLaunchArgument("set_pose_topic",
                               default_value=str(d["set_pose_topic"])),
         DeclareLaunchArgument("commander_status_topic",
@@ -63,8 +63,8 @@ def generate_launch_description():
             parameters=[{
                 "input_pose_topic":
                     LaunchConfiguration("input_pose_topic"),
-                "output_command_topic":
-                    LaunchConfiguration("output_command_topic"),
+                "target_pose_topic":
+                    LaunchConfiguration("target_pose_topic"),
                 "set_pose_topic":
                     LaunchConfiguration("set_pose_topic"),
                 "commander_status_topic":
