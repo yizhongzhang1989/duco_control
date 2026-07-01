@@ -18,3 +18,6 @@
 [submodule "external/3dconnexion_ros2"]
 	path = external/3dconnexion_ros2
 	url = https://github.com/yizhongzhang1989/3dconnexion_ros2.git
+[submodule "external/robot_test_dashboard"]
+	path = external/robot_test_dashboard
+	url = https://github.com/yizhongzhang1989/robot_test_dashboard.git
