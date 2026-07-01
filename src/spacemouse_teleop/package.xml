@@ -2,27 +2,24 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>spacemouse_teleop</name>
-  <version>1.0.0</version>
+  <version>0.1.0</version>
   <description>
-    Cartesian jog bridge for the 3Dconnexion SpaceMouse. Integrates the
-    spacenav velocity twist into a streaming PoseStamped target (captured from
-    the live end-effector pose over TF), with dead-man gating and conservative
-    speed limits. Robot-agnostic: the output drives any pose consumer
-    (e.g. ikt_pose_commander or an FZI cartesian_motion_controller).
+    Translate the 3Dconnexion SpaceMouse pose_node's absolute pose
+    (/spacemouse/curr_pose) into an absolute target pose for ikt_pose_commander
+    (~/target_pose), anchored to the robot's current end-effector so jogging
+    starts jump-free. The single adapter between the robot-agnostic SpaceMouse
+    package and the device-agnostic pose commander.
   </description>
-
-  <maintainer email="yizhong@todo.todo">Yizhong Zhang</maintainer>
+  <maintainer email="robot@todo.todo">robot</maintainer>
   <license>MIT</license>
 
-  <depend>rclpy</depend>
-  <depend>geometry_msgs</depend>
-  <depend>sensor_msgs</depend>
-  <depend>std_msgs</depend>
-  <depend>std_srvs</depend>
-  <depend>tf2_ros</depend>
-  <depend>python3-numpy</depend>
-
-  <exec_depend>spacenav</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <!-- workspace config loader (config/robot_config.yaml). -->
   <exec_depend>cct_common</exec_depend>
 
   <test_depend>ament_copyright</test_depend>

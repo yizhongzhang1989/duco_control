@@ -1,192 +1,110 @@
 # spacemouse_teleop
 
-Cartesian **jog bridge** for the 3Dconnexion SpaceMouse. It turns the
-`spacenav` velocity twist into a streaming Cartesian **pose target** so the puck
-can drive a robot end-effector in real time.
+Translate the 3Dconnexion **SpaceMouse** pose into a unified command for
+[`ikt_pose_commander`](../../external/inverse_kinematics_toolkit/ikt_pose_commander).
+It is the single adapter between two packages that know nothing about each other:
 
-The SpaceMouse driver (`spacenav`) publishes a 6-DOF *velocity* (`Twist`); the
-robot-side pose consumers — [`ikt_pose_commander`](https://github.com/yizhongzhang1989/inverse_kinematics_toolkit)
-and the FZI `cartesian_motion_controller` — want a *moving pose target*
-(`PoseStamped`). This package is the missing bridge between them.
+- the `spacemouse` package's `pose_node` is **robot-agnostic** — it publishes an
+  absolute, accumulated puck pose on `/spacemouse/curr_pose` and accepts a reset
+  on `/spacemouse/set_pose` (it owns the pose accumulation / anchoring);
+- `ikt_pose_commander` is **device-agnostic** — it wants an absolute
+  `geometry_msgs/PoseStamped` target on its `target_pose` topic, solves IK
+  in-process, and streams joints to the robot.
 
-```
-spacenav/twist (Twist)  ┐
-spacenav/joy   (Joy)    ┤─ dead-man gate ─ deadband+scale+clamp ─┐
-TF base<-tip (capture)  ┘                                        │
-                                                                 ▼
-                           integrate (tool|base frame)  ──▶  PoseStamped target
-                                                                 │
-                                  ikt_pose_commander  /  FZI cartesian_motion_controller
-```
+This package keeps both sides decoupled: the SpaceMouse never learns a robot
+link name, and the commander never learns a device exists.
 
-## Why a separate node
-
-The bridge is **robot-agnostic** (it only emits a generic `PoseStamped` and
-reads TF), so it lives next to the SpaceMouse driver and works for any pose
-consumer. It never commands the robot directly — actuation and all hard safety
-gates stay in `ikt_pose_commander` (reachability / jump / speed / staleness) or
-in the FZI controller. The bridge adds only *teleop* safety: dead-man gating,
-idle re-capture, input-staleness zeroing, and conservative speed clamps.
-
-## Safety model
-
-* **Engagement gate.** With `deadman_mode: none` (default) the puck is always
-  engaged &mdash; touch to move, centre to hold. Set `hold` (publish only while
-  the dead-man button is held) or `toggle` (press to engage / disengage) for a
-  button-gated workflow. On disengage the optional downstream commander is
-  disabled. The dashboard's **On/Off** (`~/set_enabled`) gates the whole sender.
-* **Idle re-capture.** While disengaged, the target is continuously reset to the
-  current end-effector pose (via TF), so engaging never produces a jump.
-* **Input staleness.** If no twist arrives within `input_timeout`, the puck is
-  treated as centred — a disconnected/!frozen SpaceMouse cannot drift the target.
-* **Conservative limits.** Per-axis scales plus hard `max_linear_speed` /
-  `max_angular_speed` clamps; defaults are intentionally slow.
-
-## Build
-
-```bash
-colcon build --symlink-install --packages-select spacemouse_teleop
-source install/setup.bash
+```text
+spacemouse pose_node          spacemouse_teleop                 ikt_pose_commander
+/spacemouse/curr_pose ─────▶ translate 1:1 ──────────────▶ target_pose ─▶ IK ─▶ robot
+      ▲ /spacemouse/set_pose ◀── EE on enable / link change      ◀── status (enabled, link)
 ```
 
-Depends on `rclpy`, `geometry_msgs`, `sensor_msgs`, `std_msgs`, `std_srvs`,
-`tf2_ros`, `numpy` (and the `spacenav` driver at runtime).
+## How it works
 
-## Run
+The bridge is a **thin translator** — it carries no anchoring math of its own:
 
-Defaults (`base_frame`, `tip_frame`, `jog_frame`, speeds, `dashboard_port`, …)
-come from the `spacemouse_teleop:` section of
-[`config/robot_config.yaml`](../../config/robot_config.yaml); every value below is
-a CLI override. A robot bringup must already publish `/robot_description` +
-`/joint_states` and load the controllers.
+- **Forward** — each `/spacemouse/curr_pose` is republished verbatim as a
+  `PoseStamped` on `target_pose` (`pose = curr_pose`, `frame_id = base_frame`).
+  The bridge never touches the controlled link — the commander reuses whatever
+  the config or dashboard already set — so it never fights the dashboard for it.
+- **Anchor (no jump)** — on the commander's **enable** rising edge or a
+  **control-link change**, the bridge reads the robot's current EE (TF
+  `base_frame → tip_frame`) and publishes it to `/spacemouse/set_pose`. The
+  `pose_node` resets its `curr_pose` to that EE, so the next forwarded pose
+  equals where the arm already is. Anchoring lives in the `pose_node`; the bridge
+  only triggers it.
 
-### Recommended: standalone pose commander + dashboards
+Because every message is a **full absolute pose**, the commander always tracks
+the latest one and intermediate poses can be dropped freely — transport delay or
+a lost message never corrupts the goal.
 
-The full SpaceMouse teleop stack on the real Duco (each line in its own terminal):
+## Topics & service
 
-```bash
-# 1. Robot bringup (real hardware).
-ros2 launch robot_bringup duco_bringup.launch.py use_fake_hardware:=false
+| Direction | Name (default) | Type | Purpose |
+|-----------|----------------|------|---------|
+| sub | `/spacemouse/curr_pose` | `geometry_msgs/PoseStamped` | absolute puck pose to translate |
+| sub | `/ikt_pose_commander/status` | `std_msgs/String` (JSON) | `enabled` + `controlled_frame` |
+| pub | `/ikt_pose_commander/target_pose` | `geometry_msgs/PoseStamped` | absolute target pose for the commander |
+| pub | `/spacemouse/set_pose` | `geometry_msgs/PoseStamped` | re-anchor `pose_node` to the EE |
+| srv | `~/reanchor` | `std_srvs/Trigger` | push current EE to `set_pose` (recentre) |
 
-# 2. Pose commander, pinned to the tip link, web dashboard on :8180.
-ros2 launch ikt_pose_commander commander.launch.py \
-    dashboard_port:=8180 controlled_frame:=compliance_link command_mode:=fpc
-
-# 3. SpaceMouse driver (shared hardware; launched on its own).
-ros2 launch spacemouse spacemouse.launch.py
-
-# 4. Jog bridge + On/Off dashboard on :8200
-#    (base_frame/tip_frame/jog_frame default from robot_config.yaml).
-ros2 launch spacemouse_teleop spacemouse_servo.launch.py dashboard_port:=8200
-```
-
-* **Pose-commander dashboard** &rarr; <http://localhost:8180/> (3D gizmo,
-  Read/Send mode, live params).
-* **SpaceMouse On/Off dashboard** &rarr; <http://localhost:8200/> &mdash; switch
-  the sender **On** (jog with the puck) / **Off** (release the commander so you
-  can drive from the :8180 dashboard instead). The two share one target topic, so
-  use one source at a time. It also shows the **live device status** &mdash; axis
-  bars, a 3D preview cube, and button indicators (from `spacenav/twist` +
-  `spacenav/joy`).
-
-With `deadman_mode: none` (the default) the bridge auto-enables the commander and
-jogs as soon as you touch the puck &mdash; centre it to hold.
-
-### One-command commander + bridge (its own commander instance)
-
-When you don't need a separate commander/dashboard, this starts a private
-`ikt_pose_commander` instance pinned to `tip_frame` (joints + controllers
-auto-derive) and the bridge wired to it. Launch the `spacenav` driver
-separately first (`ros2 launch spacemouse spacemouse.launch.py`):
-
-```bash
-ros2 launch spacemouse_teleop spacemouse_teleop.launch.py \
-    command_mode:=fpc dashboard_port:=8200
-```
-
-Use the FZI motion controller instead of the IK commander:
-
-```bash
-ros2 launch spacemouse_teleop spacemouse_teleop.launch.py \
-    tip_frame:=tool0 output:=fzi \
-    fzi_target_topic:=/cartesian_motion_controller/target_frame
-# (bring up the FZI controller via cartesian_control_manager separately)
-```
-
-### Bridge node only
-
-The servo never starts the driver &mdash; launch the `spacenav` driver
-separately (`ros2 launch spacemouse spacemouse.launch.py`). The On/Off dashboard
-comes up only when `dashboard_port` is non-empty (default `8200` from
-`robot_config.yaml`; set it to `""` there to run headless):
-
-```bash
-ros2 launch spacemouse_teleop spacemouse_servo.launch.py
-```
-
-## ROS interface
-
-**Subscribes**
-| Topic | Type | Purpose |
-|---|---|---|
-| `spacenav/twist` | `geometry_msgs/Twist` | puck 6-DOF velocity |
-| `spacenav/joy` | `sensor_msgs/Joy` | buttons (dead-man, mode/speed) |
-| TF `base_frame`←`tip_frame` | — | capture the live EE pose |
-
-**Publishes**
-| Topic | Type | Purpose |
-|---|---|---|
-| `~/target_pose` (remap to the sink) | `geometry_msgs/PoseStamped` | integrated jog target |
-| `~/status` | `std_msgs/String` (JSON) | sender_enabled, engaged?, jog_frame, speed_scale, position_only, has_target, twist_fresh |
-
-**Service servers** — `~/set_enabled` (`std_srvs/SetBool`): master On/Off for the
-sender (used by the On/Off dashboard, `dashboard_port:=8200`). Off stops
-publishing + disables the commander; On re-captures the live pose + re-enables.
-
-**Service clients (optional)** — `commander_enable_srv` / `commander_disable_srv`
-(`std_srvs/Trigger`), called on engage / release when `enable_commander:=true`.
-
-## Button mapping (default 2-button puck)
-
-| Input | Action |
-|---|---|
-| Button `deadman_button` (0) | **Dead-man**: hold-to-move (`deadman_mode: hold`) or toggle |
-| Button `button1_index` (1) | `button1_action`: cycle **speed** scale, or toggle **position_only**, or none |
-| no twist for `input_timeout` | puck treated as centred (zero velocity) |
+TF: looks up `base_frame → tip_frame` to capture the EE for anchoring.
 
 ## Parameters
 
-Defaults live in the `spacemouse_teleop:` section of
-[`config/robot_config.yaml`](../../config/robot_config.yaml) (like the other
-packages); package fallbacks are in `spacemouse_teleop/teleop_defaults.py`.
-CLI args still override. Most-used:
+Defaults live in `config/robot_config.yaml` under `spacemouse_teleop:`
+(loaded via `cct_common`); CLI args override.
 
-| Param | Default | Notes |
-|---|---|---|
-| `base_frame` / `tip_frame` | `base_link` / `compliance_link` | **REQUIRED** TF frames (node refuses to start without them) |
-| `rate_hz` | 50 | integration / publish rate |
-| `linear_scale` / `angular_scale` | `[0.15…]` / `[0.6…]` | per-axis m/s, rad/s per unit twist |
-| `max_linear_speed` / `max_angular_speed` | 0.30 / 1.0 | hard clamps (m/s, rad/s) |
-| `jog_frame` | `base` | `base` (base-frame jog) or `tool` |
-| `deadman_button` / `deadman_mode` | 0 / `none` | dead-man config (`none` = always on) |
-| `speed_scales` | `[0.5,1,2]` | button-1 speed cycle multipliers (starts at 1.0×) |
-| `input_timeout` | 0.2 | s — twist staleness → zero |
-| `enable_commander` | true | drive commander enable/disable from engage |
-| `dashboard_port` | "" | set e.g. 8200 for the on/off web dashboard |
+| Param | Default | Description |
+|-------|---------|-------------|
+| `input_pose_topic` | `/spacemouse/curr_pose` | absolute puck pose from `pose_node` |
+| `target_pose_topic` | `/ikt_pose_commander/target_pose` | absolute target pose to the commander |
+| `set_pose_topic` | `/spacemouse/set_pose` | reset `pose_node` to the current EE (re-anchor) |
+| `commander_status_topic` | `/ikt_pose_commander/status` | source of `enabled` + `controlled_frame` |
+| `base_frame` | `base_link` | robot root: TF base for set_pose / EE lookup |
+| `tip_frame` | `""` | controlled EE link; empty = take `controlled_frame` from commander status |
+| `follow_commander_enable` | `true` | set_pose on enable/link change, feed only while enabled; `false` = continuous |
 
-> **Tip (from the driver README):** align the SpaceMouse axes with the
-> end-effector and use `jog_frame: tool` for the most intuitive control —
-> pushing the puck forward moves the tool forward.
+### Modes
 
-## Tests
+- `follow_commander_enable: true` (default) — anchor on the enable edge, feed
+  targets only while the commander is enabled. Disabling the commander stops
+  motion; re-enabling re-anchors to the EE.
+- `follow_commander_enable: false` — anchor once on the first pose and feed
+  continuously, ignoring commander status (standalone / no status topic).
+- `tip_frame: ""` — follow the commander's controlled link live, so the anchor
+  always matches what the commander drives; set a fixed link to pin it.
 
-The twist→pose integrator is ROS-free and unit-tested offline:
+## Run
 
 ```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-PYTHONPATH=. python3 -m pytest test/test_twist_integrator.py -q
+# 1) robot bringup + 2) ikt_pose_commander (its own terminals)
+# 3) SpaceMouse driver + integrator (robot-agnostic):
+ros2 launch spacemouse spacemouse.launch.py \
+    integration_frame:=world max_trans_speed:=0.15 max_rot_speed:=0.6 \
+    dashboard_port:=8080
+# 4) this bridge:
+ros2 launch spacemouse_teleop spacemouse_teleop.launch.py
+# then enable the commander; the bridge set_poses to the current EE and jogs.
+
+# recentre after jogging far (curr_pose drifted from the EE):
+ros2 service call /spacemouse_teleop/reanchor std_srvs/srv/Trigger
 ```
 
-## License
+## Troubleshooting
 
-MIT
+- **No motion** — the commander starts DISABLED; call `~/enable` on it (or use
+  the dashboard). With `follow_commander_enable:true` the bridge feeds only while
+  enabled.
+- **Jump on enable** — TF `base_frame → tip_frame` must resolve; if the EE is
+  unavailable the anchor is skipped. Check `tip_frame` (or status) and TF.
+- **`integration_frame`** — keep the `pose_node` on `world` so puck motion is a
+  base-frame increment, matching how the commander applies the target.
+
+## Build & test
+
+```bash
+colcon build --packages-select spacemouse_teleop && \
+  colcon test --packages-select spacemouse_teleop
+```
